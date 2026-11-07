@@ -1,0 +1,2 @@
+# 可选：本机语音转文字（set WITH_LOCAL_ASR=1 后运行 build.bat 才会安装）
+faster-whisper>=1.0

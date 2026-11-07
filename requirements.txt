@@ -1,0 +1,7 @@
+pywebview>=5.1
+playwright>=1.45
+requests>=2.31
+Pillow>=10.0
+numpy>=1.26
+# 桌宠换形象时的本机抠图（模型文件第一次用时再下载，约 176MB）
+onnxruntime>=1.17
