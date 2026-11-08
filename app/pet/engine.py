@@ -61,7 +61,6 @@ IDLE, LOOK, WALK, WAVE, HOP, DANCE, DANCE1, DANCE2, DANCE3, YAWN, SLEEP, SIT, LI
 DANCE_ACTS = (DANCE1, DANCE2, DANCE3)
 FREE_ACTS = {IDLE, LOOK, WALK, WAVE, HOP, DANCE, DANCE1, DANCE2, DANCE3, YAWN, SIT, LIE, SULK, SLEEP}
 PHONE_ACTS = {PHONE, TYPE, PHONE_LIKE}
-PHONE_ARM = -100.0  # 双手往身前收、捧着手机
 
 # 粒子
 HEART, SPARK, SWEAT, TEAR, ZZZ, NOTE, PUFF, BANG, QUES, STAR, CHAT, DOTS = range(12)
@@ -104,6 +103,10 @@ class Pose:
     Phone: bool = False   # 捧着手机
     Typing: bool = False  # 在手机上打字
     Sign: bool = False    # 举着“想发作品”的牌子
+    HoldL: float = 0.0    # 双手捧着东西的程度（0～1）：手放到手机两边，手肘自然弯着（不是直直地伸过去）
+    HoldR: float = 0.0
+    HoldDL: tuple = (0.0, 0.0)   # 捧着时手的小动作（打字、往上划），逻辑单位
+    HoldDR: tuple = (0.0, 0.0)
 
 
 class Spring:
@@ -288,7 +291,7 @@ class Pet:
     rnd: random.Random = field(default_factory=random.Random)
 
     def __post_init__(self):
-        self._arm = [0.0, 0.0, 0.0, 0.0]  # armL, armR, strL, strR（平滑过渡用）
+        self._arm = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # armL, armR, strL, strR, holdL, holdR（平滑过渡用）
         self._peek_mode = 0
         self._peek_mode_t = 0.0
         self._peek_total = 0.0
@@ -1049,20 +1052,23 @@ class Pet:
         elif act in PHONE_ACTS:  # 双手捧着手机，低头认真看
             e = smooth(a / 0.35)
             p.Phone = e > 0.5
-            p.ArmL = p.ArmR = lerp(-50, PHONE_ARM, e)
-            p.StrL = p.StrR = 1
+            # 手肘自然弯着、双手捧在胸前（不是两条胳膊直直地交叉伸过去）
+            p.ArmL = p.ArmR = 0.0
+            p.StrL = p.StrR = 0.0
+            p.HoldL = p.HoldR = 1.0
             p.HeadDY = 4 * e
             p.HeadTilt = S(t * 0.7) * 2 + self.look_x * 1.5
             if act == TYPE:
                 p.Typing = True
-                p.ArmL += S(t * 31) * 3
-                p.ArmR += S(t * 27 + 1) * 3
+                p.HoldDL = (0.0, S(t * 31) * 2.2)
+                p.HoldDR = (0.0, S(t * 27 + 1) * 2.2)
             elif act == PHONE_LIKE:
                 bob = abs(S(a * 9)) * (1 - a / self.act_dur)
                 p.BodyY = -bob * 10
                 p.HeadTilt = S(a * 7) * 5
-            if self.flick > 0:
-                p.ArmR += S((0.45 - self.flick) / 0.45 * PI) * 14
+            if self.flick > 0:   # 右手拇指往上一划
+                k = S((0.45 - self.flick) / 0.45 * PI)
+                p.HoldDR = (p.HoldDR[0] - 2.0 * k, p.HoldDR[1] - 7.0 * k)
         elif act == SIGN:  # 右手举着“想发作品”的小牌子，左手挥一挥
             e = env(a, self.act_dur, 0.4)
             p.Sign = e > 0.3
@@ -1128,12 +1134,16 @@ class Pet:
         s[1] += (tp.ArmR - s[1]) * ka
         s[2] += (tp.StrL - s[2]) * ks
         s[3] += (tp.StrR - s[3]) * ks
+        kh = min(1.0, dt * 10)
+        s[4] += (tp.HoldL - s[4]) * kh
+        s[5] += (tp.HoldR - s[5]) * kh
 
     def pose(self) -> Pose:
         """这一帧要画的姿态（手臂用平滑后的值）。"""
         p = self.build_pose()
-        armL, armR, strL, strR = self._arm
+        armL, armR, strL, strR, holdL, holdR = self._arm
         p.StrL, p.StrR = strL, strR
+        p.HoldL, p.HoldR = holdL, holdR
         p.ArmL = armL * smooth(strL * 1.4)
         p.ArmR = armR * smooth(strR * 1.4)
         self.last_pose = p

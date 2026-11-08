@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw
 
 from .gfx import Mat, Sprite
 
-SLICES = 18
+SLICES = 26
 
 
 def _unit(dx: float, dy: float):
@@ -74,9 +74,12 @@ class Strip:
         self.sprites = []
         total = self.e + self.length + (self.img.width - self.e - self.length)
         edges = np.linspace(0, total, SLICES + 1)
-        ov = 1.5  # 每段两头多带 1.5 像素，和相邻的段叠在一起，弯的时候外侧也不露缝
+        ov = 1.5  # 每段两头多带 1.5 像素，和相邻的段叠在一起
+        # 往回（朝肩膀那头）再多带一截：手肘弯得很急时（比如叉腰），相邻两段在弯的外侧会张开一个楔形缺口，
+        # 后一段顺着自己的方向往回延伸正好把这个缺口填上（在弯的内侧，多出来的部分落在前一段里面，看不出来）
+        back = max(ov, self.half * 0.6)
         for a, b in zip(edges[:-1], edges[1:]):
-            x0 = max(0, int(math.floor((a - ov) * sx)))
+            x0 = max(0, int(math.floor((a - back) * sx)))
             x1 = min(w, int(math.ceil((b + ov) * sx)))
             piece = big.crop((x0, 0, x1, h))
             # 小段自己的坐标：逻辑 x = 从这一段的起点 a 算起
@@ -119,7 +122,7 @@ def _sample(arr: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
 
 
 def _straighten(arr, origin, path, u_end: float, half: float, floor_u: float, body, bpos, end_margin: float,
-                tube: bool = False):
+                tube: bool = False, dedupe: bool = True, soft_root: bool = False):
     """沿 path（u -> 中心点、法线，原图坐标）把肢体拉成横条，并把根部整理干净、往身体里延伸。"""
     us = np.arange(0.0, u_end + end_margin, 1.0)
     vs = np.arange(-half, half + 1, 1.0)
@@ -131,8 +134,10 @@ def _straighten(arr, origin, path, u_end: float, half: float, floor_u: float, bo
     # 和身体图重复的像素（剪下来的身体碎片）去掉
     rgb = np.where(alpha[..., None] > 1e-4, pm[..., :3] / np.maximum(alpha[..., None], 1e-4), 0)
     colors = np.concatenate([rgb * 255, alpha[..., None] * 255], axis=-1).reshape(-1, 4).astype(np.uint8)
-    dup = _body_hit(body, bpos, X.ravel(), Y.ravel(), colors).reshape(alpha.shape)
-    pm[dup] = 0
+    # （新版拆出来的手臂本来就只含胳膊自己：这一步会把和身体同色的胳膊——粉胳膊配粉肚子——当成碎片删掉，变成细棍，所以不做）
+    if dedupe:
+        dup = _body_hit(body, bpos, X.ravel(), Y.ravel(), colors).reshape(alpha.shape)
+        pm[dup] = 0
     alpha = pm[..., 3]
     # 关节点标得稍微偏一点没关系：按肢体中段笔画的实际位置把它挪回中心线上
     midcols = (us > u_end * 0.3) & (us < u_end * 0.7)
@@ -184,6 +189,8 @@ def _straighten(arr, origin, path, u_end: float, half: float, floor_u: float, bo
         # 手的半径：在手心（u = u_end）那里量
         at_hand = width[np.abs(us - u_end) <= 4]
         hr = float(at_hand.max()) if at_hand.size and at_hand.max() > 0 else stroke * 2
+        if soft_root:
+            hr = min(hr, stroke * 1.8)   # 手搭在身上时量出来的“手”会把身体也算进去，太大了前臂就没修整到（会留一片鳍）
         hand_from = u_end - hr * 1.15
         band = np.abs(vs) <= stroke + 1
         cover = (pm[band][:, :, 3] > 0.4).mean(axis=0) if band.any() else np.zeros(len(us))
@@ -202,23 +209,35 @@ def _straighten(arr, origin, path, u_end: float, half: float, floor_u: float, bo
     at_edge = np.abs(vs)[:, None] > stroke * 0.5
     keep_end = u_end - (float(width[np.abs(us - u_end) <= 4].max()) * 1.15 if (np.abs(us - u_end) <= 4).any() else 0)
     region = (us < (keep_end if tube else u_end * 0.6))[None, :]
-    pm[near_white & at_edge & region] = 0
+    # 形象本身就是白 / 浅色的（白兔、白猫、浅色衣服）就不做：不然胳膊外半边会被当成白底削掉
+    core_px = (np.abs(vs)[:, None] <= stroke * 0.5) & (pm[..., 3] > 0.5) & region
+    if not core_px.any() or near_white[core_px].mean() < 0.3:
+        pm[near_white & at_edge & region] = 0
     # 根部这一小截附近，比线条宽出去的东西也是碎片
     near = slice(u0, min(len(us), u0 + int(stroke * 2) + 1))
     wide = np.abs(vs)[:, None] > stroke * 1.4 + 1
     pm[:, near][np.broadcast_to(wide, pm[:, near].shape[:2])] = 0
     # 往身体里延伸：用 u0 处的截面（只要线条本身那么宽）往回铺，末端圆头
-    e = max(6.0, stroke * 1.6)
+    # 新版：身体两侧已经补齐、根部又是渐隐的，延伸短一点就够（太长会从肩膀角上戳出身体外面，露一块浅色）
+    e = max(5.0, stroke * 1.05) if soft_root else max(6.0, stroke * 1.6)
     ne = int(math.ceil(e + us[u0]))
     # 延伸用的截面：取根部往外一小段的“典型”截面（逐像素取中位数），比只取一列稳
     cross = np.median(pm[:, u0:min(len(us), u0 + max(3, int(stroke * 2)))], axis=1).astype(np.float32)
     cross[np.abs(vs) > stroke] = 0
     cross[cross[:, 3] < 0.5] = 0   # 边上半透明的浅色像素不要，延伸出去的那截干干净净
+    if soft_root:   # 延伸的那截做成完全不透明（和胳膊本身一样），不然交界处有一道竖着的深浅分界
+        ca = cross[:, 3:4]
+        cross = np.where(ca > 0, cross / np.maximum(ca, 1e-4), 0).astype(np.float32)
     ext = np.repeat(cross[:, None, :], ne, axis=1)
     r = stroke + 0.5
     ex = np.arange(ne)[None, :]
-    cap = (ex < r) & (((ex - r) ** 2 + vs[:, None] ** 2) > r * r)
-    ext[cap] = 0
+    if soft_root:   # 圆头的边抗锯齿
+        dist = np.sqrt((ex - r) ** 2 + vs[:, None] ** 2)
+        k_ = np.where(ex < r, np.clip(r - dist + 0.5, 0, 1), 1.0)
+        ext = ext * k_[..., None]
+    else:
+        cap = (ex < r) & (((ex - r) ** 2 + vs[:, None] ** 2) > r * r)
+        ext[cap] = 0
     body_part = pm[:, u0:]
     full = np.concatenate([ext, body_part], axis=1)
     # 只留连成一整条的那一块（零星的小碎点去掉）
@@ -239,6 +258,23 @@ def _straighten(arr, origin, path, u_end: float, half: float, floor_u: float, bo
                 break
             comp = g
         full[~comp] = 0
+    if soft_root:
+        # 胳膊上下沿被“管子”切出来的那一排半透明浅色像素（看着像一道亮虚线）：去掉，再把边缘柔化一像素
+        vv = np.abs(np.arange(full.shape[0]) - full.shape[0] // 2)[:, None]
+        thin = (full[..., 3] < 0.55) & (vv >= stroke - 1)
+        full[thin] = 0
+        a_ = full[..., 3]
+        inner = np.zeros_like(a_)
+        inner[1:-1, 1:-1] = np.minimum.reduce([a_[:-2, 1:-1], a_[2:, 1:-1], a_[1:-1, :-2], a_[1:-1, 2:]])
+        edge = (a_ > 0) & (inner <= 0.01) & (vv >= stroke - 2)
+        full[edge] *= 0.6
+        # 沿着胳膊方向轻轻抹一下（预乘颜色，不会出色边）：边上一格亮一格暗的“虚线”锯齿就平了
+        full = (np.roll(full, 1, axis=1) + 2 * full + np.roll(full, -1, axis=1)) / 4
+        # 根部：做成一个圆头（像肩膀的球关节），只在最末梢一点点渐隐。
+        # 不用整截渐隐：那样手臂放下时肩膀顶上是半透明的，看着像一块浅色的“鬼影”
+        fx = np.arange(full.shape[1], dtype=np.float32)
+        f = np.clip((fx + 1.0) / max(1.0, stroke * 0.25), 0, 1)
+        full = full * f[None, :, None]
     # 去掉末尾空白
     cols = np.nonzero(full[..., 3].max(axis=0) > 0.02)[0]
     full = full[:, :cols.max() + 2] if cols.size else full
@@ -285,8 +321,27 @@ def _bent_path(S, E, H, b: float):
     return path, Lu + Ll
 
 
+def two_bone(S, Lu: float, Ll: float, T, out: float):
+    """两节骨头（上臂 Lu、前臂 Ll）从肩膀 S 伸向目标点 T：返回 (上臂方向, 前臂方向)，弧度。
+    手肘弯向外侧、偏下（out = -1 往左、+1 往右），像真人捧东西时那样；够不着就朝目标伸直。"""
+    dx, dy = T[0] - S[0], T[1] - S[1]
+    d = math.hypot(dx, dy) or 1e-6
+    d = min(max(d, abs(Lu - Ll) + 1e-3), (Lu + Ll) * 0.999)
+    phi = math.atan2(dy, dx)
+    c = (Lu * Lu + d * d - Ll * Ll) / (2 * Lu * d)
+    alpha = math.acos(max(-1.0, min(1.0, c)))
+    best = None
+    for up in (phi + alpha, phi - alpha):
+        ex, ey = S[0] + math.cos(up) * Lu, S[1] + math.sin(up) * Lu
+        score = (ex - S[0]) * out + 0.3 * (ey - S[1])     # 手肘越靠外、越往下越好
+        if best is None or score > best[0]:
+            best = (score, up, math.atan2(T[1] - ey, T[0] - ex))
+    return best[1], best[2]
+
+
 class ArmRig:
-    """一条手臂：一整条长条 + 两根骨头（上臂、下臂）。"""
+    """一条手臂：一整条长条 + 两根骨头（上臂、下臂）。
+    hold = (程度 0～1, 目标点, 手肘朝向)：捧手机这类动作，手要放到某个位置，手肘自然弯着（两节骨头反解）。"""
 
     def __init__(self, strip: Strip, S, E, H0, Hs, K, L):
         self.strip = strip
@@ -298,18 +353,22 @@ class ArmRig:
         self.a_lo0 = math.atan2(H0[1] - E[1], H0[0] - E[0])   # 原图里下臂的方向
         self.a_str = math.atan2(Hs[1] - S[1], Hs[0] - S[0])   # 伸直时的方向
 
-    def chain(self, deg: float, s: float, scale: float):
+    def chain(self, deg: float, s: float, scale: float, hold=None):
         """按转角 deg（度）和伸直程度 s（0 = 原图的弯法，1 = 伸直）算出骨头：返回 (肩, 肘, 上臂方向, 下臂方向)。"""
         r = math.radians(deg)
         up = _lerp_angle(self.a_up0, self.a_str, s) + r
         lo = _lerp_angle(self.a_lo0, self.a_str, s) + r
+        if hold and hold[0] > 1e-3:
+            h, target, out = hold
+            iu, il = two_bone(self.S, self.Lu * scale, (self.Ls - self.Lu) * scale, target, out)
+            up, lo = _lerp_angle(up, iu, h), _lerp_angle(lo, il, h)
         sx, sy = self.S
         ex, ey = sx + math.cos(up) * self.Lu * scale, sy + math.sin(up) * self.Lu * scale
         return (sx, sy), (ex, ey), up, lo
 
-    def point(self, u: float, deg: float, s: float, scale: float):
+    def point(self, u: float, deg: float, s: float, scale: float, hold=None):
         """长条上第 u（逻辑长度，从肩膀算）处在身体坐标里的位置；手肘附近做成圆滑的弯。"""
-        (sx, sy), (ex, ey), up, lo = self.chain(deg, s, scale)
+        (sx, sy), (ex, ey), up, lo = self.chain(deg, s, scale, hold)
         Lu = self.Lu * scale
         u = u * scale
         b = min(Lu * 0.45, max(4.0, self.strip.half * self.K * 1.4 * scale))   # 手肘圆弯的范围
@@ -326,15 +385,15 @@ class ArmRig:
                     (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * ey + t * t * p2[1])
         return straight(u)
 
-    def hand(self, deg: float, s: float, scale: float):
-        return self.point(self.Ls, deg, s, scale)
+    def hand(self, deg: float, s: float, scale: float, hold=None):
+        return self.point(self.Ls, deg, s, scale, hold)
 
-    def draw(self, cv, base: Mat, deg: float, s: float, scale: float, alpha: float = 1.0):
+    def draw(self, cv, base: Mat, deg: float, s: float, scale: float, alpha: float = 1.0, hold=None):
         half = self.strip.half * self.K * scale
         for sp, a, b in self.strip.sprites:
             ua, ub = a * self.K, b * self.K
-            pa = self.point(ua, deg, s, scale)
-            pb = self.point(ub, deg, s, scale)
+            pa = self.point(ua, deg, s, scale, hold)
+            pb = self.point(ub, deg, s, scale, hold)
             dx, dy = pb[0] - pa[0], pb[1] - pa[1]
             seg = (ub - ua) or 1e-6
             tx, ty = dx / seg, dy / seg                      # 这一段的方向（含拉伸）
@@ -342,7 +401,7 @@ class ArmRig:
             m = Mat(tx, nx * scale, pa[0], ty, ny * scale, pa[1])
             cv.blit(sp, base.mul(m), alpha)
         _ = half
-        return self.hand(deg, s, scale)
+        return self.hand(deg, s, scale, hold)
 
 
 class LegRig:
@@ -415,6 +474,7 @@ def repair_body(rig) -> None:
     if body is None or not arms:
         return
     a = np.array(body).astype(np.float32)
+    alpha0 = a[..., 3].copy()
     mask = a[..., 3] > 100
     bx, by = rig.pos["body"]
     arm_w = float(rig.data.get("arm_width") or 40)
@@ -427,6 +487,8 @@ def repair_body(rig) -> None:
     cols = np.nonzero(mask.any(axis=0))[0]
     mid_x = (cols.min() + cols.max()) / 2 if cols.size else mask.shape[1] / 2
     joints = rig.data.get("joints") or {}
+    soft = int(rig.data.get("arm_seg") or 1) >= 2   # 新版拆出来的形象：补得更收敛、边缘抗锯齿（默认形象保持原样）
+    cover = np.zeros(mask.shape, dtype=np.float32)
     for side in ("l", "r"):
         if side not in arms:
             continue
@@ -434,6 +496,9 @@ def repair_body(rig) -> None:
         # 手臂在原图里贴着身体走过的那一整段（肩膀到手）都可能被剪出凹陷：这一段都补
         ys_arm = [sy, arms[side]["elbow"][1], (joints.get(f"hand_{side}") or arms[side]["hand"])[1]]
         y0 = int(max(0, min(ys_arm) - by - rc * 1.6))
+        if soft and rig.data.get("neck"):
+            # 脖子以上那一截是被头盖住的，不参与（不然两肩上面会补出两个方角，头盖不住，像一道台阶）
+            y0 = max(y0, int(rig.data["neck"][1] - by + 2))
         # 往下一直补到身体最下沿（裙摆 / 衣服下摆两侧也不能有凹进去的地方）
         rows_any = np.nonzero(mask.any(axis=1))[0]
         y1 = int(rows_any.max()) + 1 if rows_any.size else int(min(mask.shape[0], max(ys_arm) - by + rc * 1.6))
@@ -444,9 +509,18 @@ def repair_body(rig) -> None:
         hull = _convex_hull(_extreme_points(sub))
         if len(hull) < 3:
             continue
-        hm = Image.new("L", (mask.shape[1], mask.shape[0]), 0)
-        ImageDraw.Draw(hm).polygon(hull, fill=255)
-        h = np.asarray(hm) > 0
+        if soft:
+            # 4 倍大小画凸包再缩回来：补出来的边是抗锯齿的，不会一格一格像锯齿
+            ss = 4
+            hm = Image.new("L", (mask.shape[1] * ss, mask.shape[0] * ss), 0)
+            ImageDraw.Draw(hm).polygon([((x + 0.5) * ss, (y + 0.5) * ss) for x, y in hull], fill=255)
+            cv_ = np.asarray(hm.resize((mask.shape[1], mask.shape[0]), Image.BOX), dtype=np.float32) / 255
+            h = cv_ > 0.02
+            cover = np.maximum(cover, cv_ * ((xx < mid_x) if side == "l" else (xx >= mid_x)) * (yy >= y0) * (yy < y1))
+        else:
+            hm = Image.new("L", (mask.shape[1], mask.shape[0]), 0)
+            ImageDraw.Draw(hm).polygon(hull, fill=255)
+            h = np.asarray(hm) > 0
         half = (xx < mid_x) if side == "l" else (xx >= mid_x)
         rows = (yy >= y0) & (yy < y1)
         closed |= h & half & rows
@@ -500,6 +574,11 @@ def repair_body(rig) -> None:
         band = mask & ~inner_t & wide
         fix = band & (lum >= 90)
         a[fix, :3] = ink
+    if soft:
+        # 补出来的像素按凸包覆盖率给透明度（边上是半透明的抗锯齿）；原来就有的半透明边，在凸包里面的也补实
+        zone = closed & near
+        a[..., 3] = np.where(add, cover * 255, a[..., 3])
+        a[..., 3] = np.where(zone & ~add, np.maximum(alpha0, cover * 255), a[..., 3])
     rig.src["body"] = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8), "RGBA")
 
 
@@ -526,8 +605,11 @@ def build_limbs(rig) -> tuple[dict, dict]:
         Hs = tuple(a.get("hand") or joints.get(f"hand_{side}"))
         H0 = tuple(joints.get(f"hand_{side}") or Hs)
         half = max(30.0, arm_w * 0.9 if arm_w else 40.0)
-        path, L = _bent_path(S, E, H0, b=max(6.0, (arm_w or 30) * 0.4))
-        st = _straighten(arr, origin, path, L, half, 0.0, body, bpos, end_margin=half * 1.5, tube=True)
+        # 手肘的圆弯半径至少要比胳膊半宽大一点：不然弯的内侧取样线会交叉（叉腰这种急弯最明显），拉直后一团乱
+        soft = int(d.get("arm_seg") or 1) >= 2
+        path, L = _bent_path(S, E, H0, b=max(6.0, (arm_w or 30) * (0.6 if soft else 0.4)))
+        st = _straighten(arr, origin, path, L, half, 0.0, body, bpos, end_margin=half * 1.5, tube=True,
+                         dedupe=int(d.get("arm_seg") or 1) < 2, soft_root=int(d.get("arm_seg") or 1) >= 2)
         if st is not None:
             arms[side] = ArmRig(st, S, E, H0, Hs, rig.K, rig.L)
     for side in ("l", "r"):

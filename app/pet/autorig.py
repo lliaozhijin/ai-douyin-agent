@@ -3,7 +3,9 @@
 做法和原来雨雨桌宠的 make_parts.py 一样，只是原来的关节坐标是手填的，这里由你在界面上拖好：
 - 脖子以上是头；
 - 肩 → 肘 → 手这条线周围一圈是手臂（粗细可以调），离肩近的是上臂、离手近的是前臂；
-- 胯以下是腿（左右按中线分开，往上多留一截，画在身体后面，抬腿时不会露缝）；
+  一圈以外的“边角料”（比胳膊粗的手 / 蹄子、半透明描边、冒到脖子线以上的一点）也整块归胳膊，身上不留碎片；
+- 腿：按实际轮廓找身体和腿的分界（裆在哪、肚子 / 裙摆外沿在哪），圆肚子垂到胯下面也留在身体上；
+  左右按中线分开，往上多留一截，画在身体后面，抬腿时不会露缝；
 - 剩下的是身体；手臂原来挡住的身体部分用周围的颜色补上（手臂抬起来时不会露出一个洞）；
 - 再合成一条“伸直的手臂”，挥手、跳舞时用。
 
@@ -24,6 +26,8 @@ JOINT_LABELS = {
     "neck": "脖子（头和身体的分界）", "shoulder_l": "左肩", "elbow_l": "左肘", "hand_l": "左手",
     "shoulder_r": "右肩", "elbow_r": "右肘", "hand_r": "右手", "hip_l": "左胯（左腿根）", "hip_r": "右胯（右腿根）",
 }
+ARM_SEG = 2       # 拆手臂的算法版本：2 = 手 / 边角料整块归胳膊（画手臂时不再按颜色去“重复的身体碎片”）
+HAND_EXTRA = 0.15  # 手那里的圆比胳膊半径大多少（再大的手 / 蹄子由下面的“边角料归胳膊”接住；圆太大，叉腰时会把胯挖走一块）
 CANON = {"l": 150.0, "r": 30.0}  # 伸直的手臂朝哪个方向（和原版雨雨一样：往下、往外张开 60°）
 
 
@@ -143,6 +147,77 @@ def _seg_dist(px, py, a, b):
     return np.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
+def _dilate(m: np.ndarray, k: int) -> np.ndarray:
+    """把掩码往外扩 k 像素（十字 / 方形交替，接近圆形）。"""
+    out = m.copy()
+    for i in range(int(k)):
+        n = out.copy()
+        n[1:] |= out[:-1]
+        n[:-1] |= out[1:]
+        n[:, 1:] |= out[:, :-1]
+        n[:, :-1] |= out[:, 1:]
+        if i % 2:
+            n[1:, 1:] |= out[:-1, :-1]
+            n[1:, :-1] |= out[:-1, 1:]
+            n[:-1, 1:] |= out[1:, :-1]
+            n[:-1, :-1] |= out[1:, 1:]
+        out = n
+    return out
+
+
+def _erode(m: np.ndarray, k: int) -> np.ndarray:
+    k = int(k)
+    if k <= 0:
+        return m.copy()
+    return ~_dilate(np.pad(~m, k, constant_values=True), k)[k:-k, k:-k]
+
+
+def _components(m: np.ndarray):
+    """连通块（8 邻接）：按行找“连续的一段”再合并，只用 numpy + 少量循环，大图也快。返回 (标号图, 块数)。"""
+    h, w = m.shape
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    runs = []          # (y, x0, x1, id)
+    prev: list = []
+    for y in range(h):
+        row = m[y]
+        if not row.any():
+            prev = []
+            continue
+        d = np.diff(np.concatenate(([0], row.view(np.int8), [0])))
+        starts, ends = np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]
+        cur = []
+        j = 0
+        for x0, x1 in zip(starts.tolist(), ends.tolist()):
+            rid = len(parent)
+            parent.append(rid)
+            while j < len(prev) and prev[j][1] < x0:   # 上一行这一段完全在左边（且不斜着挨着）
+                j += 1
+            k = j
+            while k < len(prev) and prev[k][0] <= x1:   # 和上一行的段重叠或斜着挨着
+                ra, rb = find(rid), find(prev[k][2])
+                if ra != rb:
+                    parent[ra] = rb
+                k += 1
+            cur.append((x0, x1, rid))
+            runs.append((y, x0, x1, rid))
+        prev = cur
+    lab = np.zeros((h, w), dtype=np.int32)
+    remap: dict[int, int] = {}
+    for y, x0, x1, rid in runs:
+        root = find(rid)
+        if root not in remap:
+            remap[root] = len(remap) + 1
+        lab[y, x0:x1] = remap[root]
+    return lab, len(remap)
+
+
 def _inpaint(rgb: np.ndarray, known: np.ndarray, fill: np.ndarray, iters: int) -> np.ndarray:
     """用周围已知的颜色一圈圈往里扩散，把 fill 区域补上。"""
     rgb = rgb.copy()
@@ -169,6 +244,46 @@ def _inpaint(rgb: np.ndarray, known: np.ndarray, fill: np.ndarray, iters: int) -
     return rgb
 
 
+def _belly_line(fg: np.ndarray, J: dict, mid_x: float, hip_y: float, ground_y: float) -> np.ndarray:
+    """每一列身体和腿的分界 y（见 build 里的说明）。找不到空隙 / 外沿时退回胯的高度。"""
+    Hh, Ww = fg.shape
+    out = np.full(Ww, hip_y + 3, dtype=np.float32)
+    leg_len = ground_y - hip_y
+    if leg_len < 8:
+        return out
+    cx = int(round(min(max(mid_x, 0), Ww - 1)))
+    lo_y = int(min(Hh - 1, hip_y + leg_len * 0.6))
+    # 裆：中线那一列，从胯往下第一个透明的地方（两腿并拢、没有空隙就当是胯）
+    y_c = hip_y + 3
+    col = fg[int(max(0, hip_y)):lo_y + 1, max(0, cx - 1):cx + 2].all(axis=1)
+    gap = np.nonzero(~col)[0]
+    if gap.size:
+        y_c = max(hip_y + 3, hip_y + float(gap[0]))
+    probe = int(min(Hh - 1, (max(y_c, hip_y) + ground_y) / 2))   # 量腿外沿的那一行（小腿中间）
+    for side in ("l", "r"):
+        row = np.nonzero(fg[probe])[0]
+        row = row[row < cx] if side == "l" else row[row > cx]
+        if row.size == 0:
+            continue
+        xo = float(row.min() if side == "l" else row.max())
+        # 从这一行往上找：外轮廓第一次比腿外沿宽出去 3 像素以上的那一行 = 肚子 / 裙摆的下沿
+        y_o = hip_y + 3
+        for y in range(probe, int(max(0, J["neck"][1])), -1):
+            xs_ = np.nonzero(fg[y])[0]
+            xs_ = xs_[xs_ < cx] if side == "l" else xs_[xs_ > cx]
+            if xs_.size and ((side == "l" and xs_.min() < xo - 3) or (side == "r" and xs_.max() > xo + 3)):
+                y_o = float(y)
+                break
+        y_o = min(max(y_o, hip_y - leg_len * 0.3), y_c)
+        span = abs(cx - xo) or 1.0
+        xs_all = np.arange(Ww, dtype=np.float32)
+        t = np.clip(np.abs(cx - xs_all) / span, 0, 1)
+        curve = y_o + (y_c - y_o) * np.sqrt(1 - t * t)   # 四分之一椭圆：外沿往里先快后慢，到裆最低
+        sel = (xs_all < cx) if side == "l" else (xs_all >= cx)
+        out[sel] = curve[sel]
+    return out
+
+
 def build(img: Image.Image, joints: dict, arm_width: float, out_dir: Path, name: str = "") -> dict:
     """拆部件、写 rig.json。img：抠好的 RGBA 图；joints：关节点（图片像素坐标）；arm_width：手臂粗细（像素）。"""
     out_dir = Path(out_dir)
@@ -191,36 +306,90 @@ def build(img: Image.Image, joints: dict, arm_width: float, out_dir: Path, name:
     mid_x = (J["hip_l"][0] + J["hip_r"][0]) / 2
     r = max(4.0, arm_width / 2)
 
-    # 手臂：沿 肩 → 肘 → 手（再往外延伸一个半径，把手掌包进来）
-    arm_w, upper_w, lower_w = {}, {}, {}
+    # 手臂：沿 肩 → 肘 → 手（再往外延伸一个半径），手那里再加一个更大的圆，把比胳膊粗的手 / 蹄子 / 手套整个包进来
+    fg = A > 0.01
+    # 胳膊顶上冒到脖子线以上的那一点（胳膊画在身体后面、肩膀高时常见）：同一列往上不和头连着的，也算胳膊。
+    # 不然这一小条会被分给头，胳膊一动它还留在原地，肩膀上就多一块浅色碎片
+    run_top = np.full(A.shape, np.inf, dtype=np.float32)
+    prev = np.full(Ww, np.inf, dtype=np.float32)
+    for y in range(Hh):
+        cur = np.where(fg[y], np.minimum(prev, y), np.inf)
+        run_top[y] = cur
+        prev = cur
+    above_ok = (ys < neck_y - 2) & (ys >= neck_y - r * 1.5) & (run_top >= neck_y - r * 1.2)
+    arm_w, upper_w, lower_w, d_eff, d_up, d_lo = {}, {}, {}, {}, {}, {}
     for s in ("l", "r"):
         S, E, Hd = J[f"shoulder_{s}"], J[f"elbow_{s}"], J[f"hand_{s}"]
         ln = math.hypot(Hd[0] - E[0], Hd[1] - E[1]) or 1.0
-        H2 = (Hd[0] + (Hd[0] - E[0]) / ln * r, Hd[1] + (Hd[1] - E[1]) / ln * r)
+        # 往手外面只多带 0.6 个半径（指尖再往外的部分由“边角料归胳膊”接住）：叉腰时手搭在身上，带太长会挖到身体
+        H2 = (Hd[0] + (Hd[0] - E[0]) / ln * r * 0.6, Hd[1] + (Hd[1] - E[1]) / ln * r * 0.6)
         d1 = _seg_dist(xs, ys, S, E)
-        d2 = _seg_dist(xs, ys, E, H2)
+        d2 = np.minimum(_seg_dist(xs, ys, E, H2), np.hypot(xs - Hd[0], ys - Hd[1]) - r * HAND_EXTRA)
         d = np.minimum(d1, d2)
-        w = np.clip((r - d) / 1.5, 0, 1) * (ys >= neck_y - 2)
+        d_eff[s], d_up[s], d_lo[s] = d, d1, d2
+        w = np.clip((r - d) / 1.5, 0, 1) * ((ys >= neck_y - 2) | above_ok)
         arm_w[s] = w * A
-        upper_w[s] = arm_w[s] * (d1 <= d2)
-        lower_w[s] = arm_w[s] * (d1 > d2)
+        geo = w if s == "l" else np.maximum(geo, w)
     arm_any = np.maximum(arm_w["l"], arm_w["r"])
+    # 胳膊带子外面的“边角料”：手比胳膊粗露出去的一圈、抗锯齿的半透明描边、蹄子尖……
+    # 原来这些会留在身体图上，胳膊一抬就剩下一块孤零零的碎片。现在：把带子以外的部分做一次“开运算”，
+    # 细条和离身体主干分开的小块 = 胳膊的边角料，分给离它最近的那条胳膊（上臂 / 前臂）
+    d_arm = np.minimum(d_eff["l"], d_eff["r"])
+    rest = fg & ~(geo > 0.05)
+    k = max(2, int(round(r * 0.3)))
+    opened = _dilate(_erode(rest, k), k) & rest
+    lab, n = _components(opened)
+    main = np.zeros_like(rest)
+    if n:
+        area = np.bincount(lab.ravel(), minlength=n + 1)
+        far = np.bincount(lab.ravel(), weights=(d_arm > r * 2.2).ravel(), minlength=n + 1)
+        keep = (far > 0) | (area > fg.sum() * 0.05)
+        keep[0] = False
+        main = keep[lab]
+    core_main = main
+    main = rest & _dilate(main, k + 1)
+    # 紧贴胳膊带子的那一圈：只有本来就是身体主干的才算身体（胳膊和肚子贴着的地方，胳膊的边不会被“补回”身体）
+    main &= core_main | (d_arm > r + 3)
+    resid = rest & ~main & (d_arm <= r * 3) & ((ys >= neck_y - 2) | above_ok)
+    for s, o in (("l", "r"), ("r", "l")):
+        mine = resid & (d_eff[s] <= d_eff[o])
+        arm_w[s] = np.maximum(arm_w[s], mine * A)
+        upper_w[s] = arm_w[s] * (d_up[s] <= d_lo[s])
+        lower_w[s] = arm_w[s] * (d_up[s] > d_lo[s])
+    # 从头 / 身体 / 腿里去掉的范围按“位置”算（在胳膊带子里、或是分给胳膊的边角料），不按透明度：
+    # 不然胳膊边上几乎透明的那一圈描边会留在身体上，胳膊一动就是几道淡淡的细线
+    arm_any = np.maximum(geo, resid.astype(np.float32))
+    arm_mask = _dilate(arm_any > 0.05, 2)
 
     # 头：脖子以上（边缘柔和过渡 3 像素）。
-    # 垂到脖子下面的头发（双马尾、长发）：脖子下面一小段里、在两肩外侧、又不是手臂的部分，也算头，跟着头一起动
-    head_a = A * np.clip((neck_y + 1.5 - ys) / 3, 0, 1)
+    # 垂到脖子下面的头发（双马尾、长发）：脖子下面一小段里、在两肩外侧、又不是手臂的部分，
+    # 而且要从脖子上面（头那边）一路连下来，才算头发，跟着头一起动（胳膊的描边、身体的边不会被误认成头发）
+    head_a = A * np.clip((neck_y + 1.5 - ys) / 3, 0, 1) * (arm_any <= 0.05)
     sl_x, sr_x = J["shoulder_l"][0] - r * 0.3, J["shoulder_r"][0] + r * 0.3
     band = (ys >= neck_y - 10) & (ys < neck_y + (ground_y - top) * 0.15)
     outside = (xs < min(sl_x, sr_x)) | (xs > max(sl_x, sr_x))
-    hair = A * band * outside * (arm_any < 0.3)
+    zone = fg & outside & ~arm_mask & ((ys < neck_y) | band)
+    hair_m = np.zeros_like(zone)
+    lab, n = _components(zone)
+    if n:
+        from_head = np.bincount(lab.ravel(), weights=(ys < neck_y - 2).ravel(), minlength=n + 1)
+        below = np.bincount(lab.ravel(), weights=(ys >= neck_y).ravel(), minlength=n + 1)
+        ok = (from_head > 0) & (below >= (r * 0.6) ** 2)
+        ok[0] = False
+        hair_m = ok[lab] & (ys >= neck_y - 10)
+    hair = A * hair_m
     head_a = np.maximum(head_a, hair)
-    # 腿：胯以下，往上多留一截（画在身体后面）
+    # 身体和腿的分界：圆肚子 / 裙摆常常垂到胯下面，按一条水平线切会把肚子底切成两半分给两条腿，
+    # 一抬腿肚子底就跟着走（缺一块、裆部一道“T”字缝）。所以按实际轮廓找：两腿中间的空隙从哪儿开始（裆），
+    # 腿外侧从哪儿开始比身体窄（肚子 / 裙摆的外沿），中间用一条圆弧连起来，弧线以上归身体，以下归腿
+    y_b = _belly_line(fg, J, mid_x, hip_y, ground_y)[None, :]
+    # 腿：分界线以下，往上多留一截（画在身体后面）
     leg_over = max(4.0, (ground_y - hip_y) * 0.18)
-    legs = A * np.clip((ys - (hip_y - leg_over)) / 2, 0, 1) * (1 - np.clip(arm_any * 2, 0, 1))
+    legs = A * np.clip((ys - (y_b - leg_over)) / 2, 0, 1) * (1 - np.clip(arm_any * 2, 0, 1))
     leg_l_a = legs * (xs < mid_x)
     leg_r_a = legs * (xs >= mid_x)
     # 身体：脖子以上留一截被头盖住，胯以下去掉，手臂的部分去掉后补色
-    body_a = A * np.clip((ys - (neck_y - 8)) / 2, 0, 1) * np.clip((hip_y + 3 - ys) / 3, 0, 1) * (hair < 0.5)
+    body_a = A * np.clip((ys - (neck_y - 8)) / 2, 0, 1) * np.clip((y_b + 1.5 - ys) / 3, 0, 1) * (hair < 0.5)
     removed = (arm_any > 0.05) & (body_a > 0)
     keep = (body_a > 0.5) & ~removed
     span = np.zeros_like(keep)
@@ -293,6 +462,7 @@ def build(img: Image.Image, joints: dict, arm_width: float, out_dir: Path, name:
     K = 300.0 / max(10.0, ground_y - top)
     rig = {"version": 1, "name": name, "K": round(K, 5), "ground": [round(mid_x, 1), ground_y],
            "neck": list(J["neck"]), "hip_l": list(J["hip_l"]), "hip_r": list(J["hip_r"]), "arms": arms,
-           "parts": parts, "joints": {k: list(v) for k, v in J.items()}, "arm_width": arm_width}
+           "parts": parts, "joints": {k: list(v) for k, v in J.items()}, "arm_width": arm_width,
+           "arm_seg": ARM_SEG}
     (out_dir / "rig.json").write_text(json.dumps(rig, ensure_ascii=False, indent=1), encoding="utf-8")
     return rig

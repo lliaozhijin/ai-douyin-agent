@@ -20,15 +20,66 @@ def _part(cv: Canvas, rig: Rig, name: str, m: Mat, alpha: float = 1.0) -> None:
     cv.blit(rig.sprites.get(name), m, alpha)
 
 
-def _arm(cv: Canvas, rig: Rig, side: str, base: Mat, deg: float, s: float, scale: float):
-    """画一条手臂，返回手的位置（逻辑坐标）。"""
+def _reach(rig: Rig, side: str) -> float:
+    """肩膀到手心的长度（逻辑单位，按原图）。"""
+    limb = rig.limb_arms.get(side) if hasattr(rig, "limb_arms") else None
+    if limb is not None:
+        return limb.Ls
+    a = rig.arms[side]
+    h0 = _hand0(rig, side)
+    return math.dist(a["shoulder"], a["elbow"]) + math.dist(a["elbow"], h0)
+
+
+def _hand0(rig: Rig, side: str):
+    """原图里手的位置（逻辑坐标）；旧形象没记就用伸直时的手。"""
+    j = (rig.data.get("joints") or {}).get(f"hand_{side}")
+    return rig.L(*j) if j else rig.arms[side]["hand"]
+
+
+def hold_target(rig: Rig, side: str, d=(0.0, 0.0)):
+    """双手捧手机时这只手放在哪（逻辑坐标）：身体中线两边、胸口偏下，按这个形象的肩宽和胳膊长短算。"""
+    sl, sr = rig.arms["l"]["shoulder"], rig.arms["r"]["shoulder"]
+    sy = (sl[1] + sr[1]) / 2
+    reach = min(_reach(rig, "l"), _reach(rig, "r"))
+    gap = 15 * rig.fy                                  # 手机约 26 宽：两只手扶在手机两侧
+    dx = max(0.0, abs(sr[0] - sl[0]) / 2 - gap)        # 肩膀到手横着要伸多远
+    dy = reach * 0.62                                  # 胸口偏下
+    # 手离肩膀最多 0.88 个臂长：手肘始终留着一个自然的弯（约 55° 以上）。
+    # 胳膊短的形象够不着就把手机拿高一点（但不高过 0.4 个臂长），再不够就两只手稍微分开一点
+    dmax = reach * 0.88
+    if dx * dx + dy * dy > dmax * dmax:
+        dy = max(reach * 0.4, math.sqrt(max(0.0, dmax * dmax - dx * dx)))
+        if dx * dx + dy * dy > dmax * dmax:
+            dx = math.sqrt(max(0.0, dmax * dmax - dy * dy))
+    x = sl[0] + dx if side == "l" else sr[0] - dx
+    return (x + d[0], sy + dy + d[1])
+
+
+def _arm(cv: Canvas, rig: Rig, side: str, base: Mat, deg: float, s: float, scale: float, hold=None):
+    """画一条手臂，返回手的位置（逻辑坐标）。hold = (程度, 目标点, 手肘朝向)：捧东西时手放到目标点、手肘自然弯着。"""
     limb = rig.limb_arms.get(side) if hasattr(rig, "limb_arms") else None
     if limb is not None:  # 整条手臂顺着骨头弯着画：关节处不会裂开
-        hx, hy = limb.draw(cv, base, deg, s, scale)
+        hx, hy = limb.draw(cv, base, deg, s, scale, hold=hold)
         return base.apply(hx, hy)
     a = rig.arms[side]
     sx, sy = a["shoulder"]
     ma = base.translate(sx, sy).rotate(deg).scale(scale, scale).translate(-sx, -sy)
+    if hold and hold[0] > 1e-3:   # 分段画法：上臂绕肩、前臂绕肘各自转到反解出来的角度
+        from .limbs import two_bone
+        h, target, out = hold
+        ex, ey = a["elbow"]
+        h0 = _hand0(rig, side)
+        up0 = math.atan2(ey - sy, ex - sx)
+        lo0 = math.atan2(h0[1] - ey, h0[0] - ex)
+        iu, il = two_bone((sx, sy), math.dist((sx, sy), (ex, ey)) * scale, math.dist((ex, ey), h0) * scale, target, out)
+        du = math.degrees((iu - up0 + math.pi) % (2 * math.pi) - math.pi) * h
+        dl = math.degrees((il - lo0 + math.pi) % (2 * math.pi) - math.pi) * h
+        mb = ma.about(sx, sy, du)
+        lo = mb.about(ex, ey, dl - du)
+        _part(cv, rig, f"arm_{side}_cap", lo, h)
+        _part(cv, rig, f"arm_{side}_lo", lo)
+        _part(cv, rig, f"arm_{side}_up", mb)
+        return lo.apply(*h0)
     full = smooth((s - 0.75) / 0.22)
     if full < 0.999:
         mb = ma.about(sx, sy, a["adj"] * s) if a["adj"] else ma
@@ -76,11 +127,14 @@ def draw_pet(cv: Canvas, rig: Rig, p: Pose, t: float, face=None) -> None:
     am = m.translate(0, p.ArmDY)
     hands = {}
 
+    def hold(side: str, h: float, d):
+        return (h, hold_target(rig, side, d), -1.0 if side == "l" else 1.0) if h > 1e-3 else None
+
     def arms(left: bool, right: bool):
         if left:
-            hands["l"] = _arm(cv, rig, "l", am, p.ArmL, p.StrL, p.ArmScale)
+            hands["l"] = _arm(cv, rig, "l", am, p.ArmL, p.StrL, p.ArmScale, hold("l", p.HoldL, p.HoldDL))
         if right:
-            hands["r"] = _arm(cv, rig, "r", am, -p.ArmR, p.StrR, p.ArmScale)
+            hands["r"] = _arm(cv, rig, "r", am, -p.ArmR, p.StrR, p.ArmScale, hold("r", p.HoldR, p.HoldDR))
 
     arms(not front_l, not front_r)
     if p.Phone and "l" in hands and "r" in hands:  # 手机捧在两只手中间

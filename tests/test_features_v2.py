@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import sys
 import tempfile
@@ -36,6 +37,7 @@ if not getattr(unittest.TestCase, "_cancel_reset", False):
     unittest.TestCase.run = _run_with_reset
     unittest.TestCase._cancel_reset = True
 
+import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from app.agent.brain import Brain  # noqa: E402
@@ -1214,3 +1216,158 @@ class PersonaCustomTests(unittest.TestCase):
         for k in ("vibe", "archetype", "custom"):
             self.assertNotIn(k, p)
         self.assertEqual(p["traits"]["energy"], 12)
+
+
+def _chubby_pet():
+    """和用户反馈的小猪类似：粗短胳膊画在身体后面、蹄子比胳膊粗、圆肚子垂到胯下面、没有轮廓线。"""
+    from PIL import ImageDraw
+    img = Image.new("RGBA", (600, 820), (0, 0, 0, 0))
+    hoof = Image.new("L", img.size, 0)
+    d = ImageDraw.Draw(img)
+    dh = ImageDraw.Draw(hoof)
+    pink = (250, 170, 190, 255)
+    for (sx, sy), (ex, ey), (hx, hy) in (((215, 470), (165, 535), (140, 590)), ((385, 470), (435, 535), (460, 590))):
+        d.line((sx, sy, ex, ey, hx, hy), fill=pink, width=50, joint="curve")
+        d.ellipse((hx - 32, hy - 30, hx + 32, hy + 34), fill=(245, 160, 180, 255))
+        dh.ellipse((hx - 32, hy - 30, hx + 32, hy + 34), fill=255)
+    for x in (255, 345):
+        d.rounded_rectangle((x - 36, 640, x + 36, 780), radius=34, fill=(240, 160, 180, 255))
+    d.ellipse((185, 410, 415, 700), fill=(252, 178, 198, 255))      # 圆肚子（底到 700，胯在 680）
+    d.ellipse((150, 160, 450, 470), fill=(250, 175, 195, 255))      # 头套
+    d.ellipse((210, 260, 390, 440), fill=(245, 215, 200, 255))      # 脸
+    joints = {"neck": [300, 452], "shoulder_l": [215, 470], "elbow_l": [165, 535], "hand_l": [140, 592],
+              "shoulder_r": [385, 470], "elbow_r": [435, 535], "hand_r": [460, 592],
+              "hip_l": [255, 680], "hip_r": [345, 680]}
+    return img, joints, np.asarray(hoof) > 128
+
+
+def _layer(out: Path, rig: dict, name: str, size) -> np.ndarray:
+    """某个部件放回原图位置后的透明度（0～255）。"""
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    if name in rig["parts"]:
+        canvas.alpha_composite(Image.open(out / f"{name}.png"), tuple(rig["parts"][name]))
+    return np.asarray(canvas)[..., 3].astype(int)
+
+
+class CutoutSeamTests(unittest.TestCase):
+    """自定义形象拆部件：手 / 蹄子整块归胳膊、不留碎片；胳膊描边不被当成头发；肚子底不被切给腿；同色胳膊不被削成细棍。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from app.pet import autorig
+        cls.img, cls.joints, cls.hoof = _chubby_pet()
+        cls.out = Path(tempfile.mkdtemp()) / "rig"
+        cls.rig = autorig.build(cls.img, cls.joints, 50, cls.out)
+
+    def test_components(self):
+        from app.pet.autorig import _components
+        m = np.zeros((20, 20), dtype=bool)
+        m[2:5, 2:5] = True
+        m[10:15, 10:12] = True
+        m[5, 5] = True                      # 斜着挨着 → 和第一块是一块
+        lab, n = _components(m)
+        self.assertEqual(n, 2)
+        self.assertEqual(lab[2, 2], lab[5, 5])
+        self.assertNotEqual(lab[2, 2], lab[12, 10])
+
+    def test_whole_hoof_goes_with_arm(self):
+        size = self.img.size
+        arm = sum(_layer(self.out, self.rig, n, size) for n in ("arm_l_up", "arm_l_lo", "arm_r_up", "arm_r_lo"))
+        self.assertGreater((arm[self.hoof] > 128).mean(), 0.97)       # 比胳膊粗的蹄子整块在胳膊里
+        for name in ("head", "body", "leg_l", "leg_r"):
+            a = _layer(self.out, self.rig, name, size)
+            self.assertLess(int((a[self.hoof] > 12).sum()), 15, name)  # 头 / 身体 / 腿上不留蹄子碎片
+
+    def test_no_arm_edges_left_on_head_or_body(self):
+        size = self.img.size
+        A = np.asarray(self.img)[..., 3]
+        torso = np.zeros(A.shape, dtype=bool)
+        from PIL import ImageDraw
+        t = Image.new("L", size, 0)
+        ImageDraw.Draw(t).ellipse((183, 408, 417, 702), fill=255)
+        ImageDraw.Draw(t).ellipse((148, 158, 452, 472), fill=255)
+        torso = np.asarray(t) > 0
+        outside = (A > 0) & ~torso & (np.arange(size[1])[:, None] < 640)   # 头 / 肚子以外、腿以上 = 只有胳膊
+        for name in ("head", "body"):
+            a = _layer(self.out, self.rig, name, size)
+            self.assertEqual(int((a[outside] > 3).sum()), 0, name)
+
+    def test_belly_bottom_stays_on_body(self):
+        size = self.img.size
+        body = _layer(self.out, self.rig, "body", size)
+        self.assertGreater(body[692, 300], 200)                       # 胯（680）下面的肚子底还在身体上
+        legs = _layer(self.out, self.rig, "leg_l", size) + _layer(self.out, self.rig, "leg_r", size)
+        self.assertGreater(legs[760, 255], 200)
+
+    def test_same_colour_arm_not_thinned(self):
+        from app.pet.rig import Rig
+        self.assertEqual(self.rig.get("arm_seg"), 2)
+        r = Rig(self.out)
+        self.assertIn("l", r.limb_arms)
+        st = r.limb_arms["l"].strip
+        a = np.asarray(st.img)[..., 3]
+        mid = int(st.e + st.length * 0.45)                             # 上臂和前臂之间那一段
+        self.assertGreaterEqual(int((a[:, mid] > 128).sum()), 40)     # 胳膊画的是 50 粗：不能被当成身体碎片削细
+
+    def test_default_rig_unchanged_path(self):
+        """默认形象（旧版拆的，没有 arm_seg）照旧按原来的方式处理。"""
+        from app.pet.rig import Rig, rig_dir
+        r = Rig(rig_dir("default"))
+        self.assertNotIn("arm_seg", r.data)
+        self.assertEqual(set(r.limb_arms), {"l", "r"})
+
+
+class PhoneHoldTests(unittest.TestCase):
+    """刷视频捧手机：手肘自然弯着、双手在手机两边，不是两条胳膊直直地交叉伸过去。"""
+
+    def _pose(self, act, secs=2.0):
+        from app.pet import engine as E
+        pet = E.Pet(rnd=random.Random(3))
+        pet.set_act(act, 1e9)
+        for _ in range(int(secs / 0.033)):
+            pet.act_t += 0.033
+            pet.t += 0.033
+            pet._smooth_arms(0.033)
+        return pet.pose()
+
+    def test_engine_uses_hold_not_straight_arms(self):
+        from app.pet import engine as E
+        p = self._pose(E.PHONE)
+        self.assertGreater(p.HoldL, 0.95)
+        self.assertGreater(p.HoldR, 0.95)
+        self.assertLess(p.StrL, 0.05)
+        self.assertLess(abs(p.ArmL), 2.0)
+        free = self._pose(E.WAVE, 1.0)
+        self.assertLess(free.HoldL, 0.05)                 # 别的动作不受影响
+
+    def test_two_bone_bends_elbow_outward(self):
+        from app.pet.limbs import two_bone
+        up, lo = two_bone((0.0, 0.0), 50.0, 50.0, (40.0, 60.0), out=-1.0)   # 左手伸向身前偏右下
+        ex = math.cos(up) * 50
+        self.assertLess(ex, 0)                            # 手肘在肩膀外侧（左边）
+        bend = abs((lo - up + math.pi) % (2 * math.pi) - math.pi)
+        self.assertGreater(math.degrees(bend), 45)        # 真的弯了
+        hx, hy = ex + math.cos(lo) * 50, math.sin(up) * 50 + math.sin(lo) * 50
+        self.assertAlmostEqual(hx, 40.0, delta=0.5)
+        self.assertAlmostEqual(hy, 60.0, delta=0.5)
+
+    def test_rig_hands_meet_at_phone_without_crossing(self):
+        from app.pet import engine as E
+        from app.pet.render import hold_target
+        from app.pet.rig import Rig, rig_dir
+        r = Rig(rig_dir("default"))
+        p = self._pose(E.PHONE)
+        hands = {}
+        for side, deg, h, d in (("l", p.ArmL, p.HoldL, p.HoldDL), ("r", -p.ArmR, p.HoldR, p.HoldDR)):
+            limb = r.limb_arms[side]
+            hold = (h, hold_target(r, side, d), -1.0 if side == "l" else 1.0)
+            hands[side] = limb.hand(deg, p.StrL, 1.0, hold)
+            (sx, sy), (ex, ey), up, lo = limb.chain(deg, p.StrL, 1.0, hold)
+            out = -1 if side == "l" else 1
+            hx, hy = hands[side]
+            x_line = sx + (hx - sx) * (ey - sy) / ((hy - sy) or 1e-6)          # 肩→手连线在手肘这一高度的 x
+            self.assertGreater((ex - x_line) * out, 0, side)                     # 手肘往外弯，不往身体里拐
+            bend = abs((lo - up + math.pi) % (2 * math.pi) - math.pi)
+            self.assertGreater(math.degrees(bend), 30, side)                     # 手肘弯着
+        self.assertLess(hands["l"][0], hands["r"][0])                            # 左手在左、右手在右，不交叉
+        self.assertLess(hands["r"][0] - hands["l"][0], 80 * r.fy)               # 两只手凑在手机两边
