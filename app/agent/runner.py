@@ -556,20 +556,33 @@ class Agent(threading.Thread):
 
     def _watch_one(self, b: DouyinBrowser, rules: dict) -> None:
         feed = Feed(b)
+        skip_ads = bool(rules.get("skip_ads", True))
         try:
-            v = feed.read_current(with_comments=True)
+            v = feed.read_current(with_comments=True, skip_ad=skip_ads)
         except FeedReadError as first:
             # 可能被跳到了别的页面：重新打开推荐页再读一次；还读不到就交给主循环（连续 3 次会自动暂停）
             log.warning("%s，重新打开推荐页再试", first)
             self.current = {"title": "", "author": "", "step": "读不到视频信息，重新打开推荐页"}
             feed.open()
-            v = feed.read_current(with_comments=True)
+            v = feed.read_current(with_comments=True, skip_ad=skip_ads)
         self.current = {"title": v["desc"][:40] or "（无文案）", "author": v["author"], "step": "读文案和热评",
                         "frames": []}
         if self.db.seen_video(v["video_id"]):
             feed.next()
             return
         if self._stopped():
+            return
+        if v.get("ad") and skip_ads:
+            # 刷到广告：真人大多直接划走；也不让她给广告点赞、评论，还省一次模型调用
+            bus.emit("skip")
+            self.current["step"] = "是广告，划走"
+            title = f"《{v['desc'][:24] or '无文案'}》"
+            vrow = self.db.add_video(video_id=v["video_id"], url=v["url"], author=v["author"], title=v["desc"][:100],
+                                     decision="skip", reason="广告")
+            self.db.add_event("skip", f"划走广告 {title}", "刷到广告，直接划走", ref=f"video:{vrow}")
+            if not self._sleep(random.uniform(1.5, 4.0)) or self._stopped():
+                return
+            feed.next()
             return
         self.budget.use("videos")
         bias = self.mood.bias()
@@ -1209,7 +1222,8 @@ class Agent(threading.Thread):
 
         try:
             b = self._ensure_browser()
-            msg = publish(b, d, files, step=step, wait_login=self._wait_creator_login)
+            msg = publish(b, d, files, step=step, wait_login=self._wait_creator_login,
+                          wait_verify=self._wait_publish_verify)
         except OperationCancelled:
             self.db.update_draft(did, status="failed",
                                  error="你让她休息了，发布中途停下，作品没有发出去（可以再点一次“确认发布”）")
@@ -1247,8 +1261,37 @@ class Agent(threading.Thread):
             self.browser.hide_window()
         return ok
 
+    def _wait_publish_verify(self, kind: str) -> bool:
+        """发作品时抖音要求验证（多半是点“发布”后的“接收短信验证码”）：弹窗提醒、浏览器拿到最前面，
+        等你在浏览器里验证完（最多 10 分钟）。验证完把浏览器藏回后台，返回 True，她接着等发布结果。"""
+        self._raise_attention(kind, during_publish=True)
+        started = time.time()
+        gone = 0
+        ok = False
+        try:
+            while time.time() - started < 600 and not self._shutdown and self.browser:
+                if self.browser.verification_open():
+                    gone = 0
+                else:
+                    gone += 1
+                    if gone >= 2:
+                        ok = True
+                        break
+                time.sleep(1.5)
+        finally:
+            self._clear_attention()
+            if self.browser:
+                with cancel.shield():
+                    try:
+                        self.browser.hide_window()
+                    except Exception:  # noqa: BLE001
+                        log.warning("验证后藏浏览器失败", exc_info=True)
+        self.db.add_event("info" if ok else "error", "发作品时的验证已完成" if ok else "发作品时的验证没有完成",
+                          f"等了 {int(time.time() - started)} 秒")
+        return ok
+
     # ---------- 验证码 ----------
-    def _raise_attention(self, kind: str, during_login: bool = False) -> None:
+    def _raise_attention(self, kind: str, during_login: bool = False, during_publish: bool = False) -> None:
         """需要你亲自处理：把浏览器拿到屏幕上，软件窗口弹到前面并弹窗说明（不只是一行小字）。"""
         self._attention_seq += 1
         if kind == "creator_login":
@@ -1257,18 +1300,26 @@ class Agent(threading.Thread):
                     "登录好后她会自动接着发布。")
         elif kind == "sms":
             title = "需要填写手机验证码"
-            body = ("抖音要求验证你的手机号。请到她的浏览器窗口里点“获取验证码”，"
-                    "把手机收到的短信验证码填进去并确认。" + ("填完就登录成功了。" if during_login else
-                    "验证完成后浏览器会自动藏回后台，她继续刷视频。") + "（软件不会、也不能替你填写验证码。）")
+            body = (("发作品时抖音要求验证你的手机号。" if during_publish else "抖音要求验证你的手机号。")
+                    + "请到弹到最前面的浏览器窗口里点“获取验证码”，把手机收到的短信验证码填进去，再点“验证”。"
+                    + ("填完就登录成功了。" if during_login else
+                       "验证完成后浏览器会自动藏回后台，她接着把作品发出去。" if during_publish else
+                       "验证完成后浏览器会自动藏回后台，她继续刷视频。") + "（软件不会、也不能替你填写验证码。）")
         else:
             title = "需要你完成一个验证"
-            body = ("抖音弹出了安全验证（比如拖动滑块、点选图片）。请到她的浏览器窗口里手动完成，"
-                    "完成后浏览器会自动藏回后台，她继续刷视频。（软件不会自动破解验证码。）")
+            body = ("抖音弹出了安全验证（比如拖动滑块、点选图片）。请到弹到最前面的浏览器窗口里手动完成，"
+                    + ("完成后浏览器会自动藏回后台，她接着把作品发出去。" if during_publish else
+                       "完成后浏览器会自动藏回后台，她继续刷视频。") + "（软件不会自动破解验证码。）")
         self.attention = {"id": self._attention_seq, "kind": kind, "title": title, "body": body}
         self.alert = f"{title}：{body}"
+        # 先让软件窗口亮出来（恢复最小化、任务栏闪烁、弹窗写着要做什么），再把浏览器放到最前面：
+        # 以前顺序反过来，浏览器刚拿出来就被随后弹到前面的软件窗口整个挡住，看着像还藏着
+        log.info("需要你处理：%s（%s）", title, kind)
+        winfocus.call_attention(APP_NAME)
         if self.browser:
             self.browser.show_window()
-        winfocus.call_attention(APP_NAME)  # 软件窗口弹到前面、任务栏闪烁，让你看到弹窗
+        else:
+            log.warning("要你处理验证，但浏览器对象不在了")
         bus.emit("attention", title)
         if kind != "creator_login":
             self.mood.event("captcha")

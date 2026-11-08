@@ -54,6 +54,7 @@ DEFAULT_RULES = {
     "card_bg_default": "",         # 文字卡片默认背景：空 = 内置粉色样式；否则是“背景图库”里的文件名
     "card_panel_default": True,    # 默认把文字写在半透明白卡片上
     "collect_enabled": True,       # 刷到特别喜欢、想以后再看的视频时收藏
+    "skip_ads": True,              # 刷到广告直接划走（不看、不点赞、不评论，也不花模型的钱）
     "engage_comments": True,       # 看到喜欢的评论时，给别人的评论点赞 / 回复
     "dm_scope": "all",             # all 回复所有人 / followers 只回复关注了她的人
     "share_watch_minutes": 3,      # 私信里别人分享的视频：最多完整看几分钟（更长的后面快进着看）

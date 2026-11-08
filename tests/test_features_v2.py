@@ -1618,3 +1618,282 @@ class CollectPolicyTests(unittest.TestCase):
             agent._watch_one(mock.Mock(), agent.db.rules())
         self.assertFalse(agent.brain.decide.call_args.kwargs["can_collect"])
         feed.collect.assert_not_called()                                              # 模型说要收也不收
+
+
+class PublishVerifyTests(unittest.TestCase):
+    """创作者中心点“发布”后弹“接收短信验证码”：要认出来、弹窗等你验证，验证完接着等发布结果。"""
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "creator_sms_verify.html"
+
+    def test_real_dialog_is_recognised(self):
+        """用用户发来的真实页面里的验证弹窗：verification_open() 要认出来，verify_kind() 是短信验证。"""
+        try:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"没有 Playwright：{e}")
+        try:
+            try:
+                br = pw.chromium.launch()
+            except Exception:  # noqa: BLE001
+                try:
+                    br = pw.chromium.launch(executable_path="/usr/bin/google-chrome", args=["--no-sandbox"])
+                except Exception as e:  # noqa: BLE001
+                    self.skipTest(f"没有可用的浏览器：{e}")
+            from app.douyin.browser import DouyinBrowser
+            from app.douyin.selectors import DEFAULT_SELECTORS
+            ctx = br.new_context()
+            page = ctx.new_page()
+            page.goto(self.FIXTURE.as_uri())
+            b = DouyinBrowser.__new__(DouyinBrowser)
+            b.sel, b.ctx, b._page = DEFAULT_SELECTORS, ctx, page
+            self.assertTrue(b.verification_open())
+            self.assertEqual(b.verify_kind(), "sms")
+            page.set_content("<p>评论：收到验证码了吗 哈哈</p>")
+            self.assertFalse(b.verification_open())                                  # 只有“验证码”几个字不算
+            br.close()
+        finally:
+            pw.stop()
+
+    def _browser(self, verify_seq, published_after):
+        """假浏览器：verify_seq 依次是每次查“有没有验证框”的结果；第 published_after 次查结果时显示发布成功。"""
+        b = mock.Mock()
+        b.sel = {"creator_done_words": ["发布成功"]}
+        seq = iter(verify_seq)
+        b.verification_open.side_effect = lambda: next(seq, False)
+        b.verify_kind.return_value = "sms"
+        n = {"checks": 0}
+
+        def visible(*a, **k):
+            n["checks"] += 1
+            return n["checks"] >= published_after
+        b.page.url = "https://creator.douyin.com/creator-micro/content/upload"
+        b.page.get_by_text.return_value.first.is_visible.side_effect = visible
+        b.dump.return_value = "x"
+        return b
+
+    def test_handle_verify(self):
+        from app.douyin import publish as pub
+        b = self._browser([False], 99)
+        self.assertFalse(pub._handle_verify(b, mock.Mock()))                         # 没有验证：不打扰
+        b = self._browser([True], 99)
+        wait = mock.Mock(return_value=True)
+        self.assertTrue(pub._handle_verify(b, wait))
+        wait.assert_called_once_with("sms")
+        b = self._browser([True], 99)
+        with self.assertRaises(pub.PublishError) as ctx:
+            pub._handle_verify(b, mock.Mock(return_value=False))                     # 没验证完：明确告诉你原因
+        self.assertIn("手机短信验证码", str(ctx.exception))
+
+    def test_after_click_waits_for_sms_then_finishes(self):
+        """点了“发布”→ 弹短信验证 → 你验证完 → 自动补点一次“发布” → 看到发布成功。"""
+        from app.douyin import publish as pub
+        b = self._browser([False, True, False, False], published_after=3)
+        b.find.return_value = mock.Mock()
+        b.safe_click.return_value = True
+        waited = []
+        with mock.patch.object(pub, "declare_ai", return_value=True), \
+                mock.patch.object(pub.cancel, "sleep"), mock.patch.object(pub, "_visible_text", return_value=""), \
+                mock.patch.object(pub, "_published", side_effect=[False, True]):
+            b.in_new_tab.return_value.__enter__ = mock.Mock(return_value=None)
+            b.in_new_tab.return_value.__exit__ = mock.Mock(return_value=False)
+            msg = pub.publish(b, {"kind": "image", "title": "t", "text": "x", "tags": []}, [Path("a.jpg")],
+                              wait_verify=lambda k: waited.append(k) or True)
+        self.assertEqual(msg, "发布成功")
+        self.assertEqual(waited, ["sms"])
+        publish_clicks = [c for c in b.safe_click.call_args_list if c.args[1:] == ("发布",)]
+        self.assertEqual(len(publish_clicks), 2)                                     # 验证完补点了一次
+
+    def test_runner_wait_publish_verify_pops_up_and_hides(self):
+        from app.agent.runner import Agent
+        agent = Agent(make_db())
+        agent.browser = mock.Mock()
+        seq = iter([True, False, False])
+        agent.browser.verification_open.side_effect = lambda: next(seq, False)
+        seen = []
+        with mock.patch("app.agent.runner.winfocus"), \
+                mock.patch("app.agent.runner.time.sleep", side_effect=lambda s: seen.append(agent.attention)):
+            ok = agent._wait_publish_verify("sms")
+        self.assertTrue(ok)
+        self.assertEqual(seen[0]["kind"], "sms")
+        self.assertIn("发作品时", seen[0]["body"])
+        self.assertIn("接着把作品发出去", seen[0]["body"])
+        agent.browser.show_window.assert_called()
+        agent.browser.hide_window.assert_called_once()
+        self.assertIsNone(agent.attention)
+
+
+class StubbornClickTests(unittest.TestCase):
+    """点“通知 / 私信”入口被浮层挡住、视频画面一直在动：换点法 / 换截图方法，在真浏览器里验证。"""
+
+    PAGE = """<!doctype html><meta charset="utf-8"><body style="margin:0">
+    <button data-e2e="im-entry" style="position:absolute;left:20px;top:20px;width:80px;height:40px"
+      onclick="document.getElementById('p').style.display='block'">消息</button>
+    <div id="mask" style="position:absolute;left:0;top:0;width:300px;height:100px;background:transparent"></div>
+    <div id="p" data-e2e="im-panel" style="display:none;position:absolute;left:20px;top:120px;width:200px;height:200px;background:#fcc">私信面板</div>
+    <video id="v" width="160" height="90" style="position:absolute;left:20px;top:340px;background:#36c;
+      animation:wob .2s infinite alternate"></video>
+    <style>@keyframes wob{from{transform:translateX(0)}to{transform:translateX(30px)}}</style></body>"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from playwright.sync_api import sync_playwright
+            cls.pw = sync_playwright().start()
+        except Exception as e:  # noqa: BLE001
+            raise unittest.SkipTest(f"没有 Playwright：{e}")
+        try:
+            try:
+                cls.br = cls.pw.chromium.launch()
+            except Exception:  # noqa: BLE001
+                cls.br = cls.pw.chromium.launch(executable_path="/usr/bin/google-chrome", args=["--no-sandbox"])
+        except Exception as e:  # noqa: BLE001
+            cls.pw.stop()
+            raise unittest.SkipTest(f"没有可用的浏览器：{e}")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.br.close()
+        cls.pw.stop()
+
+    def _browser(self):
+        from app.douyin.browser import DouyinBrowser
+        ctx = self.br.new_context()
+        page = ctx.new_page()
+        page.set_content(self.PAGE)
+        b = DouyinBrowser.__new__(DouyinBrowser)
+        b.ctx, b._page = ctx, page
+        b.sel = {"tip_close": [], "dm_entry": ["[data-e2e='im-entry']"], "dm_panel": ["[data-e2e='im-panel']"],
+                 "captcha": [], "video_element": ["video"]}
+        b.pause = lambda *a, **k: None
+        return b, page
+
+    def test_covered_entry_still_opens_panel(self):
+        b, page = self._browser()
+        entry = page.locator("[data-e2e='im-entry']").first
+        with self.assertLogs("app.douyin.browser", level="INFO") as logs:
+            ok = b.click_open(entry, "私信入口", lambda t: b.find("dm_panel", timeout=t) is not None)
+        self.assertTrue(ok)
+        self.assertTrue(page.locator("#p").is_visible())
+        self.assertTrue(any("intercepts pointer events" in m for m in logs.output))   # 日志里写清了被什么挡住
+
+    def test_why_picks_useful_line(self):
+        from app.douyin.browser import why
+        e = Exception("Timeout 6000ms exceeded.\nCall log:\n  - waiting for locator\n"
+                      "  - <div class=\"mask\"></div> intercepts pointer events\n  - retrying click action")
+        self.assertIn("intercepts pointer events", why(e))
+        self.assertTrue(why(e).startswith("Timeout 6000ms exceeded."))
+
+    def test_moving_video_still_captured(self):
+        from app.douyin.feed import Feed
+        b, page = self._browser()
+        feed = Feed.__new__(Feed)
+        feed.b = b
+        video = page.locator("video").first
+        png = feed._grab(video, timeout=1500)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+
+class AdAndProductCardTests(unittest.TestCase):
+    """广告：认出来、默认直接划走；商品卡挡住评论：先关掉商品卡。结构照用户发来的真实页面（2026-11）。"""
+
+    PAGE = """<!doctype html><meta charset="utf-8"><body>
+    <div data-e2e="feed-active-video"><div data-e2e="video-info"><div class="account">
+      <div data-e2e="feed-video-nickname">@MINISO名创优品拖鞋旗舰店</div>
+      <div class="video-create-time"><span class="time">· 9月9日</span></div>
+      <svg width="30" height="16" viewBox="0 0 30 16"><rect width="30" height="16"></rect></svg></div></div>
+      <div class="xgTips" style="display:none">广告视频不支持倍速功能</div></div>
+    <div id="videoSideBar"><svg id="svg_icon_circle_close" width="38" height="38"
+        onclick="document.getElementById('videoSideBar').style.display='none';
+                 document.getElementById('videoSideCard').style.display='block'"><rect width="38" height="38"/></svg>
+      <div>¥39.9</div><div>立即购买</div></div>
+    <div id="videoSideCard" style="display:none"><div data-e2e="comment-list"><div data-e2e="comment-item">好可爱</div></div></div>
+    </body>"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from playwright.sync_api import sync_playwright
+            cls.pw = sync_playwright().start()
+        except Exception as e:  # noqa: BLE001
+            raise unittest.SkipTest(f"没有 Playwright：{e}")
+        try:
+            try:
+                cls.br = cls.pw.chromium.launch()
+            except Exception:  # noqa: BLE001
+                cls.br = cls.pw.chromium.launch(executable_path="/usr/bin/google-chrome", args=["--no-sandbox"])
+        except Exception as e:  # noqa: BLE001
+            cls.pw.stop()
+            raise unittest.SkipTest(f"没有可用的浏览器：{e}")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.br.close()
+        cls.pw.stop()
+
+    def _feed(self, html):
+        from app.douyin.browser import DouyinBrowser
+        from app.douyin.feed import Feed
+        from app.douyin.selectors import DEFAULT_SELECTORS
+        ctx = self.br.new_context()
+        page = ctx.new_page()
+        page.set_content(html)
+        b = DouyinBrowser.__new__(DouyinBrowser)
+        b.ctx, b._page, b.sel = ctx, page, dict(DEFAULT_SELECTORS, tip_close=[])
+        b.pause = lambda *a, **k: None
+        f = Feed.__new__(Feed)
+        f.b = b
+        return f, page
+
+    def test_ad_is_recognised(self):
+        f, _ = self._feed(self.PAGE)
+        self.assertTrue(f.is_ad())
+        plain = self.PAGE.replace('<svg width="30" height="16"', '<span').replace("广告视频不支持倍速功能", "倍速")
+        f2, _ = self._feed(plain)
+        self.assertFalse(f2.is_ad())
+
+    def test_product_card_closed_to_show_comments(self):
+        f, page = self._feed(self.PAGE)
+        self.assertFalse(page.locator("[data-e2e='comment-item']").first.is_visible())
+        self.assertTrue(f._close_product_card())
+        self.assertTrue(page.locator("[data-e2e='comment-item']").first.is_visible())
+        self.assertFalse(f._close_product_card())                                    # 没有商品卡了：什么都不做
+
+    def test_runner_skips_ads_by_default(self):
+        from app.agent.runner import Agent
+        agent = Agent(make_db())
+        agent._want_run = True
+        agent._sleep = lambda s: agent._want_run
+        agent.brain = mock.Mock()
+        with mock.patch("app.agent.runner.Feed") as FeedCls:
+            feed = FeedCls.return_value
+            feed.read_current.return_value = {"video_id": "ad1", "url": "u", "author": "MINISO", "desc": "猫爪拖鞋",
+                                              "comments": [], "comment_items": [], "ad": True}
+            agent._watch_one(mock.Mock(), agent.db.rules())
+        self.assertTrue(feed.read_current.call_args.kwargs["skip_ad"])               # 广告不去翻评论区
+        agent.brain.triage.assert_not_called()                                       # 不花模型的钱
+        feed.like.assert_not_called()
+        feed.next.assert_called_once()
+        row = agent.db.query("SELECT decision, reason FROM videos WHERE video_id='ad1'")[0]
+        self.assertEqual((row["decision"], row["reason"]), ("skip", "广告"))
+        self.assertEqual(agent.db.usage().get("videos") or 0, 0)                     # 不算进“看视频”的额度
+
+    def test_ads_watched_when_switch_off(self):
+        from app.agent.runner import Agent
+        db = make_db()
+        r = db.rules()
+        r["skip_ads"] = False
+        db.set_json("rules", r)
+        agent = Agent(db)
+        agent._want_run = True
+        agent._sleep = lambda s: agent._want_run
+        agent.brain = mock.Mock()
+        agent.brain.router.task_can_see.return_value = False
+        agent.brain.triage.return_value = {"interest": 2, "topic": "", "reason": "广告", "cost": 0}
+        with mock.patch("app.agent.runner.Feed") as FeedCls:
+            feed = FeedCls.return_value
+            feed.read_current.return_value = {"video_id": "ad2", "url": "u", "author": "x", "desc": "d",
+                                              "comments": [], "comment_items": [], "ad": True}
+            feed.capture_frames.return_value = []
+            agent._watch_one(mock.Mock(), agent.db.rules())
+        agent.brain.triage.assert_called_once()                                      # 关掉开关：广告也照常看

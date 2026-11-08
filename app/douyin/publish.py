@@ -34,10 +34,25 @@ def _visible_text(b: DouyinBrowser, words: list[str], timeout: int = 300) -> str
     return ""
 
 
-def publish(b: DouyinBrowser, draft: dict, files: list[Path], step=None, wait_login=None) -> str:
+def _handle_verify(b: DouyinBrowser, wait_verify) -> bool:
+    """页面上弹了验证（创作者中心点“发布”后常见的是“接收短信验证码”）：交给 wait_verify 弹窗等你处理。
+    没有验证返回 False；有验证并且你完成了返回 True；有验证但没完成（或没法等）抛 PublishError。"""
+    if not b.verification_open():
+        return False
+    kind = b.verify_kind() or "sms"
+    log.info("发作品时抖音要求验证（%s）", kind)
+    if wait_verify and wait_verify(kind):
+        return True
+    raise PublishError(f"发作品时抖音要求验证（{'手机短信验证码' if kind == 'sms' else '安全验证'}），"
+                       f"没有在时间内完成，这次没有发出去（页面已保存到 {b.dump('creator_verify')}）。"
+                       "可以再点一次“确认发布”，弹出验证时在浏览器里完成即可")
+
+
+def publish(b: DouyinBrowser, draft: dict, files: list[Path], step=None, wait_login=None, wait_verify=None) -> str:
     """发布草稿。files：按顺序的图片（图文）或 1 个视频。返回成功说明；失败抛 PublishError。
 
-    step(说明)：更新界面上的进度；wait_login()：创作者中心要登录时调用，返回 True 表示登录好了。"""
+    step(说明)：更新界面上的进度；wait_login()：创作者中心要登录时调用，返回 True 表示登录好了；
+    wait_verify(kind)：抖音弹了验证（短信验证码 / 滑块）时调用，弹窗等你处理，返回 True 表示验证完了。"""
     ui_step = step or (lambda s: None)
 
     def step(text: str) -> None:
@@ -103,21 +118,40 @@ def publish(b: DouyinBrowser, draft: dict, files: list[Path], step=None, wait_lo
             end = time.time() + 900
             while time.time() < end and _visible_text(b, as_list(b.sel.get("creator_uploading")), 300):
                 cancel.sleep(3)
+        _handle_verify(b, wait_verify)   # 发布前就弹了验证：先处理掉
         step("点“发布”")
         btn = b.find("creator_publish", timeout=10000)
         if btn is None or not b.safe_click(btn, "发布"):
             raise PublishError(f"没找到“发布”按钮（页面已保存到 {b.dump('creator_no_publish')}）")
         with cancel.shield():  # 已经点了“发布”：这时叫停也要等出结果，免得发出去了却显示没发
             end = time.time() + 90
+            reclicked = False
             while time.time() < end:
+                # 点了“发布”后抖音常要求二次验证（“接收短信验证码”）：弹窗等你在浏览器里填完，再接着等发布结果
+                if _handle_verify(b, wait_verify):
+                    step("验证完了，等发布结果")
+                    end = time.time() + 90
+                    b.pause(2.5, 3.5)
+                    if _published(b):
+                        return "发布成功"
+                    # 验证完还停在填写页、“发布”按钮还在：说明这次点击被验证拦下了，再点一次（只补点一次）
+                    again = None if reclicked else b.find("creator_publish", timeout=3000)
+                    if again is not None and b.safe_click(again, "发布"):
+                        reclicked = True
+                        log.info("验证完成后重新点了一次“发布”")
+                    continue
                 b.check_captcha()
-                if any(w in (b.page.url or "") for w in ("content/manage", "content/publish/success")):
-                    return "发布成功"
-                if _visible_text(b, [w for w in as_list(b.sel.get("creator_done_words")) if "/" not in w], 500):
+                if _published(b):
                     return "发布成功"
                 cancel.sleep(2)
         raise PublishError(f"点了发布，但 90 秒内没看到发布成功的提示（页面已保存到 {b.dump('creator_publish_unknown')}）。"
                            "可以去抖音 App 的作品列表里确认一下")
+
+
+def _published(b: DouyinBrowser) -> bool:
+    if any(w in (b.page.url or "") for w in ("content/manage", "content/publish/success")):
+        return True
+    return bool(_visible_text(b, [w for w in as_list(b.sel.get("creator_done_words")) if "/" not in w], 500))
 
 
 DECLARE_DIALOG = ("[role=dialog]:has-text('请选择声明类型')", ".semi-modal:has-text('请选择声明类型')",

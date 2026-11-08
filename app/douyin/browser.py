@@ -27,6 +27,19 @@ class BrowserError(Exception):
     pass
 
 
+def why(e: Exception) -> str:
+    """Playwright 报错的第一行只有“Timeout 6000ms exceeded”，真正原因在后面的过程记录里
+    （比如“<div class=...> intercepts pointer events”被别的东西挡住、“element is not stable”还在动）。
+    挑出最有用的那一行一起记下来。"""
+    lines = [ln.strip(" -") for ln in str(e).splitlines() if ln.strip()]
+    if not lines:
+        return str(e)[:200]
+    keys = ("intercepts pointer events", "not stable", "not visible", "outside of the viewport", "not enabled",
+            "detached", "obscured")
+    detail = next((ln for ln in reversed(lines[1:]) if any(k in ln for k in keys)), "")
+    return (lines[0][:150] + (f"（{detail[:200]}）" if detail else ""))
+
+
 class CaptchaDetected(BaseException):
     """页面弹出了验证码。
 
@@ -96,6 +109,7 @@ def _browser_exes() -> list[str]:
 class DouyinBrowser:
     def __init__(self):
         self.hidden = True
+        self._hwnd = 0           # 浏览器窗口的 Windows 句柄（拿到最前面时用）
         self.sel = load_selectors()
         self._pw = None
         self.ctx = None
@@ -304,15 +318,56 @@ class DouyinBrowser:
 
     def show_window(self) -> None:
         """把浏览器窗口拿到屏幕上（扫码登录、手动完成验证、你想看看她在干嘛的时候），
-        放在软件主窗口所在的那块显示器上，大小按那块屏幕和缩放比例来，不会超出屏幕。"""
+        放在软件主窗口所在的那块显示器上，大小按那块屏幕和缩放比例来，不会超出屏幕；
+        并且真正放到所有窗口的最前面（不然会被软件主窗口挡住，看着像还藏着）。"""
         bounds = onscreen_bounds(APP_NAME)
-        if self.ctx and self._set_window(bounds):
+        log.info("把浏览器拿到屏幕上：位置 %s，系统缩放 %.2f，所有屏幕范围 %s", bounds, winfocus.system_scale(),
+                 winfocus.virtual_screen())
+        if not self.ctx:
+            log.warning("浏览器还没启动，没法拿到屏幕上")
+            return
+        if self._set_window(bounds):
             self.hidden = False
             self._clear_layout()
             try:
                 self.page.bring_to_front()
             except Exception:  # noqa: BLE001
                 pass
+            hwnd = self._os_window()
+            ok = bool(hwnd) and winfocus.bring_to_front(hwnd)
+            fg = winfocus.foreground()
+            log.info("浏览器窗口句柄 %s，放到最前面 %s；现在最前面的窗口 %s（%s），浏览器窗口实际位置 %s",
+                     hwnd, "成功" if ok else "失败", fg, "是浏览器" if fg and fg == hwnd else "不是浏览器",
+                     winfocus.window_rect(hwnd) if hwnd else None)
+        else:
+            log.warning("把浏览器拿到屏幕上失败（调整窗口位置出错，见上一条）")
+
+    def _os_window(self) -> int:
+        """浏览器窗口在 Windows 里的句柄：临时把网页标题改成一个暗号，按标题找到窗口后再改回去。找到后记住。"""
+        known = getattr(self, "_hwnd", 0)
+        if known and winfocus.is_window(known):
+            return known
+        if not self.page:
+            return 0
+        token = f"aiw-{random.randrange(16 ** 8):08x}"
+        try:
+            old = self.page.evaluate("t => { const o = document.title; document.title = t; return o; }", token)
+        except Exception:  # noqa: BLE001
+            return 0
+        hwnd = 0
+        try:
+            for _ in range(15):
+                hwnd = winfocus.find_window_containing(token)
+                if hwnd:
+                    break
+                time.sleep(0.1)
+        finally:
+            try:
+                self.page.evaluate("t => { document.title = t; }", old)
+            except Exception:  # noqa: BLE001
+                pass
+        self._hwnd = hwnd
+        return hwnd
 
     @contextmanager
     def keep_focus(self):
@@ -689,8 +744,33 @@ class DouyinBrowser:
             self.click(loc)
             return True
         except Exception as e:  # noqa: BLE001
-            log.warning("点击%s失败：%s", what, str(e).splitlines()[0][:200])
+            log.warning("点击%s失败：%s", what, why(e))
             return False
+
+    def click_open(self, loc, what: str, opened) -> bool:
+        """点一个“打开面板”的入口（通知、私信），并确认面板真的打开了。
+
+        普通点击有时会一直等到超时：按钮上盖着别的浮层，或者按钮还在做动画、一直不“稳定”。
+        这种入口点开只是打开一个面板，点完都会确认面板开没开，所以可以放心换别的点法：
+        普通点击 → 强制点击（不等按钮“可点”）→ 用网页脚本直接点。opened(timeout) 返回面板开没开。"""
+        tries = (("普通点击", lambda: self.click(loc, timeout=4000)),
+                 ("强制点击", lambda: loc.click(timeout=3000, force=True)),
+                 ("脚本点击", lambda: loc.evaluate("el => el.click()")))
+        reasons = []
+        for i, (name, fn) in enumerate(tries):
+            cancel.checkpoint()
+            if i and opened(800):          # 上一种点法其实已经打开了（比如鼠标移上去就弹出来了）
+                return True
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                reasons.append(f"{name}：{why(e)}")
+            if opened(3000 if i == 0 else 2500):
+                if i:
+                    log.info("点%s：%s没成功，换成%s打开了（%s）", what, tries[0][0], name, "；".join(reasons)[:300])
+                return True
+        log.warning("点击%s失败，几种点法都没打开面板：%s", what, "；".join(reasons)[:400] or "点了但面板没出来")
+        return False
 
     def find_css(self, css: str, timeout: int = 2000, root=None):
         """直接按一个 CSS 选择器找可见元素（不经过 selectors.json）。"""
@@ -762,9 +842,9 @@ class DouyinBrowser:
         认了它们就会一直以为你还没验证完，浏览器藏不回去）。所有标签页都看。"""
         if not self.ctx:
             return False
-        strong = [s for s in as_list(self.sel.get("captcha")) if not s.startswith("text=") or "请完成" in s]
-        strong += [s for s in as_list(self.sel.get("sms_verify"))
-                   if s.startswith("input") or s in ("text=获取验证码", "text=发送验证码")]
+        exact = ("text=请完成下列验证", "text=获取验证码", "text=发送验证码", "text=接收短信验证码")
+        strong = [s for s in as_list(self.sel.get("captcha")) + as_list(self.sel.get("sms_verify"))
+                  if not s.startswith("text=") or s in exact]
         try:
             pages = [pg for pg in self.ctx.pages if not pg.is_closed()]
         except Exception:  # noqa: BLE001

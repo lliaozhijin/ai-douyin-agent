@@ -162,11 +162,9 @@ class Inbox:
         if entry is None:
             log.warning("没找到“通知”入口")
             return False
-        if not self.b.safe_click(entry, "通知"):
-            return False
-        self.b.pause(1.5, 2.5)
+        ok = self.b.click_open(entry, "通知", lambda t: self.b.find("notice_panel", timeout=t) is not None)
         self.b.check_captcha()
-        return self.b.find("notice_panel", timeout=5000) is not None
+        return ok
 
     def close_notice_panel(self) -> None:
         if self.b.find("notice_panel", timeout=500) is None:
@@ -531,11 +529,9 @@ class Inbox:
         if entry is None:
             log.warning("没找到“私信”入口")
             return False
-        if not self.b.safe_click(entry, "私信入口"):
-            return False
-        self.b.pause(1.5, 2.5)
+        ok = self.b.click_open(entry, "私信入口", lambda t: self.b.find("dm_panel", timeout=t) is not None)
         self.b.check_captcha()
-        return self.b.find("dm_panel", timeout=5000) is not None
+        return ok
 
     def dm_badge(self) -> bool:
         """不打开私信面板，只看右上角“消息”旁有没有未读数字（秒回模式每看完一个视频看一眼）。"""

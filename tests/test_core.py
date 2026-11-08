@@ -1744,3 +1744,42 @@ class RunnerIncomingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShowBrowserFrontTests(unittest.TestCase):
+    """弹验证时：先亮出软件窗口（弹窗），再把浏览器真正放到最前面，不被软件窗口挡住。"""
+
+    def test_order_app_first_then_browser_front(self):
+        from app.agent.runner import Agent
+        agent = Agent(make_db())
+        order = []
+        agent.browser = mock.Mock()
+        agent.browser.show_window.side_effect = lambda: order.append("browser")
+        with mock.patch("app.agent.runner.winfocus") as wf:
+            wf.call_attention.side_effect = lambda t: order.append("app")
+            agent._raise_attention("captcha")
+        self.assertEqual(order, ["app", "browser"])
+
+    def test_show_window_raises_os_window(self):
+        from app.douyin.browser import DouyinBrowser
+        b = DouyinBrowser.__new__(DouyinBrowser)
+        page = mock.Mock()
+        page.is_closed.return_value = False
+        page.evaluate.return_value = "抖音"
+        b.ctx, b._page, b._hwnd, b._emu = mock.Mock(), page, 0, {}
+        with mock.patch.object(DouyinBrowser, "_set_window", return_value=True), \
+                mock.patch("app.douyin.browser.winfocus") as wf:
+            wf.find_window_containing.return_value = 4242
+            wf.is_window.return_value = True
+            wf.bring_to_front.return_value = True
+            wf.system_scale.return_value = 1.0
+            wf.work_area.return_value = None
+            wf.virtual_screen.return_value = (0, 0, 1920, 1080)
+            b.show_window()
+            wf.bring_to_front.assert_called_once_with(4242)
+            token = wf.find_window_containing.call_args.args[0]
+            self.assertTrue(token.startswith("aiw-"))
+            self.assertEqual(page.evaluate.call_args_list[-1].args[1], "抖音")       # 标题改回原来的
+            b.show_window()                                                          # 第二次直接用记住的句柄
+            self.assertEqual(wf.find_window_containing.call_count, 1)
+        self.assertFalse(b.hidden)

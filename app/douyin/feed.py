@@ -8,7 +8,7 @@ import logging
 import time
 
 from .. import cancel
-from .browser import BrowserError, DouyinBrowser
+from .browser import BrowserError, DouyinBrowser, why
 from .selectors import as_list
 
 log = logging.getLogger(__name__)
@@ -134,7 +134,17 @@ class Feed:
     def _active(self):
         return self.b.find("feed_active", timeout=6000)
 
-    def read_current(self, with_comments: bool = True) -> dict:
+    def is_ad(self) -> bool:
+        """当前这个视频是不是广告（作者名后面有“广告”标签）。只看元素在不在，不要求看得见。"""
+        for s in as_list(self.b.sel.get("ad_marker")):
+            try:
+                if self.b.page.locator(s).count() > 0:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def read_current(self, with_comments: bool = True, skip_ad: bool = False) -> dict:
         active = self._active()
         if active is None:
             raise FeedReadError("当前页面上没有正在播放的推荐视频")
@@ -156,10 +166,12 @@ class Feed:
         if not vid:
             vid = "h" + hashlib.md5(f"{author}|{desc}".encode("utf-8")).hexdigest()[:16]
         url = f"https://www.douyin.com/video/{vid}" if vid.isdigit() else self.b.page.url
-        items = self.read_comments() if with_comments else []
+        ad = self.is_ad()
+        # 广告反正要划走：就不去翻评论区了（广告点开评论常常先弹商品卡）
+        items = self.read_comments() if with_comments and not (ad and skip_ad) else []
         comments = [f"{c['user']}：{c['text']}" if c["user"] else c["text"] for c in items]
         return {"video_id": vid, "url": url, "author": author, "desc": desc, "comments": comments,
-                "comment_items": items}
+                "comment_items": items, "ad": ad}
 
     def read_detail(self, with_comments: bool = True) -> dict:
         """读单个视频的详情页（www.douyin.com/video/<id>），和推荐页的结构不一样。"""
@@ -223,6 +235,18 @@ class Feed:
             return True
         return False
 
+    def _close_product_card(self) -> bool:
+        """右边弹出的是商品卡（带商品的视频 / 广告），把评论卡挡住了：点它右上角的 × 关掉。关掉了返回 True。"""
+        card = self.b.find("product_card", timeout=600)
+        if card is None:
+            return False
+        btn = self.b.find("product_card_close", timeout=1500)
+        if btn is None or not self.b.safe_click(btn, "关闭商品卡"):
+            return False
+        log.info("右边弹出的是商品卡，挡住了评论：已关掉")
+        self.b.pause(0.8, 1.4)
+        return True
+
     def close_comments(self) -> None:
         close = self.b.find("comment_close", timeout=800)
         try:
@@ -241,7 +265,12 @@ class Feed:
             return []
         # 评论区刚打开时常常还在“加载中”：等第一条评论出现（最多约 8 秒）
         if self.b.find("comment_item", timeout=8000) is None:
-            self.b.find("comment_item", timeout=3000)
+            if self._close_product_card():
+                # 右边是商品卡把评论挡住了：关掉商品卡，评论卡还没出来就再点一次评论
+                if self.b.find("comment_item", timeout=3000) is None and self.open_comments():
+                    self.b.find("comment_item", timeout=6000)
+            else:
+                self.b.find("comment_item", timeout=3000)
         out = []
         for item in self.b.find_all("comment_item")[:n]:
             c = self._parse_comment(item)
@@ -486,13 +515,29 @@ class Feed:
             if wait(gap) is False:
                 break  # 被叫停了
             try:
-                png = video.screenshot(timeout=4000)
-                frames.append(_to_small_jpeg(png))
+                frames.append(_to_small_jpeg(self._grab(video)))
             except Exception as e:  # noqa: BLE001
                 if not Feed._frames_warned:
                     Feed._frames_warned = True
-                    log.warning("截取视频画面失败：%s", e)
+                    log.warning("截取视频画面失败：%s", why(e))
         return frames
+
+    def _grab(self, video, timeout: int = 4000) -> bytes:
+        """截视频画面：直接截页面上视频所在的那块区域（和元素截图拍到的是同一块，但不用等画面“稳定”）。
+        元素截图要等元素不再移动，视频切换、页面有动画时会一直等到超时（实测可以卡几十秒）。
+        拿不到视频位置时才退回元素截图。"""
+        box = None
+        try:
+            box = video.bounding_box(timeout=1500)
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(box, dict) and box.get("width", 0) >= 20 and box.get("height", 0) >= 20:
+            try:
+                return self.b.page.screenshot(clip={k: box[k] for k in ("x", "y", "width", "height")},
+                                              timeout=timeout)
+            except Exception as e:  # noqa: BLE001
+                log.debug("截视频区域没成功（%s），改用元素截图", why(e))
+        return video.screenshot(timeout=timeout, animations="disabled")
 
     def watch_through(self, n_frames: int, max_s: float, sleep=None, progress=None) -> tuple[list[bytes], float, float]:
         """把当前页面上的视频从头看到尾（最多看 max_s 秒），在整段视频里均匀截 n_frames 帧。
@@ -557,12 +602,11 @@ class Feed:
             pass
         return [f for _, f in sorted(frames, key=lambda x: x[0]) if f], watched, duration
 
-    @staticmethod
-    def _shot(video) -> bytes:
+    def _shot(self, video) -> bytes:
         try:
-            return _to_small_jpeg(video.screenshot(timeout=5000))
+            return _to_small_jpeg(self._grab(video, timeout=5000))
         except Exception as e:  # noqa: BLE001
-            log.warning("截取视频画面失败：%s", str(e).splitlines()[0][:120])
+            log.warning("截取视频画面失败：%s", why(e))
             return b""
 
     def like(self) -> bool:

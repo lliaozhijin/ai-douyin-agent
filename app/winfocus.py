@@ -135,6 +135,67 @@ def focus(hwnd: int) -> bool:
         return False
 
 
+def is_window(hwnd: int) -> bool:
+    if not _WIN or not hwnd:
+        return False
+    try:
+        return bool(_user32.IsWindow(wintypes.HWND(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def find_window_containing(text: str) -> int:
+    """找标题里含有 text 的可见顶层窗口（浏览器窗口标题后面会自动加上“ - Microsoft Edge”之类，没法按全名找）。"""
+    if not _WIN or not text:
+        return 0
+    found: list[int] = []
+    try:
+        proc_t = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def cb(hwnd, _lparam):
+            try:
+                if not _user32.IsWindowVisible(hwnd):
+                    return True
+                n = _user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                _user32.GetWindowTextW(hwnd, buf, n + 1)
+                if text in buf.value:
+                    found.append(int(hwnd or 0))
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        _user32.EnumWindows(proc_t(cb), 0)
+    except Exception as e:  # noqa: BLE001
+        log.debug("找窗口失败：%s", e)
+    return found[0] if found else 0
+
+
+def bring_to_front(hwnd: int) -> bool:
+    """把窗口真正放到所有窗口最前面并给它焦点（浏览器自己“切到前台”在 Windows 上常常不生效，会被别的窗口挡住）。
+
+    做法：最小化了先恢复；临时设成“置顶”再取消（这样不需要前台权限也能盖到最上面）；最后再把键盘焦点给它。"""
+    if not _WIN or not hwnd:
+        return False
+    try:
+        h = wintypes.HWND(hwnd)
+        if not _user32.IsWindow(h):
+            return False
+        if _user32.IsIconic(h):
+            _user32.ShowWindow(h, 9)                       # SW_RESTORE
+        flags = 0x0001 | 0x0002 | 0x0040                   # SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+        _user32.SetWindowPos(h, wintypes.HWND(-1), 0, 0, 0, 0, flags)   # HWND_TOPMOST
+        _user32.SetWindowPos(h, wintypes.HWND(-2), 0, 0, 0, 0, flags)   # HWND_NOTOPMOST：盖在最上面，但不一直置顶
+        focus(hwnd)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("把窗口拿到最前面失败：%s", e)
+        return False
+
+
 def give_back(prev: int, fallback_title: str = "") -> None:
     """如果焦点被屏幕外的浏览器抢走了，还给原来的窗口（原来的窗口不行就还给软件自己的窗口）。"""
     cur = foreground()
