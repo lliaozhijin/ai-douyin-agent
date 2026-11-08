@@ -655,11 +655,16 @@ class Agent(threading.Thread):
         cl_used = float(self.db.usage().get("comment_likes") or 0)
         cl_gate = (self.likes.comment_gate(rules, cl_used)
                    if engage and self.budget.can("comment_likes") else {"ok": False, "why": ""})
+        # 收藏：一天匀着收、同一类收多了提高标准（app/agent/likes.py）
+        col_gate = {"ok": False, "why": "", "note": ""}
+        if rules.get("collect_enabled", True) and self.budget.can("collects"):
+            col_gate = self.likes.collect_gate(tri["interest"], topic, rules,
+                                               float(self.db.usage().get("collects") or 0))
         dec = self.brain.decide(v, frames, want_like and not liked and self.budget.can("likes"),
                                 self.budget.can("comments"),
                                 cl_gate["ok"],
                                 engage and self.budget.can("comment_replies"), friends=friends,
-                                can_collect=bool(rules.get("collect_enabled", True)) and self.budget.can("collects"))
+                                can_collect=col_gate["ok"], collect_note=col_gate["note"])
         cost += dec["cost"]
         # 模型给热评打的分 → 真正要赞的：只赞够分的，一般 1 条，特别精彩才多赞，按今天的进度封顶
         dec["comment_likes"] = (self.likes.pick_comments(dec.get("comment_scores") or [], rules, cl_used)
@@ -673,7 +678,7 @@ class Agent(threading.Thread):
                 self.mood.event("liked")
                 bus.emit("like")
         collected = False
-        if dec.get("collect") and self.budget.can("collects") and not self._stopped():
+        if dec.get("collect") and col_gate["ok"] and self.budget.can("collects") and not self._stopped():
             collected = feed.collect()
             if collected:
                 self.budget.use("collects")

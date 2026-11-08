@@ -1552,3 +1552,69 @@ class CommentLikePolicyTests(unittest.TestCase):
             b.decide({"author": "a", "desc": "d", "comments": ["一"]}, [], False, True, True, False)
         self.assertIn("不打算点赞", call.call_args.args[2])
         self.assertIn("照样可以评论", call.call_args.args[2])
+
+class CollectPolicyTests(unittest.TestCase):
+    """收藏：一天匀着收；同一类收藏多了提高标准、再多就不收。"""
+
+    RULES = {"limits": {"collects": 10}, "active_start": "09:00", "active_end": "23:00"}
+
+    def _db(self, collected_topics=(), when="2026-11-07 10:00:00"):
+        db = make_db()
+        for i, t in enumerate(collected_topics):
+            db.add_video(video_id=f"c{i}", author="x", interest=9, decision="collect", collected=1, topic=t,
+                         created_at=when)
+        return db
+
+    def test_pacing(self):
+        from app.agent.likes import LikePolicy
+        pol = LikePolicy(self._db())
+        early = datetime(2026, 11, 7, 10, 0)                                          # 一天刚过 1/14
+        self.assertTrue(pol.collect_gate(8, "", self.RULES, 1, early)["ok"])
+        self.assertFalse(pol.collect_gate(8, "", self.RULES, 3, early)["ok"])         # 上午就收了 3 个：太快
+        self.assertTrue(pol.collect_gate(10, "", self.RULES, 3, early)["ok"])         # 10 分的破例
+        self.assertFalse(pol.collect_gate(10, "", self.RULES, 10, datetime(2026, 11, 7, 22, 0))["ok"])  # 额度用完
+        self.assertTrue(pol.collect_gate(8, "", self.RULES, 6, datetime(2026, 11, 7, 20, 0))["ok"])     # 晚上进度跟得上
+
+    def test_same_topic(self):
+        from app.agent.likes import LikePolicy
+        night = datetime(2026, 11, 7, 22, 0)
+        pol = LikePolicy(self._db(["菜谱", "菜谱"]))
+        self.assertFalse(pol.collect_gate(8, "菜谱", self.RULES, 2, night)["ok"])     # 已经收藏 2 个菜谱：8 分不够
+        g = pol.collect_gate(9, "菜谱", self.RULES, 2, night)
+        self.assertTrue(g["ok"])
+        self.assertIn("2 个「菜谱」", g["note"])                                      # 提醒她标准要更高
+        self.assertTrue(pol.collect_gate(8, "风景", self.RULES, 2, night)["ok"])      # 别的类不受影响
+        pol3 = LikePolicy(self._db(["菜谱"] * 3))
+        self.assertFalse(pol3.collect_gate(10, "菜谱", self.RULES, 3, night)["ok"])   # 3 个以上就不再收
+        old = LikePolicy(self._db(["菜谱"] * 3, when="2026-11-06 20:00:00"))
+        self.assertTrue(old.collect_gate(8, "菜谱", self.RULES, 0, night)["ok"])      # 昨天收的不算
+
+    def test_note_goes_into_prompt(self):
+        from app.agent.brain import Brain
+        b = Brain(make_db())
+        fake = mock.Mock(text='{"collect": false}', cost=0.0)
+        with mock.patch.object(b.router, "call", return_value=fake) as call:
+            b.decide({"author": "a", "desc": "d", "comments": []}, [], False, False, can_collect=True,
+                     collect_note="你今天已经收藏了 2 个「菜谱」类的视频")
+        self.assertIn("2 个「菜谱」", call.call_args.args[2])
+
+    def test_runner_does_not_offer_collect_when_paced(self):
+        from app.agent.runner import Agent
+        db = make_db()
+        db.add_usage("collects", 10)                                                  # 今天收满了
+        agent = Agent(db)
+        agent._want_run = True
+        agent._sleep = lambda s: agent._want_run
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.99))
+        agent.brain = mock.Mock()
+        agent.brain.router.task_can_see.return_value = True
+        agent.brain.triage.return_value = {"interest": 9, "topic": "菜谱", "reason": "", "cost": 0}
+        agent.brain.decide.return_value = {"interest": 9, "like": False, "collect": True, "comment": "", "reason": "",
+                                           "cost": 0}
+        with mock.patch("app.agent.runner.Feed") as FeedCls:
+            feed = FeedCls.return_value
+            feed.read_current.return_value = {"video_id": "n", "url": "u", "author": "b", "desc": "番茄炒蛋", "comments": []}
+            feed.capture_frames.side_effect = lambda n, d, sleep=None: [b"x"] * n
+            agent._watch_one(mock.Mock(), agent.db.rules())
+        self.assertFalse(agent.brain.decide.call_args.kwargs["can_collect"])
+        feed.collect.assert_not_called()                                              # 模型说要收也不收

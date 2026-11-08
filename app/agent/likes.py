@@ -16,6 +16,11 @@
 - 模型给热评逐条打分，只赞特别好笑、说到心坎上的（适中 8 分起，挑剔 9 分，大方 7 分）；
 - 一个视频一般最多赞 1 条，评论区特别精彩（好几条 9 分以上）才赞 2～3 条；
 - 一天的额度同样按活跃时段匀着用。
+
+收藏本来就少而精（只收以后还想再看、用得上的），所以不套“前百分之几”，只补两条：
+- 一天匀着收藏：每天的收藏上限按活跃时段摊开，收得比进度快就先不收（10 分的才破例）；
+- 同类别控制：今天已经收藏过 2 个同一类（比如都是菜谱），再遇到要 9 分以上才考虑、并提醒她标准要更高；
+  收藏过 3 个以上的同一类就不再收。
 """
 from __future__ import annotations
 
@@ -35,6 +40,9 @@ MOOD_SHIFT = {"excited": 0.05, "happy": 0.03, "clingy": 0.02, "bored": -0.05, "g
               "sulky": -0.06, "sleepy": -0.03}
 BURST = 3              # 允许比匀速进度多赞几个
 TOPIC_SOFT = 3         # 同一类今天赞过几个以后开始腻
+COLLECT_BURST = 2      # 收藏额度少：只允许比匀速进度多收 2 个
+COLLECT_TOPIC_SOFT = 2  # 同一类今天收藏过几个以后提高标准
+COLLECT_TOPIC_HARD = 3  # 同一类今天收藏过几个以后不再收
 COMMENT_MIN = {"picky": 9, "normal": 8, "generous": 7}       # 评论至少几分才赞
 COMMENT_MAX = {"picky": 1, "normal": 2, "generous": 3}        # 一个视频最多赞几条评论
 
@@ -74,7 +82,8 @@ class LikePolicy:
         return max(0.0, min(1.0, (k - above) / equal))
 
     @staticmethod
-    def pace_allowance(limit: float, used: float, rules: dict, now: datetime | None = None) -> float:
+    def pace_allowance(limit: float, used: float, rules: dict, now: datetime | None = None,
+                       burst: float = BURST) -> float:
         """按活跃时段的进度，现在最多该赞到第几个（含 BURST 的富余）。"""
         now = now or datetime.now()
         start_t = parse_hhmm(rules.get("active_start", "09:00"), dtime(9, 0))
@@ -88,7 +97,7 @@ class LikePolicy:
                 end += timedelta(days=1)
         span = max(60.0, (end - start).total_seconds())
         frac = max(0.0, min(1.0, (now - start).total_seconds() / span))
-        return limit * frac + BURST
+        return limit * frac + burst
 
     def judge(self, interest: int, author: str, topic: str, rules: dict, mood_key: str = "calm",
               likes_used: float = 0, now: datetime | None = None) -> dict:
@@ -134,6 +143,28 @@ class LikePolicy:
         if used >= self.pace_allowance(limit, used, rules, now):
             return {"ok": False, "why": "今天赞评论有点快了，先忍住"}
         return {"ok": True, "why": ""}
+
+    # ---------- 收藏 ----------
+    def collect_gate(self, interest: int, topic: str, rules: dict, used: float = 0,
+                     now: datetime | None = None) -> dict:
+        """这个视频要不要让她考虑收藏：返回 {ok, why, note}。note 是给她的提醒（写进提示词），比如同类已经收藏了好几个。"""
+        limit = float((rules.get("limits") or {}).get("collects") or 0)
+        if limit <= 0 or used >= limit:
+            return {"ok": False, "why": "今天收藏的额度用完了", "note": ""}
+        if used >= self.pace_allowance(limit, used, rules, now, COLLECT_BURST) and interest < 10:
+            return {"ok": False, "why": "今天收藏得有点快了，先不收（10 分的才破例）", "note": ""}
+        if topic:
+            day = (now or datetime.now()).strftime("%Y-%m-%d")
+            same = self.db.query("SELECT COUNT(*) AS n FROM videos WHERE collected=1 AND topic=? AND created_at >= ?",
+                                 (topic, day))[0]["n"]
+            if same >= COLLECT_TOPIC_HARD:
+                return {"ok": False, "why": f"今天已经收藏了 {same} 个「{topic}」，够了", "note": ""}
+            if same >= COLLECT_TOPIC_SOFT:
+                if interest < 9:
+                    return {"ok": False, "why": f"今天已经收藏了 {same} 个「{topic}」，这个不够特别", "note": ""}
+                return {"ok": True, "why": "",
+                        "note": f"你今天已经收藏了 {same} 个「{topic}」类的视频，除非这个明显比之前的都更有用、更想反复看，否则别再收藏。"}
+        return {"ok": True, "why": "", "note": ""}
 
     def pick_comments(self, scored: list, rules: dict, used: float = 0, now: datetime | None = None) -> list[int]:
         """模型给热评打的分 [(编号, 分数)] → 真正要赞的编号：只赞够分的，一般 1 条，特别精彩才多赞，按进度封顶。"""

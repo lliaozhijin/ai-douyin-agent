@@ -100,7 +100,7 @@ class Brain:
 
     def decide(self, video: dict, frames: list[bytes], can_like: bool, can_comment: bool,
                can_like_comments: bool = False, can_reply_comments: bool = False,
-               friends: list[dict] | None = None, can_collect: bool = False) -> dict:
+               friends: list[dict] | None = None, can_collect: bool = False, collect_note: str = "") -> dict:
         """看了画面之后，决定点不点赞、要不要评论；还可以给评论区里喜欢的评论点赞、回复某一条；
         刷到好朋友会喜欢的视频时，@ 一位互关好友来看（friends：可以 @ 的好友，{nickname, tags}）。"""
         n_comments = len((video.get("comments") or [])[:8])
@@ -144,7 +144,8 @@ class Brain:
             "像一个真实的观众那样决定怎么互动。不是每个视频都要评论，只有真心想说点什么时才评论；"
             "评论要具体提到内容里的细节，30 字以内，不要和热门评论重复。\n"
             + ("收藏和点赞不一样：收藏是留着以后还想再看的。只有特别喜欢、想反复看，或者以后用得上"
-               "（教程、菜谱、攻略、好听的歌、想去的地方）的视频才收藏，大多数视频都不收藏。\n" if can_collect else "")
+               "（教程、菜谱、攻略、好听的歌、想去的地方）的视频才收藏，大多数视频都不收藏。"
+               + (collect_note or "") + "\n" if can_collect else "")
             + ("点赞：程序已经替你看过，这个视频在你最近刷到的里面算比较出挑的，可以点赞；"
                "但如果仔细看完其实没那么喜欢，就写 false。\n" if can_like else
                ("这个视频你看完了但不打算点赞——这不影响别的：有想说的话照样可以评论，"
