@@ -650,12 +650,20 @@ class Agent(threading.Thread):
         friends = []
         if rules.get("at_friends_enabled", True) and self.budget.can("at_friends") and self.budget.can("comments"):
             friends = self.db.friends_for_at(max(1, _int(rules.get("at_friend_per_day"), 1)))[:8]
+        # 发评论、赞别人的评论、回复别人的评论：看了的视频都要判断，和视频本身赞没赞无关；
+        # 赞评论只受今天的额度和进度限制（app/agent/likes.py）
+        cl_used = float(self.db.usage().get("comment_likes") or 0)
+        cl_gate = (self.likes.comment_gate(rules, cl_used)
+                   if engage and self.budget.can("comment_likes") else {"ok": False, "why": ""})
         dec = self.brain.decide(v, frames, want_like and not liked and self.budget.can("likes"),
                                 self.budget.can("comments"),
-                                engage and self.budget.can("comment_likes"),
+                                cl_gate["ok"],
                                 engage and self.budget.can("comment_replies"), friends=friends,
                                 can_collect=bool(rules.get("collect_enabled", True)) and self.budget.can("collects"))
         cost += dec["cost"]
+        # 模型给热评打的分 → 真正要赞的：只赞够分的，一般 1 条，特别精彩才多赞，按今天的进度封顶
+        dec["comment_likes"] = (self.likes.pick_comments(dec.get("comment_scores") or [], rules, cl_used)
+                                if cl_gate["ok"] else [])
         if self._stopped():  # 想完的时候已经被叫停了：不再点赞或评论
             return
         if dec["like"] and want_like and not liked and self.budget.can("likes"):   # 程序没同意赞的，模型说了也不赞

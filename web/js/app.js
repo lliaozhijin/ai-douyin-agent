@@ -823,7 +823,7 @@ function renderRules() {
           </div></section>
         <section class="card"><h2>${HEART}回复规则</h2>
           <h3 class="sub-h">刷视频时</h3>
-          <div class="toggle-row"><label for="r-liketd">点赞倾向<span class="hint" style="display:block;margin:2px 0 0">和她最近看过的视频比，只赞最出挑的那部分；推荐页全是喜欢的内容时也不会见一个赞一个</span></label>
+          <div class="toggle-row"><label for="r-liketd">点赞倾向<span class="hint" style="display:block;margin:2px 0 0">和她最近看过的视频比，只赞最出挑的那部分；推荐页全是喜欢的内容时也不会见一个赞一个。赞别人的评论也跟着这一档（看了的视频都会看评论区，视频没赞也照样评论、赞评论）</span></label>
             <select id="r-liketd" class="input" style="max-width:260px">
               ${[["picky", "挑剔：只赞最喜欢的约 15%"], ["normal", "适中：约 25%（推荐）"], ["generous", "大方：约 40%"]].map(([k, v]) => `<option value="${k}" ${(r.like_tendency || "normal") === k ? "selected" : ""}>${v}</option>`).join("")}
             </select></div>

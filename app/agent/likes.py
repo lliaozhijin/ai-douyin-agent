@@ -10,9 +10,16 @@
 3. 同类内容越赞越腻：今天已经赞过这个作者、或者赞过 3 个以上同一类（比如都是猫），再遇到就不太想赞了。
 
 心情只让比例小幅浮动（开心时大方一点、烦的时候挑剔一点），不会越刷越松。
+
+赞别人的评论也一样克制（同样跟着“点赞倾向”走）：
+- 看了的视频（过了感兴趣门槛的）都会看评论区，不管视频本身赞没赞——没赞的视频里也可能有出彩的评论；
+- 模型给热评逐条打分，只赞特别好笑、说到心坎上的（适中 8 分起，挑剔 9 分，大方 7 分）；
+- 一个视频一般最多赞 1 条，评论区特别精彩（好几条 9 分以上）才赞 2～3 条；
+- 一天的额度同样按活跃时段匀着用。
 """
 from __future__ import annotations
 
+import math
 import random
 from datetime import datetime, time as dtime, timedelta
 
@@ -28,6 +35,13 @@ MOOD_SHIFT = {"excited": 0.05, "happy": 0.03, "clingy": 0.02, "bored": -0.05, "g
               "sulky": -0.06, "sleepy": -0.03}
 BURST = 3              # 允许比匀速进度多赞几个
 TOPIC_SOFT = 3         # 同一类今天赞过几个以后开始腻
+COMMENT_MIN = {"picky": 9, "normal": 8, "generous": 7}       # 评论至少几分才赞
+COMMENT_MAX = {"picky": 1, "normal": 2, "generous": 3}        # 一个视频最多赞几条评论
+
+
+def _tendency(rules: dict) -> str:
+    t = rules.get("like_tendency") or "normal"
+    return t if t in TENDENCY else "normal"
 
 
 class LikePolicy:
@@ -79,9 +93,7 @@ class LikePolicy:
     def judge(self, interest: int, author: str, topic: str, rules: dict, mood_key: str = "calm",
               likes_used: float = 0, now: datetime | None = None) -> dict:
         """这个视频该不该点赞：返回 {p: 点赞概率, why: 原因}（还没掷骰子）。"""
-        tendency = rules.get("like_tendency") or "normal"
-        if tendency not in TENDENCY:
-            tendency = "normal"
+        tendency = _tendency(rules)
         q = max(0.05, min(0.6, TENDENCY[tendency] + MOOD_SHIFT.get(mood_key, 0.0)))
         if interest < MIN_SCORE[tendency]:
             return {"p": 0.0, "why": f"{interest} 分，还不到想点赞的程度"}
@@ -111,6 +123,31 @@ class LikePolicy:
 
     def roll(self, verdict: dict) -> bool:
         return verdict["p"] > 0 and self.rnd.random() < verdict["p"]
+
+    # ---------- 赞别人的评论 ----------
+    def comment_gate(self, rules: dict, used: float = 0, now: datetime | None = None) -> dict:
+        """看了的视频（过了感兴趣门槛的）都会看评论区、判断要不要给评论点赞，不管视频本身赞没赞；
+        这里只管今天的额度和进度：返回 {ok, why}。"""
+        limit = float((rules.get("limits") or {}).get("comment_likes") or 0)
+        if limit <= 0 or used >= limit:
+            return {"ok": False, "why": "今天赞评论的额度用完了"}
+        if used >= self.pace_allowance(limit, used, rules, now):
+            return {"ok": False, "why": "今天赞评论有点快了，先忍住"}
+        return {"ok": True, "why": ""}
+
+    def pick_comments(self, scored: list, rules: dict, used: float = 0, now: datetime | None = None) -> list[int]:
+        """模型给热评打的分 [(编号, 分数)] → 真正要赞的编号：只赞够分的，一般 1 条，特别精彩才多赞，按进度封顶。"""
+        t = _tendency(rules)
+        good = sorted(((i, s) for i, s in scored if s >= COMMENT_MIN[t]), key=lambda x: -x[1])
+        if not good:
+            return []
+        great = sum(1 for _, s in good if s >= 9)
+        n = 1 + (great >= 2) + (great >= 3)
+        n = min(n, COMMENT_MAX[t], len(good))
+        limit = float((rules.get("limits") or {}).get("comment_likes") or 0)
+        room = math.ceil(self.pace_allowance(limit, used, rules, now) - used) if limit > 0 else 0
+        room = min(room, int(limit - used)) if limit > 0 else 0
+        return [i for i, _ in good[:max(0, min(n, room))]]
 
 
 def impatient_skip(interest: int, mood_key: str, rnd: random.Random) -> bool:

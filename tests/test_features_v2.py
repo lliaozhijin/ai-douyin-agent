@@ -1468,3 +1468,87 @@ class LikePolicyTests(unittest.TestCase):
         row = agent.db.query("SELECT decision, topic FROM videos WHERE video_id='new'")[0]
         self.assertEqual(row["decision"], "watch")                                    # 记成“看完”
         self.assertEqual(row["topic"], "猫")
+
+
+class CommentLikePolicyTests(unittest.TestCase):
+    """赞别人的评论：只在喜欢的视频上、只赞特别出彩的、一般 1 条、一天匀着赞，跟着“点赞倾向”走。"""
+
+    RULES = {"like_tendency": "normal", "limits": {"comment_likes": 30}, "active_start": "00:00", "active_end": "23:59"}
+    NOON = datetime(2026, 11, 7, 12, 0)
+
+    def _pol(self, r=0.0):
+        from app.agent.likes import LikePolicy
+        return LikePolicy(make_db(), mock.Mock(random=mock.Mock(return_value=r)))
+
+    def test_gate(self):
+        pol = self._pol(0.9)
+        self.assertTrue(pol.comment_gate(self.RULES, 0, self.NOON)["ok"])               # 看了的视频都看评论区
+        early = datetime(2026, 11, 7, 1, 0)
+        self.assertFalse(pol.comment_gate(self.RULES, 10, early)["ok"])                 # 凌晨就赞了 10 条：太快
+        self.assertFalse(pol.comment_gate(self.RULES, 30, self.NOON)["ok"])             # 额度用完
+
+    def test_pick(self):
+        pol = self._pol()
+        self.assertEqual(pol.pick_comments([(0, 6), (1, 7)], self.RULES, 0, self.NOON), [])        # 普通评论不赞
+        self.assertEqual(pol.pick_comments([(0, 8), (1, 9), (2, 7)], self.RULES, 0, self.NOON), [1])  # 一般只赞 1 条
+        self.assertEqual(pol.pick_comments([(0, 9), (1, 10), (2, 9)], self.RULES, 0, self.NOON), [1, 0])  # 精彩：2 条
+        picky = dict(self.RULES, like_tendency="picky")
+        self.assertEqual(pol.pick_comments([(0, 8), (1, 9), (2, 10)], picky, 0, self.NOON), [2])
+        gen = dict(self.RULES, like_tendency="generous")
+        self.assertEqual(len(pol.pick_comments([(0, 9), (1, 10), (2, 9), (3, 7)], gen, 0, self.NOON)), 3)
+        late = datetime(2026, 11, 7, 23, 50)
+        self.assertEqual(pol.pick_comments([(0, 10), (1, 10), (2, 10)], self.RULES, 29, late), [0])  # 只剩 1 个额度
+        self.assertEqual(pol.pick_comments([(0, 10), (1, 10)], self.RULES, 29, self.NOON), [])     # 中午就赞了 29 条：太快
+
+    def test_brain_parses_scores(self):
+        from app.agent.brain import Brain
+        b = Brain(make_db())
+        fake = mock.Mock(text='{"like": true, "comment": "", "comment_likes": [[2, 9], {"no": 1, "score": 6}, 3, [9, 10]]}',
+                         cost=0.0)
+        with mock.patch.object(b.router, "call", return_value=fake):
+            d = b.decide({"author": "a", "desc": "d", "comments": ["一", "二", "三"]}, [], True, False, True, False)
+        self.assertEqual(d["comment_scores"], [(1, 9), (0, 6), (2, 8)])                # 越界的去掉；只写编号算 8 分
+
+    def test_watched_but_not_liked_video_still_judges_comments(self):
+        """没点赞、但看了的视频：照样判断要不要发评论、给出彩的评论点赞。"""
+        from app.agent.runner import Agent
+        db = make_db()
+        for i in range(29):
+            db.add_video(video_id=f"v{i}", author="x", interest=9, decision="watch")   # 最近全是 9 分：这个 6 分的不会赞
+        r = db.rules()
+        r["interest_threshold"] = 4          # 心情（跟时间有关）怎么变都会看下去，不会被划走
+        db.set_json("rules", r)
+        agent = Agent(db)
+        agent._want_run = True
+        agent._sleep = lambda s: agent._want_run
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.5))
+        agent.brain = mock.Mock()
+        agent.brain.router.task_can_see.return_value = True
+        agent.brain.safety_check.return_value = (True, "", 0.0)
+        agent.brain.triage.return_value = {"interest": 6, "topic": "猫", "reason": "还行", "cost": 0}
+        agent.brain.decide.return_value = {"interest": 6, "like": False, "comment": "", "reason": "",
+                                           "comment_scores": [(0, 10), (1, 5)], "comment_reply": None, "cost": 0}
+        with mock.patch("app.agent.runner.Feed") as FeedCls:
+            feed = FeedCls.return_value
+            items = [{"cid": "c1", "user": "u1", "text": "笑死我了这个眼神"}, {"cid": "c2", "user": "u2", "text": "好看"}]
+            feed.read_current.return_value = {"video_id": "new", "url": "u", "author": "b", "desc": "小猫",
+                                              "comments": [c["text"] for c in items], "comment_items": items}
+            feed.capture_frames.side_effect = lambda n, d, sleep=None: [b"x"] * n
+            feed.interact_comments.return_value = {"liked": [items[0]], "replied": []}
+            agent._watch_one(mock.Mock(), agent.db.rules())
+        args = agent.brain.decide.call_args.args
+        self.assertFalse(args[2])                                                      # 视频不赞
+        self.assertTrue(args[3])                                                       # 但照样问要不要评论
+        self.assertTrue(args[4])                                                       # 也照样给评论打分
+        feed.like.assert_not_called()
+        liked_comments = feed.interact_comments.call_args.args[0]
+        self.assertEqual([c["cid"] for c in liked_comments], ["c1"])                   # 只赞出彩的那条
+
+    def test_prompt_says_comment_even_without_like(self):
+        from app.agent.brain import Brain
+        b = Brain(make_db())
+        fake = mock.Mock(text='{"comment": ""}', cost=0.0)
+        with mock.patch.object(b.router, "call", return_value=fake) as call:
+            b.decide({"author": "a", "desc": "d", "comments": ["一"]}, [], False, True, True, False)
+        self.assertIn("不打算点赞", call.call_args.args[2])
+        self.assertIn("照样可以评论", call.call_args.args[2])

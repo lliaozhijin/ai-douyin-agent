@@ -113,7 +113,8 @@ class Brain:
         if can_comment:
             options.append('"comment": "你的评论（不想评论就写空字符串）"')
         if can_like_comments and n_comments:
-            options.append('"comment_likes": [想点赞的评论编号，最多 3 个，没有就写 []]')
+            options.append('"comment_likes": [[评论编号, 0到10的分数], ...]（只列特别好笑、说到你心坎上的评论，'
+                           '普通的“哈哈哈”“好看”不要列；大多数时候写 []）')
         if can_reply_comments and n_comments:
             options.append('"comment_reply": {"to": 评论编号, "text": "你的回复"}（不想回复就写 null）')
         if friends:
@@ -132,7 +133,8 @@ class Brain:
         about_comments = ""
         if n_comments and (can_like_comments or can_reply_comments):
             about_comments = (
-                "热门评论前面有编号。评论区里真心觉得说得好、有意思的评论，可以给它点赞；"
+                "热门评论前面有编号。评论区里特别好笑、说到你心坎上的评论可以点赞，给它打个分"
+                "（8 分以上才算真的出彩，大多数评论只是普通的）；"
                 "只有真的想接某条评论的话时才回复它，回复要针对那条评论本身，30 字以内，"
                 "语气友好，不抬杠，不聊敏感话题，不索要或留下联系方式。大多数时候不用回复。\n"
             )
@@ -144,7 +146,10 @@ class Brain:
             + ("收藏和点赞不一样：收藏是留着以后还想再看的。只有特别喜欢、想反复看，或者以后用得上"
                "（教程、菜谱、攻略、好听的歌、想去的地方）的视频才收藏，大多数视频都不收藏。\n" if can_collect else "")
             + ("点赞：程序已经替你看过，这个视频在你最近刷到的里面算比较出挑的，可以点赞；"
-               "但如果仔细看完其实没那么喜欢，就写 false。\n" if can_like else "")
+               "但如果仔细看完其实没那么喜欢，就写 false。\n" if can_like else
+               ("这个视频你看完了但不打算点赞——这不影响别的：有想说的话照样可以评论，"
+                "评论区里有出彩的评论照样可以给它点赞、回复。\n" if (can_comment or can_like_comments or can_reply_comments)
+                else ""))
             + about_comments
             + about_friends
             + f'只输出 JSON：{{"interest": 0到10, {", ".join(options)}, "reason": "一句话原因"}}'
@@ -153,14 +158,22 @@ class Brain:
         data = parse_json(r.text)
         comment = safety.clean_reply(str(data.get("comment") or "")) if can_comment else ""
         likes: list[int] = []
+        scores: list[tuple[int, int]] = []   # (编号, 分数)：程序按分数和“点赞倾向”挑真正要赞的
         if can_like_comments:
             for x in data.get("comment_likes") or []:
+                score = 8                       # 只写了编号（旧格式）：当作刚好够格
+                if isinstance(x, dict):
+                    x, score = x.get("no", x.get("to")), x.get("score", 8)
+                elif isinstance(x, (list, tuple)) and x:
+                    x, score = x[0], (x[1] if len(x) > 1 else 8)
                 try:
                     i = int(x) - 1
+                    score = max(0, min(10, int(score)))
                 except (TypeError, ValueError):
                     continue
                 if 0 <= i < n_comments and i not in likes:
                     likes.append(i)
+                    scores.append((i, score))
         reply = None
         raw = data.get("comment_reply") if can_reply_comments else None
         if isinstance(raw, dict):
@@ -187,6 +200,7 @@ class Brain:
             "collect": _yes(data.get("collect")) if can_collect else False,
             "comment": comment,
             "comment_likes": likes[:3],
+            "comment_scores": scores,
             "comment_reply": reply,
             "reason": str(data.get("reason", ""))[:100],
             "cost": r.cost,
