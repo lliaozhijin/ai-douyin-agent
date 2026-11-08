@@ -43,6 +43,16 @@ def parse_json(text: str) -> dict:
     return {}
 
 
+# 打分标准：不给标准的话，大模型（加上活泼的人设）几乎什么都打 6～8 分，结果每个视频都“感兴趣”、都点赞
+INTEREST_SCALE = (
+    "打分要像真人刷推荐页那样严格：\n"
+    "0～3：不感兴趣，马上划走；4～5：一般般，看两眼就划走；6～7：还不错，会看下去；"
+    "8～9：很喜欢；10：超级喜欢，非常少见。\n"
+    "推荐页上大多数视频都在 3～6 分。只有和你感兴趣的内容明显相关、而且拍得有意思，才给 7 分以上；"
+    "属于你不喜欢的内容直接给 0～2 分。不要因为语气活泼就打高分。\n"
+)
+
+
 def _video_block(v: dict) -> str:
     comments = "\n".join(f"{i}. {c}" for i, c in enumerate((v.get("comments") or [])[:8], 1)) or "（没读到评论）"
     block = (
@@ -75,15 +85,18 @@ class Brain:
         prompt = (
             f"你正在刷抖音推荐页，刷到了下面这个视频。{seen}判断你对它有多感兴趣。\n\n"
             f"{_video_block(video)}\n\n"
-            '只输出 JSON：{"interest": 0到10的整数, "reason": "一句话原因"}'
+            + INTEREST_SCALE
+            + '只输出 JSON：{"interest": 0到10的整数, "topic": "这个视频属于哪一类，2到4个字，比如 猫、美食、舞蹈、搞笑、风景", '
+              '"reason": "一句话原因"}'
         )
-        r = self.router.call("vision", self.system, prompt, images=frames or None, max_tokens=120, temperature=0.3)
+        r = self.router.call("vision", self.system, prompt, images=frames or None, max_tokens=140, temperature=0.3)
         data = parse_json(r.text)
         try:
             interest = max(0, min(10, int(data.get("interest", 0))))
         except (TypeError, ValueError):
             interest = 0
-        return {"interest": interest, "reason": str(data.get("reason", ""))[:100], "cost": r.cost}
+        topic = re.sub(r"\s+", "", str(data.get("topic") or ""))[:6]
+        return {"interest": interest, "topic": topic, "reason": str(data.get("reason", ""))[:100], "cost": r.cost}
 
     def decide(self, video: dict, frames: list[bytes], can_like: bool, can_comment: bool,
                can_like_comments: bool = False, can_reply_comments: bool = False,
@@ -130,6 +143,8 @@ class Brain:
             "评论要具体提到内容里的细节，30 字以内，不要和热门评论重复。\n"
             + ("收藏和点赞不一样：收藏是留着以后还想再看的。只有特别喜欢、想反复看，或者以后用得上"
                "（教程、菜谱、攻略、好听的歌、想去的地方）的视频才收藏，大多数视频都不收藏。\n" if can_collect else "")
+            + ("点赞：程序已经替你看过，这个视频在你最近刷到的里面算比较出挑的，可以点赞；"
+               "但如果仔细看完其实没那么喜欢，就写 false。\n" if can_like else "")
             + about_comments
             + about_friends
             + f'只输出 JSON：{{"interest": 0到10, {", ".join(options)}, "reason": "一句话原因"}}'

@@ -542,6 +542,7 @@ class WatchTests(unittest.TestCase):
         from app.agent.runner import Agent
 
         agent = Agent(make_db())
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.99))  # 不随机：不会“看到一半就赞”、不会没耐心划走
         agent._want_run = True
         agent._sleep = lambda s: agent._want_run
         agent.brain = mock.Mock()
@@ -573,6 +574,7 @@ class WatchTests(unittest.TestCase):
         from app.agent.runner import Agent
 
         agent = Agent(make_db())
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.99))  # 不随机：不会“看到一半就赞”、不会没耐心划走
         agent._want_run = True
         agent._sleep = lambda s: agent._want_run
         agent.brain = mock.Mock()
@@ -603,6 +605,7 @@ class WatchTests(unittest.TestCase):
         r["collect_enabled"] = False
         db.set_json("rules", r)
         agent = Agent(db)
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.99))  # 不随机：不会“看到一半就赞”、不会没耐心划走
         agent._want_run = True
         agent._sleep = lambda s: agent._want_run
         agent.brain = mock.Mock()

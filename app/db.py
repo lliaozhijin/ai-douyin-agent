@@ -262,7 +262,7 @@ class Database:
         "daily_usage": {"comment_likes": "INTEGER NOT NULL DEFAULT 0", "comment_replies": "INTEGER NOT NULL DEFAULT 0",
                         "thread_replies": "INTEGER NOT NULL DEFAULT 0", "at_friends": "INTEGER NOT NULL DEFAULT 0",
                         "publishes": "INTEGER NOT NULL DEFAULT 0", "collects": "INTEGER NOT NULL DEFAULT 0"},
-        "videos": {"collected": "INTEGER NOT NULL DEFAULT 0"},
+        "videos": {"collected": "INTEGER NOT NULL DEFAULT 0", "topic": "TEXT NOT NULL DEFAULT ''"},
         "drafts": {"card_bg": "TEXT NOT NULL DEFAULT ''", "card_panel": "INTEGER NOT NULL DEFAULT 1"},
         "events": {"ref": "TEXT NOT NULL DEFAULT ''"},
         "comment_actions": {"video_title": "TEXT NOT NULL DEFAULT ''", "video_author": "TEXT NOT NULL DEFAULT ''",

@@ -1371,3 +1371,100 @@ class PhoneHoldTests(unittest.TestCase):
             self.assertGreater(math.degrees(bend), 30, side)                     # 手肘弯着
         self.assertLess(hands["l"][0], hands["r"][0])                            # 左手在左、右手在右，不交叉
         self.assertLess(hands["r"][0] - hands["l"][0], 80 * r.fy)               # 两只手凑在手机两边
+
+
+class LikePolicyTests(unittest.TestCase):
+    """点赞：和最近看过的比、一天匀着赞、同类赞腻；推荐页全是喜欢的也不会见一个赞一个。"""
+
+    RULES = {"like_tendency": "normal", "limits": {"likes": 40}, "active_start": "00:00", "active_end": "23:59"}
+    NOON = datetime(2026, 11, 7, 12, 0)
+
+    def _db_with(self, scores, liked=()):
+        db = make_db()
+        for i, s in enumerate(scores):
+            db.add_video(video_id=f"v{i}", author=f"作者{i}", interest=s, decision="watch")
+        for author, topic in liked:
+            db.add_video(video_id="x", author=author, interest=8, decision="like", liked=1, topic=topic)
+        return db
+
+    def test_rank_chance(self):
+        from app.agent.likes import LikePolicy
+        self.assertEqual(LikePolicy.rank_chance(10, [5, 6, 7] * 9, 0.25), 1.0)
+        self.assertEqual(LikePolicy.rank_chance(6, [8, 9] * 10, 0.25), 0.0)
+        self.assertAlmostEqual(LikePolicy.rank_chance(8, [8] * 29, 0.25), 0.25)    # 全是 8 分：按比例挑
+
+    def test_all_good_feed_likes_only_a_share(self):
+        from app.agent.likes import LikePolicy
+        db = self._db_with([8] * 29)
+        pol = LikePolicy(db, random.Random(5))
+        v = pol.judge(8, "新作者", "猫", self.RULES, "calm", likes_used=0, now=self.NOON)
+        self.assertAlmostEqual(v["p"], 0.25, places=2)
+        hits = sum(pol.roll(v) for _ in range(400))
+        self.assertTrue(60 < hits < 140, hits)                                       # 大约四个里赞一个
+
+    def test_low_score_never_liked_and_tendency(self):
+        from app.agent.likes import LikePolicy
+        db = self._db_with([4, 5, 6] * 10)
+        pol = LikePolicy(db)
+        self.assertEqual(pol.judge(6, "a", "", self.RULES, now=self.NOON)["p"], 0.0)     # 不到 7 分不赞
+        self.assertEqual(pol.judge(9, "a", "", self.RULES, now=self.NOON)["p"], 1.0)     # 明显最出挑：赞
+        picky = dict(self.RULES, like_tendency="picky")
+        self.assertEqual(pol.judge(7, "a", "", picky, now=self.NOON)["p"], 0.0)          # 挑剔：8 分起
+        db2 = self._db_with([8] * 29)
+        gen = LikePolicy(db2).judge(8, "a", "", dict(self.RULES, like_tendency="generous"), now=self.NOON)
+        nor = LikePolicy(db2).judge(8, "a", "", self.RULES, now=self.NOON)
+        self.assertGreater(gen["p"], nor["p"])
+
+    def test_pacing_holds_back_unless_ten(self):
+        from app.agent.likes import LikePolicy
+        db = self._db_with([5] * 29)
+        rules = dict(self.RULES, active_start="09:00", active_end="23:00")
+        early = datetime(2026, 11, 7, 10, 0)                                         # 一天才过了 1/14
+        pol = LikePolicy(db)
+        self.assertEqual(pol.judge(9, "a", "", rules, likes_used=20, now=early)["p"], 0.0)
+        self.assertEqual(pol.judge(10, "a", "", rules, likes_used=20, now=early)["p"], 1.0)
+        self.assertEqual(pol.judge(9, "a", "", rules, likes_used=2, now=early)["p"], 1.0)
+
+    def test_same_topic_and_author_get_tiring(self):
+        from app.agent.likes import LikePolicy
+        db = self._db_with([5] * 25, liked=[("猫猫日记", "猫")] + [(f"别人{i}", "猫") for i in range(3)])
+        pol = LikePolicy(db)
+        fresh = pol.judge(9, "新作者", "美食", self.RULES, now=datetime.now())["p"]
+        cat = pol.judge(9, "新作者", "猫", self.RULES, now=datetime.now())["p"]
+        same_author = pol.judge(9, "猫猫日记", "美食", self.RULES, now=datetime.now())["p"]
+        self.assertEqual(fresh, 1.0)
+        self.assertLess(cat, 0.5)
+        self.assertLess(same_author, 0.5)
+
+    def test_triage_prompt_has_scale_and_topic(self):
+        from app.agent.brain import Brain
+        b = Brain(make_db())
+        fake = mock.Mock(text='{"interest": 4, "topic": "风 景", "reason": "一般"}', cost=0.0)
+        with mock.patch.object(b.router, "call", return_value=fake) as call:
+            r = b.triage({"author": "a", "desc": "海边日落", "comments": []})
+        prompt = call.call_args.args[2]
+        self.assertIn("大多数视频都在 3～6 分", prompt)
+        self.assertEqual(r["topic"], "风景")
+        self.assertEqual(r["interest"], 4)
+
+    def test_runner_does_not_offer_like_when_policy_says_no(self):
+        from app.agent.runner import Agent
+        db = self._db_with([9] * 29)                                                  # 最近全是 9 分
+        agent = Agent(db)
+        agent._want_run = True
+        agent._sleep = lambda s: agent._want_run
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.99))
+        agent.brain = mock.Mock()
+        agent.brain.router.task_can_see.return_value = True
+        agent.brain.triage.return_value = {"interest": 7, "topic": "猫", "reason": "还行", "cost": 0}
+        agent.brain.decide.return_value = {"interest": 7, "like": True, "comment": "", "reason": "", "cost": 0}
+        with mock.patch("app.agent.runner.Feed") as FeedCls:
+            feed = FeedCls.return_value
+            feed.read_current.return_value = {"video_id": "new", "url": "u", "author": "b", "desc": "小猫", "comments": []}
+            feed.capture_frames.side_effect = lambda n, d, sleep=None: [b"x"] * n
+            agent._watch_one(mock.Mock(), agent.db.rules())
+        self.assertFalse(agent.brain.decide.call_args.args[2])                       # 没问模型要不要赞
+        feed.like.assert_not_called()
+        row = agent.db.query("SELECT decision, topic FROM videos WHERE video_id='new'")[0]
+        self.assertEqual(row["decision"], "watch")                                    # 记成“看完”
+        self.assertEqual(row["topic"], "猫")

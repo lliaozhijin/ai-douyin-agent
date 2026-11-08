@@ -78,6 +78,7 @@ DEFAULT_RULES = {
     "keywords": ["加微信", "私聊发你", "内部消息", "稳赚"],
     "on_hit": "pending",           # pending: 放进待你处理 / log: 只记日志
     "interest_threshold": 6,       # 0-10，高于它才截帧细看
+    "like_tendency": "normal",     # 点赞倾向：picky 挑剔（赞最近看过的前 15%）/ normal 适中（前 25%）/ generous 大方（前 40%）
     "frames_per_video": 4,
 }
 

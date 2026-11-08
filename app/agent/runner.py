@@ -28,6 +28,7 @@ from ..llm.router import BudgetExceeded
 from . import safety
 from .brain import Brain
 from .budget import Budget, in_active_hours, parse_hhmm
+from .likes import LikePolicy, impatient_skip
 from .persona import douyin_bio
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class Agent(threading.Thread):
         self.db = db
         self.brain = Brain(db)
         self.budget = Budget(db)
+        self.likes = LikePolicy(db)
         self.q: queue.Queue = queue.Queue()
         self.browser: DouyinBrowser | None = None
         self.state = "stopped"
@@ -588,6 +590,7 @@ class Agent(threading.Thread):
             feed.next()
             raise
         cost += tri["cost"]
+        topic = tri.get("topic") or ""
         title = f"《{v['desc'][:24] or '无文案'}》"
         threshold = max(0, min(10, _int(rules.get("interest_threshold"), 6) + bias["threshold"]))
         if tri["interest"] >= 8:
@@ -595,12 +598,15 @@ class Agent(threading.Thread):
             bus.emit("love", v["desc"][:20])
         else:
             self.mood.event("video_ok" if tri["interest"] >= threshold else "video_meh")
-        if tri["interest"] < threshold:
+        mood_key = self.mood.current().get("key", "calm")
+        bored_skip = tri["interest"] >= threshold and impatient_skip(tri["interest"], mood_key, self.likes.rnd)
+        if tri["interest"] < threshold or bored_skip:
             bus.emit("skip")
-            self.current["step"] = "不太感兴趣，划走"
+            reason = "有点没耐心，还没看完就划走了" if bored_skip else (tri["reason"] or "不是她喜欢的类型")
+            self.current["step"] = "没耐心，划走" if bored_skip else "不太感兴趣，划走"
             vrow = self.db.add_video(video_id=v["video_id"], url=v["url"], author=v["author"], title=v["desc"][:100],
-                                     interest=tri["interest"], decision="skip", reason=tri["reason"], cost=cost)
-            self.db.add_event("skip", f"划走 {title}", tri["reason"] or "不是她喜欢的类型", ref=f"video:{vrow}")
+                                     interest=tri["interest"], decision="skip", reason=reason, cost=cost, topic=topic)
+            self.db.add_event("skip", f"划走 {title}", reason, ref=f"video:{vrow}")
             if not self._sleep(min(dwell, random.uniform(2, 6))) or self._stopped():
                 return
             feed.next()
@@ -608,6 +614,24 @@ class Agent(threading.Thread):
         if self._stopped():
             return
 
+        # 点不点赞：和最近看过的比、看今天赞的进度、同类有没有赞腻（app/agent/likes.py）。
+        # 不想赞的视频就不问模型要不要赞；想赞的再让模型看完画面最后确认一次（它可以反悔）
+        verdict = self.likes.judge(tri["interest"], v["author"], topic, rules, mood_key,
+                                   likes_used=float(self.db.usage().get("likes") or 0))
+        want_like = self.budget.can("likes") and self.likes.roll(verdict)
+        log.info("点赞判断：%s 分，概率 %.2f，%s → %s", tri["interest"], verdict["p"], verdict["why"],
+                 "想赞" if want_like else "不赞")
+        liked = False
+        if want_like and tri["interest"] >= 9 and self.likes.rnd.random() < 0.35:
+            # 特别喜欢的：看到一半就忍不住双击了（真人也常这样），不用等看完
+            self._watch_sleep(min(dwell * 0.4, random.uniform(2, 6)))
+            if not self._stopped() and feed.like():
+                liked = True
+                self.budget.use("likes")
+                self.mood.event("liked")
+                bus.emit("like")
+        if self._stopped():
+            return
         if can_see:
             self.current["step"] = "感兴趣，多截几张画面细看"
             more = feed.capture_frames(max(0, int(rules.get("frames_per_video") or 4) - len(first)), dwell,
@@ -626,15 +650,15 @@ class Agent(threading.Thread):
         friends = []
         if rules.get("at_friends_enabled", True) and self.budget.can("at_friends") and self.budget.can("comments"):
             friends = self.db.friends_for_at(max(1, _int(rules.get("at_friend_per_day"), 1)))[:8]
-        dec = self.brain.decide(v, frames, self.budget.can("likes"), self.budget.can("comments"),
+        dec = self.brain.decide(v, frames, want_like and not liked and self.budget.can("likes"),
+                                self.budget.can("comments"),
                                 engage and self.budget.can("comment_likes"),
                                 engage and self.budget.can("comment_replies"), friends=friends,
                                 can_collect=bool(rules.get("collect_enabled", True)) and self.budget.can("collects"))
         cost += dec["cost"]
         if self._stopped():  # 想完的时候已经被叫停了：不再点赞或评论
             return
-        liked = False
-        if dec["like"] and self.budget.can("likes"):
+        if dec["like"] and want_like and not liked and self.budget.can("likes"):   # 程序没同意赞的，模型说了也不赞
             liked = feed.like()
             if liked:
                 self.budget.use("likes")
@@ -679,7 +703,8 @@ class Agent(threading.Thread):
         decision = "+".join(acts) or "watch"
         vrow = self.db.add_video(video_id=v["video_id"], url=v["url"], author=v["author"], title=v["desc"][:100],
                                  interest=tri["interest"], decision=decision, liked=int(liked),
-                                 collected=int(collected), comment=posted, reason=dec["reason"], cost=cost)
+                                 collected=int(collected), comment=posted, reason=dec["reason"], cost=cost,
+                                 topic=topic)
         if acts:
             kind = "comment" if posted else "collect" if collected else "like"
             label = " + ".join({"like": "点赞", "collect": "收藏", "comment": "评论"}[a] for a in acts)

@@ -823,6 +823,10 @@ function renderRules() {
           </div></section>
         <section class="card"><h2>${HEART}回复规则</h2>
           <h3 class="sub-h">刷视频时</h3>
+          <div class="toggle-row"><label for="r-liketd">点赞倾向<span class="hint" style="display:block;margin:2px 0 0">和她最近看过的视频比，只赞最出挑的那部分；推荐页全是喜欢的内容时也不会见一个赞一个</span></label>
+            <select id="r-liketd" class="input" style="max-width:260px">
+              ${[["picky", "挑剔：只赞最喜欢的约 15%"], ["normal", "适中：约 25%（推荐）"], ["generous", "大方：约 40%"]].map(([k, v]) => `<option value="${k}" ${(r.like_tendency || "normal") === k ? "selected" : ""}>${v}</option>`).join("")}
+            </select></div>
           <label class="toggle-row"><span>刷到特别喜欢、想以后再看的视频时收藏（她自己决定收不收）</span><input id="r-col" type="checkbox" ${r.collect_enabled !== false ? "checked" : ""}></label>
           <label class="toggle-row"><span>刷视频时给喜欢的评论点赞、回复别人的评论</span><input id="r-cm" type="checkbox" ${r.engage_comments !== false ? "checked" : ""}></label>
           <h3 class="sub-h">评论区里 @ 她（让她看视频、分析内容）</h3>
@@ -899,7 +903,7 @@ function collectRules() {
     rest_every: num("#r-every"), rest_min: num("#r-rmin"), rest_max: Math.max(num("#r-rmax"), num("#r-rmin")),
     at_interval: Math.max(1, num("#r-atint") || 10), dm_reply_mode: $("#r-dmmode").value,
     interest_threshold: num("#r-thr"), frames_per_video: num("#r-frames"),
-    auto_reply_at: $("#r-at").checked, auto_reply_dm: $("#r-dm").checked, engage_comments: $("#r-cm").checked, collect_enabled: $("#r-col").checked, dm_scope: $("#r-scope").value,
+    auto_reply_at: $("#r-at").checked, auto_reply_dm: $("#r-dm").checked, engage_comments: $("#r-cm").checked, collect_enabled: $("#r-col").checked, like_tendency: $("#r-liketd").value, dm_scope: $("#r-scope").value,
     share_watch_minutes: Math.max(0.5, Number($("#r-watch").value) || 3), share_frames: Math.max(0, Math.min(12, num("#r-sframes"))),
     per_user_daily: num("#r-per"), topics: r.topics,
     keywords: $("#r-kw").value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean),
