@@ -754,6 +754,30 @@ class DouyinBrowser:
                 continue
         return False
 
+    def verification_open(self) -> bool:
+        """还有没有验证框开着（判断“验证完了没”用）。
+
+        只认验证框本身：滑块 / 图形验证的容器和 iframe、短信验证码输入框和“获取 / 发送验证码”按钮；
+        不认页面上随便哪里出现的“验证”“验证码”几个字（评论、文案、登录面板里都可能有，
+        认了它们就会一直以为你还没验证完，浏览器藏不回去）。所有标签页都看。"""
+        if not self.ctx:
+            return False
+        strong = [s for s in as_list(self.sel.get("captcha")) if not s.startswith("text=") or "请完成" in s]
+        strong += [s for s in as_list(self.sel.get("sms_verify"))
+                   if s.startswith("input") or s in ("text=获取验证码", "text=发送验证码")]
+        try:
+            pages = [pg for pg in self.ctx.pages if not pg.is_closed()]
+        except Exception:  # noqa: BLE001
+            pages = [self.page] if self.page else []
+        for pg in pages:
+            for sel in strong:
+                try:
+                    if pg.locator(sel).first.is_visible(timeout=300):
+                        return True
+                except Exception:  # noqa: BLE001
+                    continue
+        return False
+
     def verify_kind(self) -> str:
         """现在页面上要你处理的验证：sms 手机验证码 / captcha 滑块或图形验证 / 空字符串 没有。"""
         if self.sms_visible():

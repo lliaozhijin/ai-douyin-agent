@@ -1259,7 +1259,7 @@ class Agent(threading.Thread):
             title = "需要填写手机验证码"
             body = ("抖音要求验证你的手机号。请到她的浏览器窗口里点“获取验证码”，"
                     "把手机收到的短信验证码填进去并确认。" + ("填完就登录成功了。" if during_login else
-                    "验证完成后她会自动继续刷视频。") + "（软件不会、也不能替你填写验证码。）")
+                    "验证完成后浏览器会自动藏回后台，她继续刷视频。") + "（软件不会、也不能替你填写验证码。）")
         else:
             title = "需要你完成一个验证"
             body = ("抖音弹出了安全验证（比如拖动滑块、点选图片）。请到她的浏览器窗口里手动完成，"
@@ -1280,29 +1280,46 @@ class Agent(threading.Thread):
             self.alert = ""
 
     def _on_captcha(self) -> None:
+        """抖音弹了验证：把浏览器拿到屏幕上、弹窗提醒你；你验证完，马上自动把浏览器藏回后台，她接着干活。"""
         kind = (self.browser.verify_kind() if self.browser else "") or "captcha"
         self._raise_attention(kind)
         self._set("captcha", "等你在浏览器里完成验证")
         started = time.time()
-        while not self._shutdown and self.browser and (self.browser.captcha_visible() or self.browser.sms_visible()):
-            try:
-                cmd = self.q.get(timeout=3)
-                self._dispatch(*cmd)
-            except queue.Empty:
-                pass
-            if time.time() - started > 1800:
-                self._want_run = False
-                self._clear_attention()
-                self.alert = "验证 30 分钟没有完成，她已经暂停了。在浏览器里完成验证后，再点“开始刷视频”继续"
-                self._set("paused", "验证 30 分钟没处理，已暂停")
-                return
-        self._clear_attention()
-        if self.browser:
-            self.browser.hide_window()
-        self.db.add_event("info", "验证完成，继续运行", f"等了 {int(time.time() - started)} 秒")
+        gone = 0
+        timed_out = False
+        try:
+            while not self._shutdown and self.browser:
+                # 连着两次（约 3 秒）都看不到验证框才算验证完：抖音有时验证完一个紧接着再弹一个
+                if self.browser.verification_open():
+                    gone = 0
+                else:
+                    gone += 1
+                    if gone >= 2:
+                        break
+                try:
+                    cmd = self.q.get(timeout=1.5)
+                    self._dispatch(*cmd)
+                except queue.Empty:
+                    pass
+                if time.time() - started > 1800:
+                    timed_out = True
+                    break
+        finally:
+            self._clear_attention()
+            if self.browser:
+                with cancel.shield():
+                    try:
+                        self.browser.hide_window()   # 验证完（或超时、出错）都藏回后台，不留在屏幕上
+                    except Exception:  # noqa: BLE001
+                        log.warning("验证后藏浏览器失败", exc_info=True)
+        if timed_out:
+            self._want_run = False
+            self.alert = "验证 30 分钟没有完成，她已经暂停了。在浏览器里完成验证后，再点“开始刷视频”继续"
+            self._set("paused", "验证 30 分钟没处理，已暂停")
+            return
+        self.db.add_event("info", "验证完成，浏览器已藏回后台", f"等了 {int(time.time() - started)} 秒")
         if self._want_run:
             self._set("running", "继续刷视频")
-
 
 def publish_slots(rules: dict, n: int, now: float | None = None) -> list[float]:
     """今天想一想要不要发作品的时间点：在设定的时间段里随机挑 n 个（已经过去的不算）。"""

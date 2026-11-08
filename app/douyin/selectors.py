@@ -13,7 +13,7 @@ from ..paths import SELECTORS_FILE
 
 log = logging.getLogger(__name__)
 
-SELECTORS_VERSION = 16  # 改了默认定位就加 1，旧的 selectors.json 会自动备份并更新
+SELECTORS_VERSION = 17  # 改了默认定位就加 1，旧的 selectors.json 会自动备份并更新
 
 DEFAULT_SELECTORS: dict = {
     "_说明": "抖音网页改版后，如果某个动作失效，修改这里对应的定位即可。修改后重启软件生效。",
@@ -164,8 +164,9 @@ DEFAULT_SELECTORS: dict = {
     # 手机短信验证（登录或抖音风控时要求填手机收到的验证码）：检测到就弹窗提醒你去浏览器里填写
     "sms_verify": ["input[placeholder*='验证码']:visible", "text=获取验证码", "text=发送验证码", "text=短信验证",
                    "text=验证手机", "text=手机号验证", "text=身份验证"],
+    # 不要放“text=验证码”这种宽泛的文字：评论、文案里出现“验证码”三个字也会被当成弹了验证
     "captcha": ["#captcha_container", ".captcha_verify_container", "iframe[src*='verifycenter']",
-                "iframe[src*='captcha']", "text=请完成下列验证", "text=验证码"],
+                "iframe[src*='captcha']", "text=请完成下列验证"],
 }
 
 

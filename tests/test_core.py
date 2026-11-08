@@ -1051,21 +1051,76 @@ class VerifyPopupTests(unittest.TestCase):
         b.hide_window.assert_called()
         self.assertTrue(agent.logged_in)
 
+    def _fast_queue(self, agent):
+        import queue as _q
+        agent.q = mock.Mock(get=mock.Mock(side_effect=_q.Empty))   # 不真的等 1.5 秒
+
     def test_captcha_while_running_uses_popup(self):
         agent, b = self.make()
+        self._fast_queue(agent)
         b.verify_kind.return_value = "captcha"
-        visible = iter([True, False])
-        b.captcha_visible.side_effect = lambda: next(visible, False)
-        b.sms_visible.return_value = False
+        visible = iter([True, True, False, False])
+        b.verification_open.side_effect = lambda: next(visible, False)
         agent._want_run = True
         with mock.patch("app.agent.runner.winfocus"):
             agent._on_captcha()
         self.assertIsNone(agent.attention)
+        b.show_window.assert_called()
+        b.hide_window.assert_called_once()                         # 验证完自动藏回后台
         kinds = [e["title"] for e in agent.db.events()]
         self.assertIn("需要你完成一个验证", kinds)
-        self.assertIn("验证完成，继续运行", kinds)
-        self.assertIn("attention", agent.status())
+        self.assertIn("验证完成，浏览器已藏回后台", kinds)
+        self.assertEqual(agent.state, "running")
 
+    def test_captcha_waits_through_a_second_challenge(self):
+        """验证完一个、紧接着又弹一个：中间那一下空档不藏，等第二个也验证完才藏。"""
+        agent, b = self.make()
+        self._fast_queue(agent)
+        b.verify_kind.return_value = "captcha"
+        seq = iter([True, False, True, True, False, False])
+        calls = []
+        b.verification_open.side_effect = lambda: (calls.append(1), next(seq, False))[1]
+        with mock.patch("app.agent.runner.winfocus"):
+            agent._on_captcha()
+        self.assertEqual(len(calls), 6)
+        b.hide_window.assert_called_once()
+
+    def test_captcha_timeout_still_hides(self):
+        agent, b = self.make()
+        self._fast_queue(agent)
+        b.verify_kind.return_value = "captcha"
+        b.verification_open.return_value = True
+        agent._want_run = True
+        t = iter([0, 0] + [5000] * 10)
+        with mock.patch("app.agent.runner.winfocus"), mock.patch("app.agent.runner.time.time", side_effect=lambda: next(t)):
+            agent._on_captcha()
+        b.hide_window.assert_called_once()                         # 超时暂停也藏回去，不留在屏幕上
+        self.assertEqual(agent.state, "paused")
+        self.assertFalse(agent._want_run)
+
+    def test_verification_open_ignores_loose_text(self):
+        """页面上（评论、文案、登录面板）出现“验证码”几个字不算验证框还开着；验证框本身才算。"""
+        from app.douyin.browser import DouyinBrowser
+        from app.douyin.selectors import DEFAULT_SELECTORS
+        self.assertNotIn("text=验证码", DEFAULT_SELECTORS["captcha"])
+
+        def page_with(visible: set):
+            pg = mock.Mock()
+            pg.is_closed.return_value = False
+            pg.locator.side_effect = lambda sel: mock.Mock(first=mock.Mock(
+                is_visible=mock.Mock(return_value=sel in visible)))
+            return pg
+
+        b = DouyinBrowser.__new__(DouyinBrowser)
+        b.sel = dict(DEFAULT_SELECTORS, captcha=list(DEFAULT_SELECTORS["captcha"]) + ["text=验证码"])
+        b.page = page_with({"text=验证码", "text=身份验证", "text=短信验证"})
+        b.ctx = mock.Mock(pages=[b.page])
+        self.assertFalse(b.verification_open())
+        other = page_with({"#captcha_container"})                  # 验证框在另一个标签页里也认
+        b.ctx = mock.Mock(pages=[b.page, other])
+        self.assertTrue(b.verification_open())
+        b.ctx = mock.Mock(pages=[page_with({"input[placeholder*='验证码']:visible"})])
+        self.assertTrue(b.verification_open())
 
 class ReactDataTests(unittest.TestCase):
     def test_pick_unique(self):
