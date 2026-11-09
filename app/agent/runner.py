@@ -81,6 +81,8 @@ class Agent(threading.Thread):
         self._rest_until = 0.0
         self._next_at = 0.0   # 下次去看 @ 的时间
         self._next_dm = 0.0   # 下次去看私信的时间
+        self._notice_fail_warned = 0.0   # 上次在动态里提醒“通知面板打不开”的时间
+        self.notice_checked: dict = {}   # 上次看“互动消息”的时间和结果
         self.activity = ""    # 桌宠用：watch 刷视频 / inbox 回消息 / publish 发作品 / 空 什么都没做
         # 上次软件关闭（或出错）时还在“发布中”的作品：标记为没发出去，让你可以再点一次发布
         db.execute("UPDATE drafts SET status='failed', error='上次发布没有完成（软件关闭或中断了），可以再点一次“确认发布”' "
@@ -137,6 +139,7 @@ class Agent(threading.Thread):
             "running": self._want_run,
             "next_at_s": next_at,
             "next_dm_s": next_dm,
+            "notice_checked": self.notice_checked,
             "alert": self.alert,
             "activity": self.activity if self._want_run or self.activity == "publish" else "",
         }
@@ -660,8 +663,13 @@ class Agent(threading.Thread):
             return
         self.current["step"] = "想想要不要点赞 / 评论"
         engage = bool(rules.get("engage_comments", True)) and bool(v.get("comment_items"))
+        # 自己发评论：程序按今天的进度和兴趣分决定让不让写、要不要明确邀请她说一句（app/agent/likes.py）
+        post_gate = {"ok": False, "invite": False, "p": 0.0, "why": "今天评论的额度用完了"}
+        if self.budget.can("comments"):
+            post_gate = self.likes.post_gate(tri["interest"], topic, rules,
+                                             float(self.db.usage().get("comments") or 0))
         friends = []
-        if rules.get("at_friends_enabled", True) and self.budget.can("at_friends") and self.budget.can("comments"):
+        if (rules.get("at_friends_enabled", True) and self.budget.can("at_friends") and post_gate["ok"]):
             friends = self.db.friends_for_at(max(1, _int(rules.get("at_friend_per_day"), 1)))[:8]
         # 发评论、赞别人的评论、回复别人的评论：看了的视频都要判断，和视频本身赞没赞无关；
         # 赞评论只受今天的额度和进度限制（app/agent/likes.py）
@@ -674,11 +682,16 @@ class Agent(threading.Thread):
             col_gate = self.likes.collect_gate(tri["interest"], topic, rules,
                                                float(self.db.usage().get("collects") or 0))
         dec = self.brain.decide(v, frames, want_like and not liked and self.budget.can("likes"),
-                                self.budget.can("comments"),
+                                post_gate["ok"],
                                 cl_gate["ok"],
                                 engage and self.budget.can("comment_replies"), friends=friends,
-                                can_collect=col_gate["ok"], collect_note=col_gate["note"])
+                                can_collect=col_gate["ok"], collect_note=col_gate["note"],
+                                comment_invite=post_gate["invite"])
         cost += dec["cost"]
+        log.info("评论判断：%s → %s", post_gate["why"],
+                 f"她写了：{dec['comment'][:30]}" if dec.get("comment") else
+                 ("邀请了但她这次没写" + (f"（{dec.get('reason', '')[:40]}）" if dec.get("reason") else ""))
+                 if post_gate["invite"] else "没写")
         # 模型给热评打的分 → 真正要赞的：只赞够分的，一般 1 条，特别精彩才多赞，按今天的进度封顶
         dec["comment_likes"] = (self.likes.pick_comments(dec.get("comment_scores") or [], rules, cl_used)
                                 if cl_gate["ok"] else [])
@@ -709,7 +722,15 @@ class Agent(threading.Thread):
             friend = dec.get("at_friend")
             if problem is None:
                 bus.emit("typing", f"@{friend['nickname']} " + comment if friend else comment)
-            if problem is None and feed.comment(comment, mention=friend["nickname"] if friend else ""):
+            sent = feed.comment(comment, mention=friend["nickname"] if friend else "") if problem is None else None
+            if sent is not None and not sent and getattr(sent, "uncertain", False):
+                # 点了发送但没在评论区里查到：可能已经发出去了，不重发，按发了算（免得发两遍）
+                self.db.add_event("info", f"评论 {title} 可能已经发出去了",
+                                  f"“{comment}”——按了发送但没在评论区里确认到，去抖音里看一眼")
+            if sent is not None and not sent and not getattr(sent, "uncertain", False):
+                self.db.add_event("error", f"评论没发出去 {title}",
+                                  f"“{comment}”——按了发送，评论没出现在评论区（可能需要校准页面定位）")
+            if sent or getattr(sent, "uncertain", False):
                 self.budget.use("comments")
                 posted = comment
                 if friend and feed.last_mention_ok:
@@ -723,6 +744,7 @@ class Agent(threading.Thread):
                 bus.emit("comment", posted)
             elif problem:
                 log.info("评论没发：%s（%s）", comment, problem)
+                self.db.add_event("skip", f"评论被拦下 {title}", f"“{comment}”——{problem}")
         if not self._stopped():
             cost += self._engage_comments(feed, v, dec, rules)
         acts = [k for k, on in (("like", liked), ("collect", collected), ("comment", posted)) if on]
@@ -776,7 +798,8 @@ class Agent(threading.Thread):
     def _inbox_due(self, b: DouyinBrowser, rules: dict) -> tuple[bool, bool]:
         """现在该不该去看 @ / 私信。额度用完的就不去看（省时间也省 token）。"""
         now = time.time()
-        due_at = (bool(rules.get("auto_reply_at")) and self.budget.can("replies_at") and now >= self._next_at)
+        # “互动消息”里的 @ 她、回复她评论的（接着聊）一起看；两个开关各管各的，额度也各算各的
+        due_at = bool(self._notice_kinds(rules)) and now >= self._next_at
         due_dm = False
         if rules.get("auto_reply_dm") and self.budget.can("replies_dm"):
             due_dm = now >= self._next_dm
@@ -786,6 +809,16 @@ class Agent(threading.Thread):
         if due_dm:
             self._dm_flag = False
         return due_at, due_dm
+
+    def _notice_kinds(self, rules: dict, with_budget: bool = True) -> tuple:
+        """要去“互动消息”里看哪几种：at（@ 她的）、reply（回复她评论的，接着聊）。
+        “接着聊”不再挂在“自动回复 @”下面：只关了 @、或者 @ 的额度用完了，照样会去看有没有人回复她。"""
+        out = []
+        if rules.get("auto_reply_at") and (not with_budget or self.budget.can("replies_at")):
+            out.append("at")
+        if rules.get("auto_reply_thread", True) and (not with_budget or self.budget.can("thread_replies")):
+            out.append("reply")
+        return tuple(out)
 
     def _epoch_key(self, rules: dict, now: datetime | None = None) -> str:
         """最近一次活跃时段开始的时刻（今天的开始时间还没到，就是昨天的）。"""
@@ -838,19 +871,20 @@ class Agent(threading.Thread):
         inbox = Inbox(b)
         halted = (lambda: stop_on_pause and not self._want_run)
         self._set("running" if self._want_run else "idle", "去看看有没有人找她")
-        kinds = tuple(k for k, on in (("at", rules.get("auto_reply_at")),
-                                      ("reply", rules.get("auto_reply_thread", True))) if on)
+        kinds = self._notice_kinds(rules)
         key = self._epoch_key(rules)
         if self._inbox_epoch != key:
             # 这次启动后第一次看消息，或者新的一天活跃时段刚开始：之前的都不回
             self.activity = "inbox"
-            self._baseline_inbox(inbox, rules, kinds)
+            self._baseline_inbox(inbox, rules, self._notice_kinds(rules, with_budget=False))
             self._inbox_epoch = key
             return
         if at and kinds and not halted():
             self.activity = "inbox"
-            for it in inbox.fetch_mentions(is_known=self.db.message_exists, kinds=kinds,
-                                           mine=self.db.my_comment_texts()):
+            found = inbox.fetch_mentions(is_known=self.db.message_exists, kinds=kinds,
+                                         mine=self.db.my_comment_texts())
+            self._log_notice_check(inbox, kinds, found)
+            for it in found:
                 if halted():
                     return
                 if self.db.message_exists(it["ext_id"]):
@@ -881,6 +915,26 @@ class Agent(threading.Thread):
                     except Exception:  # noqa: BLE001
                         pass
                 self.activity = "watch" if self._want_run else ""
+
+    def _log_notice_check(self, inbox: Inbox, kinds: tuple, found: list[dict]) -> None:
+        """每次看完“互动消息”都在日志里记一笔，没有新消息也记；通知面板打不开的，一小时在动态里提醒一次。"""
+        n_at = sum(1 for it in found if it.get("kind") == "at")
+        n_rp = sum(1 for it in found if it.get("kind") == "reply")
+        stats = getattr(inbox, "last_notice", None) or {}
+        if stats.get("opened") is False:
+            log.warning("看互动消息：通知面板没打开，这次没看成（@ 和“接着聊”都会受影响）")
+            now = time.time()
+            if now - self._notice_fail_warned >= 3600:
+                self._notice_fail_warned = now
+                self.db.add_event("error", "通知面板打不开",
+                                  "去看 @ 和评论回复时没能打开“通知”面板，这段时间回复 @、接着聊评论都没法进行；"
+                                  "多次出现请把 data\\debug 里的文件发给开发者")
+            return
+        names = {"at": "@ 她", "reply": "回复她评论"}
+        log.info("看了互动消息（%s）：通知 %s 条，其中 @ 她 %s 条、回复她评论 %s 条；新的 @ %d 条、新的回复 %d 条",
+                 " + ".join(names[k] for k in kinds), stats.get("rows", "?"), stats.get("at", "?"),
+                 stats.get("reply", "?"), n_at, n_rp)
+        self.notice_checked = {"at": now_str(), "new_at": n_at, "new_reply": n_rp}
 
     def _skip_gone(self, mid: int, user: str) -> None:
         """原视频已经被删除 / 设为不可见：视频打不开，评论区也没了，没法回复（你手动也回复不了），直接跳过。"""

@@ -661,17 +661,22 @@ class Feed:
 
     last_mention_ok = False  # 上一次评论里的 @ 有没有成功（选中了候选列表里的好友）
 
-    def comment(self, text: str, mention: str = "") -> bool:
+    def comment(self, text: str, mention: str = "") -> SendResult:
         """发一条评论。mention 是要 @ 的好友昵称：先输入 @ 和名字，在弹出的候选里点选（这样对方才会收到提醒）。
 
-        @ 没成功（候选里找不到这个人）就去掉 @，只发评论内容；结果记在 last_mention_ok。"""
+        @ 没成功（候选里找不到这个人）就去掉 @，只发评论内容；结果记在 last_mention_ok。
+        发完核实：评论区里出现了她刚发的这条才算 sent；字还留在输入框里算 failed；查不清算 uncertain（不重发）。"""
         self.last_mention_ok = False
         if not self.open_comments():
-            return False
+            log.warning("发评论：评论区没打开")
+            return FAILED
         box = self.b.find("comment_input", timeout=4000)
         if box is None or not self.b.safe_click(box, "评论输入框"):
+            log.warning("发评论：没找到评论输入框")
+            self._dump_comments_once("comment_input_fail", "发评论时没找到评论输入框")
             self.close_comments()
-            return False
+            return FAILED
+        baseline = {r["id"] for r in self.comment_rows() if r.get("id")}
         self.b.pause(0.5, 1.0)
         if mention:
             self.last_mention_ok = self._insert_mention(mention)
@@ -680,8 +685,13 @@ class Feed:
         self.b.page.keyboard.press("Enter")
         self.b.pause(1.5, 2.5)
         self.b.check_captcha()
+        res = self._confirm_sent(baseline, text, box)
+        if not res:
+            log.warning("发评论没确认发出去（%s）：%s", res, text[:30])
+            if not res.uncertain:
+                self._dump_comments_once("comment_send_fail", "按了发送，评论没出现在评论区")
         self.close_comments()
-        return True
+        return res
 
     def _insert_mention(self, name: str) -> bool:
         page = self.b.page

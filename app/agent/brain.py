@@ -100,7 +100,8 @@ class Brain:
 
     def decide(self, video: dict, frames: list[bytes], can_like: bool, can_comment: bool,
                can_like_comments: bool = False, can_reply_comments: bool = False,
-               friends: list[dict] | None = None, can_collect: bool = False, collect_note: str = "") -> dict:
+               friends: list[dict] | None = None, can_collect: bool = False, collect_note: str = "",
+               comment_invite: bool = False) -> dict:
         """看了画面之后，决定点不点赞、要不要评论；还可以给评论区里喜欢的评论点赞、回复某一条；
         刷到好朋友会喜欢的视频时，@ 一位互关好友来看（friends：可以 @ 的好友，{nickname, tags}）。"""
         n_comments = len((video.get("comments") or [])[:8])
@@ -141,8 +142,15 @@ class Brain:
         prompt = (
             f"你在刷抖音，下面是这个视频的信息，{seen}\n\n"
             f"{_video_block(video)}\n\n"
-            "像一个真实的观众那样决定怎么互动。不是每个视频都要评论，只有真心想说点什么时才评论；"
-            "评论要具体提到内容里的细节，30 字以内，不要和热门评论重复。\n"
+            "像一个真实的观众那样决定怎么互动。\n"
+            + (("这个视频你挺有感觉，这次说一句你自己的评论吧：具体提到视频里的某个细节或者你的真实感受，"
+                "30 字以内，不要和热门评论重复，别写“好看”“哈哈哈”这种空话；实在没话可说才写空字符串。\n")
+               if can_comment and comment_invite else
+               ("不是每个视频都要评论，只有真心想说点什么时才评论；"
+                "评论要具体提到内容里的细节，30 字以内，不要和热门评论重复。\n") if can_comment else "")
+            + ("comment 是你自己在视频下面发的评论，comment_reply 是接在别人某条评论下面的回复，"
+               "两件事互不影响：回复了别人不代替你自己的评论，想评论又想回复可以都写。\n"
+               if can_comment and can_reply_comments and n_comments else "")
             + ("收藏和点赞不一样：收藏是留着以后还想再看的。只有特别喜欢、想反复看，或者以后用得上"
                "（教程、菜谱、攻略、好听的歌、想去的地方）的视频才收藏，大多数视频都不收藏。"
                + (collect_note or "") + "\n" if can_collect else "")
@@ -155,7 +163,7 @@ class Brain:
             + about_friends
             + f'只输出 JSON：{{"interest": 0到10, {", ".join(options)}, "reason": "一句话原因"}}'
         )
-        r = self.router.call("vision", self.system, prompt, images=frames, max_tokens=320, temperature=0.8)
+        r = self.router.call("vision", self.system, prompt, images=frames, max_tokens=420, temperature=0.8)
         data = parse_json(r.text)
         comment = safety.clean_reply(str(data.get("comment") or "")) if can_comment else ""
         likes: list[int] = []

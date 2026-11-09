@@ -276,7 +276,10 @@ function renderDashboard() {
   const stateCls = { running: "ok", resting: "neutral", captcha: "bad", paused: "warn", error: "bad", login: "warn" }[a.state] || "neutral";
   const rb = st.rules_brief;
   const nextInbox = a.running
-    ? ` · 私信${rb.dm_reply_mode === "5min" ? "每 5 分钟回一次" : "秒回"} · ${a.next_at_s > 0 ? `${Math.ceil(a.next_at_s / 60)} 分钟后去看 @` : "马上去看 @"}`
+    ? ` · 私信${rb.dm_reply_mode === "5min" ? "每 5 分钟回一次" : "秒回"} · ${a.next_at_s > 0 ? `${Math.ceil(a.next_at_s / 60)} 分钟后去看 @ 和评论回复` : "马上去看 @ 和评论回复"}`
+      + (a.notice_checked && a.notice_checked.at
+        ? `（上次 ${esc(String(a.notice_checked.at).slice(11, 16))} 看过：新 @ ${a.notice_checked.new_at} 条、新回复 ${a.notice_checked.new_reply} 条）`
+        : "")
     : "";
 
   $("#main").innerHTML = `

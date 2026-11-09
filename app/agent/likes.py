@@ -21,6 +21,11 @@
 - 一天匀着收藏：每天的收藏上限按活跃时段摊开，收得比进度快就先不收（10 分的才破例）；
 - 同类别控制：今天已经收藏过 2 个同一类（比如都是菜谱），再遇到要 9 分以上才考虑、并提醒她标准要更高；
   收藏过 3 个以上的同一类就不再收。
+
+自己发评论原来全凭模型决定，结果它几乎从不写（“不是每个视频都要评论”），所以也改成程序带节奏：
+- 一天的评论额度按活跃时段匀着用，评论得比进度快就先不让写（10 分的才破例）；
+- 适中 7 分起（挑剔 8 分）、按概率（挑剔 35% / 适中 50% / 大方 70%，9 分以上再加 20%）明确邀请她说一句；
+- 没被邀请的视频她照样可以写，只是不催；同一类今天评论过 3 条以上，邀请的概率减半。
 """
 from __future__ import annotations
 
@@ -45,6 +50,10 @@ COLLECT_TOPIC_SOFT = 2  # 同一类今天收藏过几个以后提高标准
 COLLECT_TOPIC_HARD = 3  # 同一类今天收藏过几个以后不再收
 COMMENT_MIN = {"picky": 9, "normal": 8, "generous": 7}       # 评论至少几分才赞
 COMMENT_MAX = {"picky": 1, "normal": 2, "generous": 3}        # 一个视频最多赞几条评论
+POST_MIN = {"picky": 8, "normal": 7, "generous": 7}           # 至少几分才主动邀请她发评论
+POST_P = {"picky": 0.35, "normal": 0.5, "generous": 0.7}      # 够分、没超进度时邀请她评论的概率（9 分以上 +0.2）
+POST_BURST = 2         # 评论额度少：只允许比匀速进度多发 2 条
+POST_TOPIC_SOFT = 3    # 同一类今天评论过几条以后，邀请的概率减半
 
 
 def _tendency(rules: dict) -> str:
@@ -143,6 +152,34 @@ class LikePolicy:
         if used >= self.pace_allowance(limit, used, rules, now):
             return {"ok": False, "why": "今天赞评论有点快了，先忍住"}
         return {"ok": True, "why": ""}
+
+    # ---------- 自己发评论 ----------
+    def post_gate(self, interest: int, topic: str, rules: dict, used: float = 0,
+                  now: datetime | None = None) -> dict:
+        """这个视频要不要让她发自己的评论：返回 {ok, invite, p, why}。
+
+        ok：可以评论（模型可以写）；invite：程序觉得这个视频值得说一句，明确邀请她写（不然模型几乎总是不写）。
+        和点赞一样一天匀着发：评论得比进度快就先不说（10 分的才破例）；同一类评论多了就少邀请。"""
+        limit = float((rules.get("limits") or {}).get("comments") or 0)
+        if limit <= 0 or used >= limit:
+            return {"ok": False, "invite": False, "p": 0.0, "why": "今天评论的额度用完了"}
+        if used >= self.pace_allowance(limit, used, rules, now, POST_BURST) and interest < 10:
+            return {"ok": False, "invite": False, "p": 0.0, "why": "今天评论得有点快了，先不说（10 分的才破例）"}
+        t = _tendency(rules)
+        if interest < POST_MIN[t]:
+            return {"ok": True, "invite": False, "p": 0.0, "why": f"{interest} 分，没到特别想说话的程度"}
+        p = POST_P[t] + (0.2 if interest >= 9 else 0.0)
+        why = f"{interest} 分，值得说一句"
+        if topic:
+            day = (now or datetime.now()).strftime("%Y-%m-%d")
+            same = self.db.query("SELECT COUNT(*) AS n FROM videos WHERE comment != '' AND comment IS NOT NULL "
+                                 "AND topic=? AND created_at >= ?", (topic, day))[0]["n"]
+            if same >= POST_TOPIC_SOFT:
+                p *= 0.5
+                why += f"；今天已经评论了 {same} 个「{topic}」"
+        p = round(min(1.0, p), 3)
+        invite = self.rnd.random() < p
+        return {"ok": True, "invite": invite, "p": p, "why": why + ("，邀请她评论" if invite else "，这次随她")}
 
     # ---------- 收藏 ----------
     def collect_gate(self, interest: int, topic: str, rules: dict, used: float = 0,

@@ -153,6 +153,7 @@ class Inbox:
         self.b = b
         self.sec_uids: dict[str, str] = {}  # 私信列表里的名字 -> 主页 id
         self.feed = Feed(b)
+        self.last_notice: dict = {}  # 上次看“互动消息”的情况（给日志用）
 
     # ---------- @ 我的（右上角“通知” → “互动消息”面板） ----------
     def open_notice_panel(self) -> bool:
@@ -244,14 +245,21 @@ class Inbox:
         """读“互动消息”里 @ 她的评论（kind=at）、回复她评论的（kind=reply）。
 
         is_known(ext_id) 为 True 的（已经处理过的）跳过；mine 是她发过的评论（认出别人回复的是哪条）。"""
+        self.last_notice = {"opened": False}
         if not self.open_notice_panel():
             return []
         items, seen = [], set()
-        for row in self.b.find_all("notice_item")[:40]:
+        rows = self.b.find_all("notice_item")[:40]
+        counts = {"at": 0, "reply": 0}
+        for row in rows:
             it = self._parse_notice(row, mine)
+            if it:
+                counts[it["kind"]] = counts.get(it["kind"], 0) + 1
             if it and it["kind"] in kinds and it["ext_id"] not in seen:
                 seen.add(it["ext_id"])
                 items.append(it)
+        # 给日志用：面板打开了没有、读到几条通知、其中几条是 @ / 回复她的
+        self.last_notice = {"opened": True, "rows": len(rows), **counts}
         out = []
         for it in items:
             if len(out) >= limit:

@@ -1897,3 +1897,175 @@ class AdAndProductCardTests(unittest.TestCase):
             feed.capture_frames.return_value = []
             agent._watch_one(mock.Mock(), agent.db.rules())
         agent.brain.triage.assert_called_once()                                      # 关掉开关：广告也照常看
+
+
+class PostCommentPolicyTests(unittest.TestCase):
+    """自己发评论：程序带节奏——一天匀着发、够分按概率明确邀请她说一句，和回复别人的评论互不影响。"""
+
+    RULES = {"limits": {"comments": 20}, "active_start": "09:00", "active_end": "23:00", "like_tendency": "normal"}
+
+    def _pol(self, commented_topics=(), rnd=0.0):
+        from app.agent.likes import LikePolicy
+        db = make_db()
+        for i, t in enumerate(commented_topics):
+            db.add_video(video_id=f"m{i}", author="x", interest=8, decision="comment", comment="说得好", topic=t,
+                         created_at="2026-11-08 10:00:00")
+        return LikePolicy(db, rnd=mock.Mock(random=mock.Mock(return_value=rnd)))
+
+    def test_pacing_and_quota(self):
+        noon = datetime(2026, 11, 8, 12, 0)
+        pol = self._pol()
+        self.assertTrue(pol.post_gate(8, "", self.RULES, 2, noon)["ok"])
+        self.assertFalse(pol.post_gate(8, "", self.RULES, 8, noon)["ok"])            # 中午就评论了 8 条：太快
+        self.assertTrue(pol.post_gate(10, "", self.RULES, 8, noon)["ok"])            # 10 分的破例
+        self.assertFalse(pol.post_gate(10, "", self.RULES, 20, noon)["ok"])          # 额度用完
+
+    def test_invite_by_score(self):
+        noon = datetime(2026, 11, 8, 12, 0)
+        low = self._pol(rnd=0.0).post_gate(6, "", self.RULES, 0, noon)
+        self.assertTrue(low["ok"])
+        self.assertFalse(low["invite"])                                               # 6 分：可以写，但不催
+        self.assertTrue(self._pol(rnd=0.4).post_gate(7, "", self.RULES, 0, noon)["invite"])   # 7 分：p=0.5
+        self.assertFalse(self._pol(rnd=0.6).post_gate(7, "", self.RULES, 0, noon)["invite"])
+        self.assertTrue(self._pol(rnd=0.6).post_gate(9, "", self.RULES, 0, noon)["invite"])   # 9 分：p=0.7
+        picky = dict(self.RULES, like_tendency="picky")
+        self.assertFalse(self._pol(rnd=0.0).post_gate(7, "", picky, 0, noon)["invite"])       # 挑剔：8 分起
+
+    def test_same_topic_halves(self):
+        noon = datetime(2026, 11, 8, 12, 0)
+        g = self._pol(["猫"] * 3, rnd=0.0).post_gate(9, "猫", self.RULES, 3, noon)
+        self.assertAlmostEqual(g["p"], 0.35)
+        self.assertIn("3 个「猫」", g["why"])
+
+    def test_invite_goes_into_prompt(self):
+        from app.agent.brain import Brain
+        b = Brain(make_db())
+        fake = mock.Mock(text='{"comment": "这个转身太丝滑了"}', cost=0.0)
+        with mock.patch.object(b.router, "call", return_value=fake) as call:
+            d = b.decide({"author": "a", "desc": "d", "comments": ["一"]}, [], False, True, False, True,
+                         comment_invite=True)
+        prompt = call.call_args.args[2]
+        self.assertIn("这次说一句你自己的评论吧", prompt)
+        self.assertIn("回复了别人不代替你自己的评论", prompt)
+        self.assertNotIn("不是每个视频都要评论", prompt)
+        self.assertEqual(d["comment"], "这个转身太丝滑了")
+        with mock.patch.object(b.router, "call", return_value=fake) as call:
+            b.decide({"author": "a", "desc": "d", "comments": []}, [], False, True)
+        self.assertIn("不是每个视频都要评论", call.call_args.args[2])                # 没邀请：照旧随她
+
+    def test_runner_passes_invite(self):
+        from app.agent.runner import Agent
+        agent = Agent(make_db())
+        agent._want_run = True
+        agent._sleep = lambda s: agent._want_run
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.0))
+        agent.brain = mock.Mock()
+        agent.brain.router.task_can_see.return_value = True
+        agent.brain.triage.return_value = {"interest": 9, "topic": "猫", "reason": "", "cost": 0}
+        agent.brain.decide.return_value = {"interest": 9, "like": False, "comment": "橘猫那一下好会",
+                                           "reason": "", "cost": 0}
+        agent.brain.safety_check.return_value = (True, "", 0.0)
+        with mock.patch("app.agent.runner.Feed") as FeedCls:
+            feed = FeedCls.return_value
+            feed.read_current.return_value = {"video_id": "p1", "url": "u", "author": "b", "desc": "猫", "comments": []}
+            feed.capture_frames.side_effect = lambda n, d, sleep=None: [b"x"] * n
+            from app.douyin.feed import SENT
+            feed.comment.return_value = SENT
+            agent._watch_one(mock.Mock(), agent.db.rules())
+        self.assertTrue(agent.brain.decide.call_args.kwargs["comment_invite"])
+        feed.comment.assert_called_once()
+        self.assertEqual(agent.db.usage().get("comments"), 1)
+
+    def test_runner_failed_send_is_not_counted(self):
+        from app.agent.runner import Agent
+        from app.douyin.feed import FAILED
+        agent = Agent(make_db())
+        agent._want_run = True
+        agent._sleep = lambda s: agent._want_run
+        agent.likes.rnd = mock.Mock(random=mock.Mock(return_value=0.0))
+        agent.brain = mock.Mock()
+        agent.brain.router.task_can_see.return_value = True
+        agent.brain.triage.return_value = {"interest": 9, "topic": "", "reason": "", "cost": 0}
+        agent.brain.decide.return_value = {"interest": 9, "like": False, "comment": "好会", "reason": "", "cost": 0}
+        agent.brain.safety_check.return_value = (True, "", 0.0)
+        with mock.patch("app.agent.runner.Feed") as FeedCls:
+            feed = FeedCls.return_value
+            feed.read_current.return_value = {"video_id": "p2", "url": "u", "author": "b", "desc": "d", "comments": []}
+            feed.capture_frames.side_effect = lambda n, d, sleep=None: [b"x"] * n
+            feed.comment.return_value = FAILED
+            agent._watch_one(mock.Mock(), agent.db.rules())
+        self.assertFalse(agent.db.usage().get("comments"))
+        titles = [e["title"] for e in agent.db.query("SELECT title FROM events")]
+        self.assertTrue(any("评论没发出去" in t for t in titles))
+
+
+class CommentSendConfirmTests(unittest.TestCase):
+    """发评论按了回车后要核实：评论区里出现了她发的这条才算发出去。"""
+
+    def _feed(self, rows_seq, box_text=""):
+        from app.douyin.feed import Feed
+        f = Feed.__new__(Feed)
+        f.b = mock.Mock()
+        f.b.sel = {}
+        f.b.find.return_value = mock.Mock()
+        f.b.safe_click.return_value = True
+        f.open_comments = mock.Mock(return_value=True)
+        f.close_comments = mock.Mock()
+        f._dump_comments_once = mock.Mock()
+        seq = iter(rows_seq)
+        last = {"v": []}
+
+        def rows():
+            last["v"] = next(seq, last["v"])
+            return last["v"]
+        f.comment_rows = rows
+        f._box_text = lambda box: box_text
+        return f
+
+    def test_sent_when_comment_appears(self):
+        with mock.patch("app.douyin.feed.cancel.sleep"):
+            f = self._feed([[{"id": "1", "text": "旧的"}],
+                            [{"id": "1", "text": "旧的"}, {"id": "2", "text": "这段太好笑了", "self": True}]])
+            self.assertEqual(f.comment("这段太好笑了"), "sent")
+
+    def test_failed_when_text_stuck_in_box(self):
+        with mock.patch("app.douyin.feed.cancel.sleep"):
+            f = self._feed([[{"id": "1", "text": "旧的"}]], box_text="这段太好笑了")
+            r = f.comment("这段太好笑了")
+        self.assertEqual(r, "failed")
+        self.assertFalse(r)
+        f._dump_comments_once.assert_called_once()
+
+
+class ThreadCheckIndependentTests(unittest.TestCase):
+    """“接着聊评论”不再挂在“自动回复 @”下面。"""
+
+    def test_thread_only(self):
+        from app.agent.runner import Agent
+        db = make_db()
+        r = db.rules()
+        r["auto_reply_at"] = False
+        r["auto_reply_thread"] = True
+        r["auto_reply_dm"] = False
+        db.set_json("rules", r)
+        agent = Agent(db)
+        agent._next_at = 0
+        self.assertEqual(agent._inbox_due(mock.Mock(), db.rules()), (True, False))
+        agent._inbox_epoch = agent._epoch_key(db.rules())
+        with mock.patch("app.agent.runner.Inbox") as InboxCls:
+            inbox = InboxCls.return_value
+            inbox.fetch_mentions.return_value = []
+            inbox.last_notice = {"opened": True, "rows": 3, "at": 0, "reply": 0}
+            agent._ensure_browser = mock.Mock()
+            agent._process_inbox(stop_on_pause=False, at=True, dm=False)
+        self.assertEqual(inbox.fetch_mentions.call_args.kwargs["kinds"], ("reply",))
+        self.assertEqual(agent.notice_checked["new_reply"], 0)
+
+    def test_panel_fail_warns_once_an_hour(self):
+        from app.agent.runner import Agent
+        agent = Agent(make_db())
+        inbox = mock.Mock(last_notice={"opened": False})
+        agent._log_notice_check(inbox, ("at", "reply"), [])
+        agent._log_notice_check(inbox, ("at", "reply"), [])
+        n = agent.db.query("SELECT COUNT(*) AS n FROM events WHERE title='通知面板打不开'")[0]["n"]
+        self.assertEqual(n, 1)

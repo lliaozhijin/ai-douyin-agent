@@ -1442,6 +1442,11 @@ class InboxScheduleTests(unittest.TestCase):
         agent._next_at = agent._next_dm = 0
         with mock.patch("app.agent.runner.Inbox") as InboxCls:
             InboxCls.return_value.dm_badge.return_value = True
+            # @ 的额度用完了，但“接着聊评论”还有额度：照样去看有没有人回复她
+            self.assertEqual(agent._inbox_due(mock.Mock(), agent.db.rules()), (True, False))
+            self.assertEqual(agent._notice_kinds(agent.db.rules()), ("reply",))
+            r["limits"]["thread_replies"] = 0
+            agent.db.set_json("rules", r)
             self.assertEqual(agent._inbox_due(mock.Mock(), agent.db.rules()), (False, False))
 
 
