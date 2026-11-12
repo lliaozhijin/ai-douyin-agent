@@ -28,6 +28,54 @@ class SendResult(str):
 
 SENT, FAILED, UNCERTAIN = SendResult("sent"), SendResult("failed"), SendResult("uncertain")
 
+def plain_name(name: str) -> str:
+    """名字里只留字（汉字、字母、数字），去掉标点、空格、表情——@ 好友时拿它去搜候选。"""
+    return re.sub(r"[^\w]+", "", name or "", flags=re.UNICODE).replace("_", "")
+
+
+# 输入 @ 和名字以后，在页面上找“名字正好是这个、而且在弹出的候选层里”的元素：
+# 不在输入框里、不在评论区的评论里、不在视频信息里；它自己或者往上几层是浮在页面上的（absolute / fixed），
+# 或者带着候选列表的无障碍标记（listbox / option），或者输入框自己指明了候选列表（aria-owns / aria-controls）。
+MENTION_PICK_JS = r"""
+(name) => {
+  const sq = (t) => (t || '').replace(/\s+/g, '');
+  const want = sq(name);
+  if (!want) return null;
+  const vis = (el) => { const r = el.getBoundingClientRect();
+    return r.width > 4 && r.height > 4 && r.bottom > 0 && r.top < window.innerHeight; };
+  const ed = document.activeElement;
+  const owned = [];
+  for (const a of ['aria-owns', 'aria-controls']) {
+    const id = ed && ed.getAttribute && ed.getAttribute(a);
+    const el = id && document.getElementById(id);
+    if (el) owned.push(el);
+  }
+  const floating = (el) => {
+    for (let p = el, i = 0; p && p !== document.body && i < 10; p = p.parentElement, i++) {
+      const role = p.getAttribute('role') || '';
+      if (role === 'option' || role === 'listbox') return true;
+      const pos = getComputedStyle(p).position;
+      if (pos === 'absolute' || pos === 'fixed') return true;
+    }
+    return false;
+  };
+  const skip = '[contenteditable="true"], [data-e2e="comment-item"], [data-e2e="video-desc"], [data-e2e="feed-active-video"] .account, video';
+  const hits = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (sq(n.textContent) !== want) continue;
+    const el = n.parentElement;
+    if (!el || !vis(el) || el.closest(skip)) continue;
+    const inOwned = owned.some((o) => o.contains(el));
+    if (!inOwned && !floating(el)) continue;
+    hits.push({ el, inOwned });
+  }
+  if (!hits.length) return null;
+  hits.sort((a, b) => (b.inOwned ? 1 : 0) - (a.inOwned ? 1 : 0));
+  return hits[0].el;
+}
+"""
+
 # 一次读出评论区所有评论：评论 id（三个地方都看，对不上就不认）、正文（表情图用它的文字代替）、
 # 是不是楼中楼、是不是她自己发的
 COMMENT_ROWS_JS = r"""
@@ -256,7 +304,7 @@ class Feed:
             pass
         self.b.pause(0.5, 1.0)
 
-    _comments_dumped = False  # 评论读不到时只自动保存一次页面，方便校准，不刷屏
+    _comments_dumped: set = set()  # 每种情况（标签）只自动保存一次页面，方便校准，不刷屏
 
     def read_comments(self, n: int = 8) -> list[dict]:
         """读前 n 条热评：[{cid 评论 id, user 作者, text 内容, likes 点赞数文字}]。"""
@@ -462,6 +510,22 @@ class Feed:
         self.b.page.keyboard.press("Enter")
         self.b.pause(1.2, 2.0)
         self.b.check_captcha()
+        return self._retry_with_button(self._confirm_sent(baseline, text, box), baseline, text, box)
+
+    def _retry_with_button(self, res: SendResult, baseline: set, text: str, box) -> SendResult:
+        """按回车以后字还留在输入框里（确认没发出去）：改点输入框右边红色的发送按钮，再核实一次。
+
+        只在“确认没发出去”时才点；“不确定”（可能已经发出去了）不重发，免得发两遍。"""
+        if res != FAILED:
+            return res
+        btn = self.b.find("comment_send", timeout=1500)
+        if btn is None:
+            return res
+        log.info("按回车没发出去，改点发送按钮再试一次")
+        if not self.b.safe_click(btn, "发送按钮"):
+            return res
+        self.b.pause(1.5, 2.5)
+        self.b.check_captcha()
         return self._confirm_sent(baseline, text, box)
 
     def _confirm_sent(self, baseline: set, text: str, box) -> SendResult:
@@ -488,9 +552,10 @@ class Feed:
         return SENT if last_hit else UNCERTAIN
 
     def _dump_comments_once(self, tag: str, why: str) -> None:
-        if Feed._comments_dumped:
+        # 以前是“不管什么情况，一次运行只保存一次”：先出了一种情况，后面别的情况就都不保存了，查不了。改成每种各保存一次
+        if tag in Feed._comments_dumped:
             return
-        Feed._comments_dumped = True
+        Feed._comments_dumped.add(tag)
         path = self.b.dump(tag)
         log.warning("%s，页面已保存到 %s（之后同样的情况不再重复保存）", why, path)
 
@@ -661,16 +726,64 @@ class Feed:
 
     last_mention_ok = False  # 上一次评论里的 @ 有没有成功（选中了候选列表里的好友）
 
-    def comment(self, text: str, mention: str = "") -> SendResult:
+    def _open_comment_box(self):
+        """找到可以打字的评论输入框。没点开时它只是一行“留下你的精彩评论吧”的占位文字，
+        要先点一下，输入框才会出现（点开以后也可能直接就是当前焦点所在的输入框）。"""
+        box = self.b.find("comment_input", timeout=1200)
+        if box is not None:
+            return box
+        opener = self.b.find("comment_input_open", timeout=2500)
+        if opener is None or not self.b.safe_click(opener, "评论输入框（点开）"):
+            return None
+        self.b.pause(0.4, 0.9)
+        box = self.b.find("comment_input", timeout=2500)
+        if box is None:
+            try:
+                foc = self.b.page.locator("[contenteditable='true']:focus, textarea:focus").first
+                foc.wait_for(state="visible", timeout=1500)
+                box = foc
+            except Exception:  # noqa: BLE001
+                box = None
+        return box
+
+    def _attach_image(self, path) -> bool:
+        """给这条评论配一张图（她自己的表情包）：把文件交给评论框右边“图片”按钮背后的上传框，等缩略图出来。"""
+        inp = None
+        for s in as_list(self.b.sel.get("comment_file_input")):
+            try:
+                loc = self.b.page.locator(s).first
+                if loc.count() > 0:
+                    inp = loc
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if inp is None:
+            log.warning("评论配图：没找到上传图片的地方，这条只发文字")
+            return False
+        try:
+            inp.set_input_files(str(path))
+        except Exception as e:  # noqa: BLE001
+            log.warning("评论配图：文件没能交给上传框（%s），这条只发文字", str(e).splitlines()[0][:100])
+            return False
+        ok = self.b.find("comment_image_preview", timeout=8000) is not None
+        if not ok:
+            log.warning("评论配图：没看到图片的缩略图，可能没传上去")
+            self._dump_comments_once("comment_image_fail", "评论配图后没看到缩略图")
+        self.b.pause(1.5, 2.5)      # 缩略图出来以后图片还要传一小会儿，没传完就按发送会发不出去
+        return ok
+
+    def comment(self, text: str, mention: str = "", image=None, require_mention: bool = False) -> SendResult:
         """发一条评论。mention 是要 @ 的好友昵称：先输入 @ 和名字，在弹出的候选里点选（这样对方才会收到提醒）。
 
         @ 没成功（候选里找不到这个人）就去掉 @，只发评论内容；结果记在 last_mention_ok。
+        require_mention=True（这条评论就是为了回 @ 她的人）：@ 不上就不发了，返回 failed。
         发完核实：评论区里出现了她刚发的这条才算 sent；字还留在输入框里算 failed；查不清算 uncertain（不重发）。"""
         self.last_mention_ok = False
+        self.last_image_ok = False
         if not self.open_comments():
             log.warning("发评论：评论区没打开")
             return FAILED
-        box = self.b.find("comment_input", timeout=4000)
+        box = self._open_comment_box()
         if box is None or not self.b.safe_click(box, "评论输入框"):
             log.warning("发评论：没找到评论输入框")
             self._dump_comments_once("comment_input_fail", "发评论时没找到评论输入框")
@@ -678,14 +791,23 @@ class Feed:
             return FAILED
         baseline = {r["id"] for r in self.comment_rows() if r.get("id")}
         self.b.pause(0.5, 1.0)
+        self.last_image_ok = bool(image) and self._attach_image(image)
+        if self.last_image_ok:
+            self.b.safe_click(box, "评论输入框")       # 传完图片焦点可能跑了，点回输入框再打字
+            self.b.pause(0.3, 0.6)
         if mention:
             self.last_mention_ok = self._insert_mention(mention)
+            if require_mention and not self.last_mention_ok:
+                log.warning("发评论：@%s 没 @ 上，这条不发了", mention)
+                self.close_comments()
+                return FAILED
         self.b.type_slowly(text)
         self.b.pause(0.6, 1.2)
         self.b.page.keyboard.press("Enter")
         self.b.pause(1.5, 2.5)
         self.b.check_captcha()
         res = self._confirm_sent(baseline, text, box)
+        res = self._retry_with_button(res, baseline, text, box)
         if not res:
             log.warning("发评论没确认发出去（%s）：%s", res, text[:30])
             if not res.uncertain:
@@ -694,30 +816,72 @@ class Feed:
         return res
 
     def _insert_mention(self, name: str) -> bool:
+        """在评论框里 @ 一个好友：输入 @ 和名字，在弹出的候选里点选（点了才是真正的 @，对方才会收到提醒）。
+
+        名字里带标点 / 表情的（比如“雨.”“布之道🇨🇳”），照着整个名字搜常常搜不出来：
+        整个名字搜不到，就只用名字里的字再搜一次，候选里按完整的名字认人（不会点到名字相近的别人）。
+        还是没有：先把页面保存下来（候选列表还开着，能看到抖音到底给了哪些人），再删掉刚才输入的 @ 和名字，只发评论内容。"""
         page = self.b.page
-        key = name.strip()[:12]
+        full = name.strip()
+        keys = [full[:12]]
+        plain = plain_name(full)[:12]
+        if plain and plain != keys[0]:
+            keys.append(plain)
         page.keyboard.type("@")
         self.b.pause(0.8, 1.3)
-        self.b.type_slowly(key)
-        self.b.pause(1.2, 2.0)
-        cand = None
-        for s in as_list(self.b.sel.get("mention_item")):
+        typed = 1
+        for i, key in enumerate(keys):
+            if i:                                   # 换一种搜法：删掉上一次输入的名字，@ 留着
+                self._backspace(len(keys[i - 1]))
+                self.b.pause(0.4, 0.8)
+            self.b.type_slowly(key)
+            typed = 1 + len(key)
+            self.b.pause(1.2, 2.0)
+            cand = self._mention_candidate(full)
+            if cand is not None and self.b.safe_click(cand, f"候选里的 {full}"):
+                if i:
+                    log.info("@ %s：用整个名字没搜到，只用“%s”搜到了", full, key)
+                self.b.pause(0.5, 1.0)
+                return True
+        self._dump_comments_once("mention_fail", f"输入 @{keys[-1]} 后没在候选列表里找到 {full}")
+        self._backspace(typed)
+        return False
+
+    def _backspace(self, n: int) -> None:
+        for _ in range(max(0, n)):
+            self.b.page.keyboard.press("Backspace")
+            cancel.sleep(0.04)
+
+    def _mention_candidate(self, full: str):
+        """输入 @ 和名字以后弹出来的候选里，名字正好是 full 的那一个；没有返回 None。
+
+        先在整个页面上找“名字一字不差、而且在弹出层里”的（不依赖抖音的样式名）；
+        再按 selectors.json 里的候选定位找（名字一样的优先，其次是包含这个名字的）。"""
+        try:
+            handle = self.b.page.evaluate_handle(MENTION_PICK_JS, full)
+            el = handle.as_element() if handle is not None else None
+            if el is not None:
+                return el
+        except Exception:  # noqa: BLE001
+            pass
+        want = _sq(full)
+        loose = None
+        for sel in as_list(self.b.sel.get("mention_item")):
             try:
-                loc = page.locator(s).filter(has_text=key).first
-                loc.wait_for(state="visible", timeout=1500)
-                cand = loc
-                break
+                cands = self.b.page.locator(sel).filter(has_text=full).all()[:8]
             except Exception:  # noqa: BLE001
                 continue
-        if cand is not None and self.b.safe_click(cand, f"候选里的 {name}"):
-            self.b.pause(0.5, 1.0)
-            return True
-        # 候选里没有这个人：删掉刚才输入的 @ 和名字，只发评论内容
-        for _ in range(len(key) + 1):
-            page.keyboard.press("Backspace")
-            cancel.sleep(0.04)
-        self._dump_comments_once("mention_fail", f"输入 @{key} 后没在候选列表里找到这个人")
-        return False
+            for c in cands:
+                try:
+                    if not c.is_visible():
+                        continue
+                    lines = [_sq(x) for x in (c.inner_text(timeout=500) or "").splitlines() if x.strip()]
+                except Exception:  # noqa: BLE001
+                    continue
+                if want in lines:
+                    return c
+                loose = loose or c
+        return loose
 
     def next(self) -> None:
         self.b.page.keyboard.press(self.b.sel.get("next_video_key", "ArrowDown"))

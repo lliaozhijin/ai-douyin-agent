@@ -16,6 +16,8 @@ from . import fonts
 
 W, H = 1080, 1440
 SS = 2  # 先按 2 倍画再缩小，边缘更顺滑
+MAX_CARDS = 9   # 一个作品最多几张文字卡片（不算封面）
+MAX_LINES = 8   # 一张卡片最多几句
 
 PALETTES = [
     {"bg": ((255, 228, 238), (255, 246, 250)), "accent": (214, 51, 108), "text": (92, 52, 70), "dot": (255, 182, 208)},
@@ -23,6 +25,44 @@ PALETTES = [
     {"bg": ((255, 240, 222), (255, 250, 242)), "accent": (226, 112, 52), "text": (96, 64, 44), "dot": (255, 204, 160)},
     {"bg": ((236, 228, 255), (249, 246, 255)), "accent": (132, 88, 220), "text": (72, 56, 104), "dot": (208, 190, 255)},
 ]
+
+
+def cards_from_text(text: str, per_card: int = 4) -> list[dict]:
+    """把正文原样分成几张文字卡片（“重新生成文字卡片”用）：正文里的每一句话都会出现在卡片上，不丢内容。
+
+    先按句子切（。！？～… 和换行），太长的句子在逗号处再切开；然后每张卡片放 per_card 句左右，
+    句子多到 9 张放不下时每张多放几句（最多 MAX_LINES 句），还放不下就把相邻的短句并成一行。"""
+    import re
+    pieces: list[str] = []
+    for para in (text or "").replace("\r", "").split("\n"):
+        for sent in re.findall(r"[^。！？!?～~…]+[。！？!?～~…]*", para.strip()):
+            sent = sent.strip()
+            while len(sent) > 56:                    # 一行太长：在靠后的逗号处切开
+                cut = max(sent.rfind(c, 12, 56) for c in "，,、；;：: ")
+                cut = cut + 1 if cut > 0 else 56
+                pieces.append(sent[:cut].strip())
+                sent = sent[cut:].strip()
+            if sent:
+                pieces.append(sent)
+    if not pieces:
+        return []
+    per = max(1, per_card)
+    while -(-len(pieces) // per) > MAX_CARDS and per < MAX_LINES:
+        per += 1
+    while -(-len(pieces) // per) > MAX_CARDS:        # 还是放不下：把相邻两句并成一行（一行最多 60 个字）
+        merged, i = [], 0
+        before = len(pieces)
+        while i < len(pieces):
+            if i + 1 < len(pieces) and len(pieces[i]) + len(pieces[i + 1]) <= 60:
+                merged.append(pieces[i] + pieces[i + 1])
+                i += 2
+            else:
+                merged.append(pieces[i])
+                i += 1
+        pieces = merged
+        if len(pieces) == before:
+            break
+    return [{"title": "", "lines": pieces[i:i + per]} for i in range(0, len(pieces), per)][:MAX_CARDS]
 
 
 def _heart(draw: ImageDraw.ImageDraw, cx: float, cy: float, s: float, fill) -> None:
@@ -136,23 +176,47 @@ def render_card(card: dict, idx: int, total: int, name: str, avatar: Image.Image
     _heart(d, panel[2] - 52 * s, panel[1] + 52 * s, 26 * s, pal["accent"] + (255,))
 
     inner_w = panel[2] - panel[0] - 120 * s
-    ops = []  # (类型, 内容, 字号, 行高)：先排版算总高度，再在卡片里上下居中
-    if cover_text:
-        tsize, bsize = 96 * s, 56 * s
-        for ln in fonts.wrap(card.get("title") or "", tsize, inner_w)[:4]:
-            ops.append(("title_c", ln, tsize, int(tsize * 1.3)))
-        ops.append(("rule", "", 0, 100 * s))
-        for ln in fonts.wrap(cover_text, bsize, inner_w)[:7]:
-            ops.append(("body_c", ln, bsize, int(bsize * 1.55)))
-    else:
-        tsize, bsize = 80 * s, 62 * s
-        for ln in fonts.wrap(card.get("title") or "", tsize, inner_w)[:3]:
-            ops.append(("title", ln, tsize, int(tsize * 1.3)))
-        ops.append(("gap", "", 0, 40 * s))
-        for line in (card.get("lines") or [])[:6]:
-            for j, ln in enumerate(fonts.wrap(line, bsize, inner_w - 70 * s)[:3]):
-                ops.append(("bullet" if j == 0 else "body", ln, bsize, int(bsize * 1.5)))
-            ops.append(("gap", "", 0, 20 * s))
+    room = panel[3] - panel[1] - 200 * s          # 卡片里能放字的高度
+    title = (card.get("title") or "").strip()
+    lines = [str(x) for x in (card.get("lines") or []) if str(x).strip()][:MAX_LINES]
+    # 没有小标题、只有一两句话的卡片：当成一段话，居中写大一点（不画小爱心）
+    plain = not cover_text and not title and (len(lines) <= 2 or card.get("style") == "text")
+
+    def layout(k: float) -> list:
+        """按缩放系数 k 排一遍版：(类型, 内容, 字号, 行高)。"""
+        out = []
+        if cover_text:
+            tsize, bsize = int(96 * s * k), int(56 * s * k)
+            for ln in fonts.wrap(title, tsize, inner_w)[:4]:
+                out.append(("title_c", ln, tsize, int(tsize * 1.3)))
+            out.append(("rule", "", 0, int(100 * s * k)))
+            for ln in fonts.wrap(cover_text, bsize, inner_w)[:7]:
+                out.append(("body_c", ln, bsize, int(bsize * 1.55)))
+        elif plain:
+            bsize = int(72 * s * k)
+            for i, line in enumerate(lines):
+                for ln in fonts.wrap(line, bsize, inner_w):
+                    out.append(("body_c", ln, bsize, int(bsize * 1.6)))
+                if i < len(lines) - 1:
+                    out.append(("gap", "", 0, int(36 * s * k)))
+        else:
+            tsize, bsize = int(80 * s * k), int(62 * s * k)
+            if title:
+                for ln in fonts.wrap(title, tsize, inner_w)[:3]:
+                    out.append(("title", ln, tsize, int(tsize * 1.3)))
+                out.append(("gap", "", 0, int(40 * s * k)))
+            for line in lines:
+                for j, ln in enumerate(fonts.wrap(line, bsize, inner_w - 70 * s)[:4]):
+                    out.append(("bullet" if j == 0 else "body", ln, bsize, int(bsize * 1.5)))
+                out.append(("gap", "", 0, int(20 * s * k)))
+        return out
+
+    # 先排版算总高度：字多得放不下就整体缩小一点，再在卡片里上下居中
+    k = 1.0
+    ops = layout(k)
+    while sum(o[3] for o in ops) > room and k > 0.5:
+        k -= 0.06
+        ops = layout(k)
     total = sum(o[3] for o in ops)
     y = panel[1] + max(100 * s, (panel[3] - panel[1] - total) / 2 - 10 * s)
     for kind, ln, size, lh in ops:
@@ -201,7 +265,7 @@ def render_post(title: str, text: str, cards: list[dict], name: str, out_dir: Pa
     first = (text or "").replace("\n", " ").strip()
     cut = max(first.find("。"), first.find("！"), first.find("～"))
     cover_line = first[: cut + 1] if 8 <= cut <= 60 else first[:48]
-    pages = [({"title": title or "今日分享"}, cover_line)] + [(c, "") for c in (cards or [])[:4]]
+    pages = [({"title": title or "今日分享"}, cover_line)] + [(c, "") for c in (cards or [])[:MAX_CARDS]]
     names = []
     for i, (c, cover) in enumerate(pages):
         img = render_card(c, i, len(pages), name, avatar, cover_text=cover or (" " if i == 0 else ""), palette=pal,

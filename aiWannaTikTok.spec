@@ -19,12 +19,24 @@ for pkg in ("webview", "playwright"):
 
 # 桌宠换形象时的本机抠图（onnxruntime）：装了就一起打包进去
 import importlib.util
-for pkg in ("onnxruntime",):
+# 听视频声音（faster-whisper 和它的依赖）：装了就一起打包进去
+# 给作品配音合成视频（imageio-ffmpeg 自带 ffmpeg 程序）：装了就一起打包进去
+for pkg in ("onnxruntime", "faster_whisper", "ctranslate2", "av", "tokenizers", "huggingface_hub", "imageio_ffmpeg"):
     if importlib.util.find_spec(pkg) is not None:
         d, b, h = collect_all(pkg)
         datas += d
         binaries += b
         hiddenimports += h
+
+# 语音模型（tools/fetch_whisper.py 下载到 assets/models/whisper）：有就打进安装包，用户不用再下载
+import os
+_wdir = os.path.join("assets", "models", "whisper")
+if os.path.isdir(_wdir):
+    for _name in sorted(os.listdir(_wdir)):
+        _m = os.path.join(_wdir, _name)
+        if os.path.isfile(os.path.join(_m, "model.bin")):
+            datas += [(os.path.join(_m, f), _m.replace(os.sep, "/")) for f in sorted(os.listdir(_m))
+                      if os.path.isfile(os.path.join(_m, f))]
 
 a = Analysis(
     ["run.py"],

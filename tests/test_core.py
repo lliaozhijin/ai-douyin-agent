@@ -1721,9 +1721,10 @@ class RunnerIncomingTests(unittest.TestCase):
         mid = self.add("买哪只股票好")
         self.agent._handle_incoming(self.inbox, mid, {"user": "小鹿", "text": "买哪只股票好"}, "dm", self.db.rules())
         m = self.status(mid)
-        self.assertEqual(m["status"], "pending")
-        self.assertIn("投资理财", m["reason"])
-        self.inbox.reply_dm.assert_not_called()
+        self.assertEqual(m["status"], "replied")                     # 敏感话题开关开着：直接告诉对方原因，不走模型
+        self.assertIn("投资理财", m["reply"])
+        self.agent.brain.reply_dm.assert_not_called()
+        self.inbox.reply_dm.assert_called_once()
 
     def test_normal_reply(self):
         self.agent.brain.reply_dm.return_value = Draft(text="嗨嗨～", ok=True, cost=0.002, tokens=50)

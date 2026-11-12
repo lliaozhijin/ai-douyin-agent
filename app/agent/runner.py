@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import re
 import logging
 import os
 from contextlib import nullcontext
@@ -21,7 +22,7 @@ from ..douyin.feed import Feed, FeedReadError, thumb_data_url
 from ..douyin.friends import fetch_mutual_friends
 from ..douyin.inbox import Inbox, _hid, update_bio
 from ..douyin.publish import PublishError, publish
-from ..paths import DRAFTS_DIR
+from ..paths import DRAFTS_DIR, STICKER_DIR
 from ..pet import bus
 from ..llm.client import LLMError
 from ..llm.router import BudgetExceeded
@@ -29,6 +30,7 @@ from . import safety
 from .brain import Brain
 from .budget import Budget, in_active_hours, parse_hhmm
 from .likes import LikePolicy, impatient_skip
+from .listen import Listener
 from .persona import douyin_bio
 
 log = logging.getLogger(__name__)
@@ -54,6 +56,14 @@ class Agent(threading.Thread):
         self.brain = Brain(db)
         self.budget = Budget(db)
         self.likes = LikePolicy(db)
+        self.memory = self.brain.memory          # 她的记忆（事件、私信好友的印象卡、日记）
+        self.listener = Listener()               # 听视频里的声音（Whisper，本机）
+        self._listen_warned = False
+        # 每位主人：(上次联系 / 开始计时的时刻, 一个 0～1 的随机数)。隔多久再主动找 TA 由“她现在的心情”决定，
+        # 随机数只决定落在这个心情对应的时间范围里的哪一点（心情变了，等的时间跟着变）
+        self._owner_next: dict[str, tuple] = {}
+        self._owner_tip_day = ""                 # 哪天已经提醒过“私信列表里找不到主人”
+        self._upkeep_at = 0.0                    # 上次整理记忆（写日记、淡忘）的时间
         self.q: queue.Queue = queue.Queue()
         self.browser: DouyinBrowser | None = None
         self.state = "stopped"
@@ -411,7 +421,9 @@ class Agent(threading.Thread):
             self.db.update_message(mid, reply=text, status="uncertain", reason=UNCERTAIN_REASON, handled_at=now_str())
             return
         self.db.update_message(mid, reply=text, status="manual" if ok else "failed",
-                               reason="" if ok else "手动回复发送失败", handled_at=now_str())
+                               reason="" if ok else ("手动回复发送失败" + (
+                                   f"：{inbox.last_reply_note}" if isinstance(getattr(inbox, "last_reply_note", None), str)
+                                   and inbox.last_reply_note else "")), handled_at=now_str())
         if ok and m["kind"] == "dm":
             self.db.add_dm(m["user_name"], "me", text)
 
@@ -458,8 +470,15 @@ class Agent(threading.Thread):
             return
         rules = self.db.rules()
         self._cur_rules = rules
+        self._memory_upkeep(rules)
         if not in_active_hours(rules):
-            self._set("outside", f"活跃时段是 {rules['active_start']}–{rules['active_end']}")
+            # 活跃时段以外她不刷视频、不回别人；但主人随时可以找她聊：来了主人的私信照样回
+            if self._owner_on(rules) and self._owner_dm_waiting(b, rules):
+                self._dm_flag = False
+                self._process_inbox(at=False, dm=True, owners_only=True)
+                self._next_dm = time.time() + max(300, dm_gap_seconds(rules))   # 夜里 5 分钟看一次，来了新私信马上看
+            self._set("outside", f"活跃时段是 {rules['active_start']}–{rules['active_end']}（主人的私信照样回）"
+                      if self._owner_on(rules) else f"活跃时段是 {rules['active_start']}–{rules['active_end']}")
             self._sleep(60)
             return
         due_at, due_dm = self._inbox_due(b, rules)
@@ -478,6 +497,12 @@ class Agent(threading.Thread):
             self._sleep(min(30, self._rest_until - time.time()))
             return
         self._maybe_publish_wish(rules)
+        owner = self._owner_due(rules)
+        if owner is not None:
+            self._owner_reach_out(b, owner, rules)
+            if self._want_run:
+                Feed(b).open()
+            return
         if not self.budget.can("videos"):
             self._set("budget_done", "今天看视频的额度用完啦，继续回复 @ 和私信")
             self.activity = ""
@@ -630,22 +655,17 @@ class Agent(threading.Thread):
         if self._stopped():
             return
 
-        # 点不点赞：和最近看过的比、看今天赞的进度、同类有没有赞腻（app/agent/likes.py）。
-        # 不想赞的视频就不问模型要不要赞；想赞的再让模型看完画面最后确认一次（它可以反悔）
-        verdict = self.likes.judge(tri["interest"], v["author"], topic, rules, mood_key,
-                                   likes_used=float(self.db.usage().get("likes") or 0))
-        want_like = self.budget.can("likes") and self.likes.roll(verdict)
-        log.info("点赞判断：%s 分，概率 %.2f，%s → %s", tri["interest"], verdict["p"], verdict["why"],
-                 "想赞" if want_like else "不赞")
+        # 点不点赞由她自己（身份卡 + 记忆）判断；程序只看今天的额度和进度（app/agent/likes.py）
+        lk = self.likes.judge(tri["interest"], v["author"], topic, rules, mood_key,
+                              used=float(self.db.usage().get("likes") or 0))
+        can_like = self.budget.can("likes") and lk["ok"]
         liked = False
-        if want_like and tri["interest"] >= 9 and self.likes.rnd.random() < 0.35:
-            # 特别喜欢的：看到一半就忍不住双击了（真人也常这样），不用等看完
-            self._watch_sleep(min(dwell * 0.4, random.uniform(2, 6)))
-            if not self._stopped() and feed.like():
-                liked = True
-                self.budget.use("likes")
-                self.mood.event("liked")
-                bus.emit("like")
+        if self._stopped():
+            return
+        # 听一听视频里说了什么 / 唱了什么（本机语音转文字；浏览器是静音播放的，不影响你用电脑）
+        if rules.get("listen_enabled", True):
+            self.current["step"] = "感兴趣，听听视频里说了什么"
+            v["speech"] = self._listen(b, v, rules)
         if self._stopped():
             return
         if can_see:
@@ -663,11 +683,19 @@ class Agent(threading.Thread):
             return
         self.current["step"] = "想想要不要点赞 / 评论"
         engage = bool(rules.get("engage_comments", True)) and bool(v.get("comment_items"))
-        # 自己发评论：程序按今天的进度和兴趣分决定让不让写、要不要明确邀请她说一句（app/agent/likes.py）
-        post_gate = {"ok": False, "invite": False, "p": 0.0, "why": "今天评论的额度用完了"}
-        if self.budget.can("comments"):
+        # 自己发评论：说不说由她自己判断；程序只看今天的额度和进度，并且同一个视频永远只评论一次
+        post_gate = {"ok": False, "invite": False, "why": "今天评论的额度用完了"}
+        if self.db.commented_video(v["video_id"]):
+            post_gate["why"] = "这个视频以前评论过了，不再评论（别人回复她的还可以接着聊）"
+        elif self.budget.can("comments"):
             post_gate = self.likes.post_gate(tri["interest"], topic, rules,
                                              float(self.db.usage().get("comments") or 0))
+        share_owners = self._owners_for_share(rules)
+        try:
+            mem_ctx = self.memory.video_context(v, topic)
+        except Exception:  # noqa: BLE001 —— 记忆读不出来不影响刷视频
+            log.warning("读记忆失败", exc_info=True)
+            mem_ctx = ""
         friends = []
         if (rules.get("at_friends_enabled", True) and self.budget.can("at_friends") and post_gate["ok"]):
             friends = self.db.friends_for_at(max(1, _int(rules.get("at_friend_per_day"), 1)))[:8]
@@ -681,23 +709,24 @@ class Agent(threading.Thread):
         if rules.get("collect_enabled", True) and self.budget.can("collects"):
             col_gate = self.likes.collect_gate(tri["interest"], topic, rules,
                                                float(self.db.usage().get("collects") or 0))
-        dec = self.brain.decide(v, frames, want_like and not liked and self.budget.can("likes"),
+        dec = self.brain.decide(v, frames, can_like,
                                 post_gate["ok"],
                                 cl_gate["ok"],
                                 engage and self.budget.can("comment_replies"), friends=friends,
                                 can_collect=col_gate["ok"], collect_note=col_gate["note"],
-                                comment_invite=post_gate["invite"])
+                                memory=mem_ctx, owners=share_owners,
+                                can_sticker=post_gate["ok"] and self._sticker_ok(rules, "comment"))
         cost += dec["cost"]
-        log.info("评论判断：%s → %s", post_gate["why"],
-                 f"她写了：{dec['comment'][:30]}" if dec.get("comment") else
-                 ("邀请了但她这次没写" + (f"（{dec.get('reason', '')[:40]}）" if dec.get("reason") else ""))
-                 if post_gate["invite"] else "没写")
+        log.info("她的判断（%s 分）：点赞 %s；评论 %s", tri["interest"],
+                 ("要" if dec.get("like") else "不要") if can_like else f"不考虑（{lk['why']}）",
+                 (f"写了“{dec['comment'][:30]}”" if dec.get("comment") else "不写") if post_gate["ok"]
+                 else f"不考虑（{post_gate['why']}）")
         # 模型给热评打的分 → 真正要赞的：只赞够分的，一般 1 条，特别精彩才多赞，按今天的进度封顶
         dec["comment_likes"] = (self.likes.pick_comments(dec.get("comment_scores") or [], rules, cl_used)
                                 if cl_gate["ok"] else [])
         if self._stopped():  # 想完的时候已经被叫停了：不再点赞或评论
             return
-        if dec["like"] and want_like and not liked and self.budget.can("likes"):   # 程序没同意赞的，模型说了也不赞
+        if dec["like"] and can_like and not liked and self.budget.can("likes"):
             liked = feed.like()
             if liked:
                 self.budget.use("likes")
@@ -710,19 +739,23 @@ class Agent(threading.Thread):
                 self.budget.use("collects")
                 self.mood.event("collected", title=v["desc"])
                 bus.emit("collect", v["desc"][:30])
-        comment = dec["comment"]
+        comment = dec["comment"] if post_gate["ok"] else ""      # 程序没同意评论的（额度、进度、评论过了），她写了也不发
         posted = ""
         if comment and self.budget.can("comments") and not self._stopped():
             problem = safety.output_problem(comment) or (
                 f"命中{safety.keyword_hit(comment, rules)}" if safety.keyword_hit(comment, rules) else None)
             if problem is None:
-                ok, reason, c2 = self.brain.safety_check(v["desc"], comment)
+                ok, reason, c2 = self.brain.safety_check(v["desc"], comment, kind="comment")
                 cost += c2
                 problem = None if ok else f"安全检查未通过：{reason}"
             friend = dec.get("at_friend")
             if problem is None:
                 bus.emit("typing", f"@{friend['nickname']} " + comment if friend else comment)
-            sent = feed.comment(comment, mention=friend["nickname"] if friend else "") if problem is None else None
+            pic = self._make_sticker(dec.get("sticker"), animated=False) if problem is None else None
+            sent = (feed.comment(comment, mention=friend["nickname"] if friend else "", image=pic)
+                    if problem is None else None)
+            if pic and sent and getattr(feed, "last_image_ok", False) is True:
+                self._sticker_sent("评论里", dec["sticker"])
             if sent is not None and not sent and getattr(sent, "uncertain", False):
                 # 点了发送但没在评论区里查到：可能已经发出去了，不重发，按发了算（免得发两遍）
                 self.db.add_event("info", f"评论 {title} 可能已经发出去了",
@@ -760,7 +793,209 @@ class Agent(threading.Thread):
                               ref=f"video:{vrow}")
         else:
             self.db.add_event("skip", f"看完 {title}", dec["reason"] or "看完了，没有互动", ref=f"video:{vrow}")
+        self.memory.remember_video(v, tri["interest"], topic, liked, collected, posted)
+        if dec.get("share_owner") and not self._stopped():
+            self._owner_share(b, dec["share_owner"]["owner"], dec["share_owner"]["text"], v)
         feed.next()
+
+    def _listen(self, b, v: dict, rules: dict) -> str:
+        """听这个视频开头的一段，转成文字；听不了（没装组件、拿不到视频地址）就返回空，不影响刷视频。"""
+        try:
+            text = self.listener.listen(b, v.get("video_id") or "", str(rules.get("listen_model") or "base"))
+        except Exception:  # noqa: BLE001
+            log.warning("听视频声音出错", exc_info=True)
+            return ""
+        broken = getattr(self.listener, "_broken", "")
+        if broken and not self._listen_warned:
+            self._listen_warned = True
+            self.db.add_event("info", "这次听不了视频的声音", broken + "。不影响刷视频，她会只按画面和文案判断")
+        return text
+
+    # ---------- 记忆：写日记、逐级合并、淡忘 ----------
+    def _memory_upkeep(self, rules: dict) -> None:
+        """每隔一会儿整理一次记忆：补写过完的那天的日记（约 500 字），周 / 月合并，把淡掉的记忆忘掉。"""
+        now = time.time()
+        if now - self._upkeep_at < 900:
+            return
+        self._upkeep_at = now
+        try:
+            day = self.memory.diary_due()
+            late = datetime.now().hour >= 18 and not in_active_hours(rules)   # 今天的活跃时段已经结束：今天的也可以写了
+            if not day and late and self.memory.day_material(today_str()) and not self.db.query(
+                    "SELECT 1 FROM diary WHERE level='day' AND period=?", (today_str(),)):
+                day = today_str()
+            if day:
+                self.current = {**self.current, "step": f"写 {day} 的日记"}
+                mood = self.mood.current()
+                cost = self.memory.write_diary(day, self.brain.system, mood.get("label", ""))
+                cost += self.memory.roll_up(self.brain.system)
+                if cost:
+                    self.db.add_event("info", f"写了 {day} 的日记", f"花了 {cost:.3f} 元，可以在“记忆”页里看")
+            self.memory.fade()
+            n = self.db.purge_comment_messages()      # 评论区聊完的记录过期就删（私信一直留着）
+            if n:
+                log.info("消息中心：删掉了 %d 条评论区的旧记录", n)
+        except (LLMError, BudgetExceeded) as e:
+            log.info("这次没写成日记：%s", str(e)[:100])
+        except Exception:  # noqa: BLE001
+            log.warning("整理记忆出错", exc_info=True)
+
+    # ---------- 主人：主动聊天、分享视频 ----------
+    def _today_events(self, kind: str) -> int:
+        return self.db.query("SELECT COUNT(*) AS n FROM events WHERE kind=? AND ts >= ?",
+                             (kind, today_str()))[0]["n"]
+
+    def _owners_for_share(self, rules: dict) -> list[dict]:
+        if not rules.get("owner_enabled", True):
+            return []
+        if self._today_events("owner_share") >= max(0, _int(rules.get("owner_share_per_day"), 2)):
+            return []
+        return [o for o in self.db.owners(enabled_only=True) if o["share"]]
+
+    def _owner_on(self, rules: dict) -> bool:
+        """主人功能开着、而且设了主人：主人的私信随时都看、都回。"""
+        return bool(rules.get("owner_enabled", True)) and bool(self.db.owners(enabled_only=True))
+
+    def _owner_mark(self, name: str) -> None:
+        """刚和这位主人说过话（她主动找的，或者回了 TA 的私信）：从现在起重新计时。"""
+        self._owner_next[name] = (time.time(), random.random())
+
+    def _owner_gap(self, owner: dict, frac: float) -> float:
+        """隔多久再主动找这位主人（秒）：看她现在的心情——想撒娇、开心、无聊的时候找得勤，犯困、闹小脾气的时候找得少；
+        越亲近隔得越短一点。没有“每天几次”的上限。"""
+        lo, hi = OWNER_GAP_MIN.get(self.mood.current()["key"], OWNER_GAP_MIN["calm"])
+        close = max(0.0, min(100.0, float(owner.get("closeness") or 0)))
+        return (lo + (hi - lo) * frac) * 60 * (1.0 - close / 300.0)
+
+    def _owner_due(self, rules: dict) -> dict | None:
+        """现在想不想主动找哪位主人聊天。不设每天的次数，什么时候找看心情（见 _owner_gap）。
+        只有一条克制：她连着发了几句主人都没回，就先不打扰，隔上大半天再问候一次。"""
+        if not rules.get("owner_enabled", True) or not self.logged_in:
+            return None
+        now = time.time()
+        for o in self.db.owners(enabled_only=True):
+            if not o["chat"]:
+                continue
+            name = o["name"]
+            st = self._owner_next.get(name)
+            if st is None:                        # 这次启动后第一次：过一会儿再找，不要一开软件就发
+                self._owner_mark(name)
+                continue
+            since, frac = st
+            if now - since < self._owner_gap(o, frac):
+                continue
+            n, last = self.db.owner_unanswered(name)
+            if n >= OWNER_UNANSWERED_MAX:
+                try:
+                    quiet = (datetime.now() - datetime.strptime(last, "%Y-%m-%d %H:%M:%S")).total_seconds()
+                except ValueError:
+                    quiet = OWNER_QUIET_HOURS * 3600
+                if quiet < OWNER_QUIET_HOURS * 3600:
+                    continue                      # 连着几句都没回：先不打扰
+            return o
+        return None
+
+    # ---------- 她自己的表情包 ----------
+    def _sticker_ok(self, rules: dict, where: str) -> bool:
+        """现在能不能发表情包：where 是 dm（私信）或 comment（评论）；各有开关，合起来每天有上限。"""
+        on = rules.get("sticker_dm", True) if where == "dm" else rules.get("sticker_comment", False)
+        return bool(on) and self._today_events("sticker") < max(0, _int(rules.get("sticker_per_day"), 10))
+
+    def _make_sticker(self, sticker: dict | None, animated: bool):
+        """把她想配的表情包画出来（用桌宠现在的形象）。画不出来返回 None，不影响发文字。"""
+        if not sticker:
+            return None
+        try:
+            from ..pet.host import pet_settings
+            from ..publish import stickers
+            for old in sorted(STICKER_DIR.glob("sticker_*"), key=lambda f: f.stat().st_mtime)[:-60]:
+                old.unlink(missing_ok=True)                      # 只留最近 60 张
+            return stickers.make(STICKER_DIR, sticker.get("mood") or "", sticker.get("text") or "", animated=animated,
+                                 rig_name=str(pet_settings(self.db).get("rig") or "default"))
+        except Exception:  # noqa: BLE001
+            log.warning("表情包没画出来", exc_info=True)
+            return None
+
+    def _sticker_sent(self, where: str, sticker: dict) -> None:
+        label = f"{sticker.get('mood')}" + (f" ·“{sticker['text']}”" if sticker.get("text") else "")
+        self.db.add_event("sticker", f"{where}发了一张自己的表情包", label)
+        log.info("%s发了表情包：%s", where, label)
+
+    def _dm_sticker(self, inbox: Inbox, user: str, sticker: dict | None, rules: dict) -> None:
+        """文字发出去以后，再把表情包发过去（发不出去不算失败，只记日志）。"""
+        if not sticker or not self._sticker_ok(rules, "dm"):
+            return
+        pic = self._make_sticker(sticker, animated=True)
+        if pic is None:
+            return
+        try:
+            if inbox.send_dm_file(user, pic):
+                self._sticker_sent(f"给 @{user} ", sticker)
+                self.db.add_dm(user, "me", f"[发了一张表情包：{sticker.get('text') or sticker.get('mood')}]")
+        except CaptchaDetected:
+            raise
+        except Exception:  # noqa: BLE001
+            log.warning("表情包没发出去", exc_info=True)
+
+    def _owner_send(self, b, owner: dict, text: str, sticker: dict | None = None) -> bool:
+        inbox = Inbox(b)
+        try:
+            sent = inbox.reply_dm({"user": owner["name"]}, text)
+            if sent:
+                self._dm_sticker(inbox, owner["name"], sticker, self.db.rules())
+        finally:
+            with cancel.shield():
+                try:
+                    inbox.close_dm_panel()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not sent and self._owner_tip_day != today_str():
+            self._owner_tip_day = today_str()
+            self.db.add_event("info", f"没能主动联系主人 {owner['name']}",
+                              "私信列表里没找到 TA，或者消息没发出去。请确认“主人”里填的名字和私信列表里显示的一样，"
+                              "并且 TA 先给她发过一条私信")
+        return bool(sent)
+
+    def _owner_reach_out(self, b, owner: dict, rules: dict) -> None:
+        name = owner["name"]
+        self._owner_mark(name)
+        self._set("running", f"想找主人 {owner.get('call') or name} 聊聊")
+        self.current = {"title": "", "author": "", "step": f"想找 {owner.get('call') or name} 聊聊"}
+        try:
+            draft = self.brain.owner_hello(owner, self.db.dm_history(name), self.memory.dm_context(name, ""),
+                                           self.memory.day_material(today_str()),
+                                           sticker=self._sticker_ok(rules, "dm"))
+        except LLMError as e:
+            self.db.add_event("error", "模型调用失败", str(e)[:200])
+            return
+        if not draft.ok:
+            log.info("想对主人说的话没发：%s（%s）", draft.text[:30], draft.reason)
+            return
+        bus.emit("reply_dm", name)
+        if self._owner_send(b, owner, draft.text, draft.sticker):
+            self.db.add_dm(name, "me", draft.text)
+            self.db.owner_touch(name, closer=0.3, proactive=True)
+            self.memory.remember("dm", f"我主动找 {owner.get('call') or name} 聊天，说“{draft.text[:60]}”",
+                                 scope=f"dm:{name}", person=name, importance=4)
+            self.mood.event("dm", user=name)
+            self.db.add_event("owner_chat", f"主动找主人 {owner.get('call') or name} 聊天", f"“{draft.text[:60]}”")
+
+    def _owner_share(self, b, owner: dict, text: str, v: dict) -> None:
+        """刷到想让主人也看看的视频：私信告诉 TA（她想说的话 + 视频地址）。"""
+        if safety.output_problem(text):
+            return
+        name = owner["name"]
+        url = v.get("url") or ""
+        msg = f"{text} 《{(v.get('desc') or '')[:20]}》@{v.get('author') or ''} {url}".strip()
+        self.current["step"] = f"把这个视频分享给 {owner.get('call') or name}"
+        if self._owner_send(b, owner, msg):
+            self.db.add_dm(name, "me", msg)
+            self.db.owner_touch(name, closer=0.3, proactive=True)
+            self.memory.remember("dm", f"我把 @{v.get('author')} 的视频《{(v.get('desc') or '')[:30]}》分享给了"
+                                       f" {owner.get('call') or name}，说“{text[:50]}”",
+                                 scope=f"dm:{name}", person=name, importance=4)
+            self.db.add_event("owner_share", f"给主人 {owner.get('call') or name} 分享了视频",
+                              f"“{text[:50]}” 《{(v.get('desc') or '')[:24]}》")
 
     # ---------- @ 和私信 ----------
     def _need_profile(self, user: str, rules: dict) -> bool:
@@ -787,13 +1022,22 @@ class Agent(threading.Thread):
 
     def _dm_arrived(self) -> bool:
         r = self._cur_rules
-        if not (r.get("auto_reply_dm") and r.get("dm_reply_mode", "instant") == "instant" and self.browser):
+        if not (r.get("dm_reply_mode", "instant") == "instant" and self.browser):
             return False
-        if not self.budget.can("replies_dm"):
+        if not self._dm_watch(r):
             return False
         if self.browser.dm_signal():
             self._dm_flag = True
         return self._dm_flag
+
+    def _owner_dm_waiting(self, b: DouyinBrowser, rules: dict) -> bool:
+        """活跃时段以外：有没有新私信值得去看一眼（到了该看的时间，或者“消息”上有未读）。"""
+        if time.time() >= self._next_dm:
+            return True
+        try:
+            return bool(self._dm_flag or b.dm_signal())      # 未读数刚变多了（别人留着的旧未读不算）
+        except Exception:  # noqa: BLE001
+            return False
 
     def _inbox_due(self, b: DouyinBrowser, rules: dict) -> tuple[bool, bool]:
         """现在该不该去看 @ / 私信。额度用完的就不去看（省时间也省 token）。"""
@@ -801,14 +1045,23 @@ class Agent(threading.Thread):
         # “互动消息”里的 @ 她、回复她评论的（接着聊）一起看；两个开关各管各的，额度也各算各的
         due_at = bool(self._notice_kinds(rules)) and now >= self._next_at
         due_dm = False
-        if rules.get("auto_reply_dm") and self.budget.can("replies_dm"):
+        if self._dm_watch(rules):
             due_dm = now >= self._next_dm
             if not due_dm and rules.get("dm_reply_mode", "instant") == "instant":
                 # 秒回：页面里的小脚本一直盯着“消息”未读数；看视频途中来了新私信会提前结束这个视频，马上去回
-                due_dm = self._dm_flag or b.dm_signal() or Inbox(b).dm_badge()
+                # 只回主人的时候不看“有没有未读”这个红点：别人的未读一直留着，红点一直在，会让她不停地去看
+                due_dm = self._dm_flag or b.dm_signal() or (self._dm_for_all(rules) and Inbox(b).dm_badge())
         if due_dm:
             self._dm_flag = False
         return due_at, due_dm
+
+    def _dm_for_all(self, rules: dict) -> bool:
+        """现在回不回所有人的私信：开了自动回复，而且今天的私信额度还没用完。"""
+        return bool(rules.get("auto_reply_dm")) and self.budget.can("replies_dm")
+
+    def _dm_watch(self, rules: dict) -> bool:
+        """要不要去看私信：回所有人的时候要看；额度用完了 / 关了自动回复，只要设了主人也照样看（只回主人）。"""
+        return self._dm_for_all(rules) or self._owner_on(rules)
 
     def _notice_kinds(self, rules: dict, with_budget: bool = True) -> tuple:
         """要去“互动消息”里看哪几种：at（@ 她的）、reply（回复她评论的，接着聊）。
@@ -845,8 +1098,10 @@ class Agent(threading.Thread):
                                     handled_at=now_str())
                 n += 1
         if rules.get("auto_reply_dm"):
+            owners = self._owner_names(rules)
             try:
-                for it in inbox.fetch_unread_dms(limit=20, need_profile=lambda u: False):
+                # 主人的未读私信不算“之前收到的”：不点开，留着等下一轮照常回
+                for it in inbox.fetch_unread_dms(limit=20, need_profile=lambda u: False, skip=owners):
                     if self.db.message_exists(it["ext_id"]):
                         continue
                     self.db.add_message(kind="dm", ext_id=it["ext_id"], user_name=it["user"], content=it["text"],
@@ -858,22 +1113,32 @@ class Agent(threading.Thread):
                         inbox.close_dm_panel()
                     except Exception:  # noqa: BLE001
                         pass
-        old = self.db.execute("UPDATE messages SET status='skipped_old', reason=?, handled_at=? "
-                              "WHERE status='pending'", (OLD_REASON, now_str())).rowcount or 0
+        keep = sorted(self._owner_names(rules))            # 主人留在“待你处理”里的不取消
+        old = self.db.execute(
+            "UPDATE messages SET status='skipped_old', reason=?, handled_at=? WHERE status='pending'"
+            + (" AND NOT (kind='dm' AND user_name IN (%s))" % ",".join("?" * len(keep)) if keep else ""),
+            (OLD_REASON, now_str(), *keep)).rowcount or 0
         if n or old:
             self.db.add_event("info", "从现在起才回复新消息",
                               f"之前收到的 {n + old} 条 @ / 私信不再回复（只回这次启动、活跃时段开始之后收到的）")
 
-    def _process_inbox(self, stop_on_pause: bool = True, at: bool = True, dm: bool = True) -> None:
-        """检查 @ 和私信。运行中被叫停时（stop_on_pause），处理完当前这一条就不再继续。"""
+    def _owner_names(self, rules: dict) -> set:
+        return {o["name"] for o in self.db.owners(enabled_only=True)} if rules.get("owner_enabled", True) else set()
+
+    def _process_inbox(self, stop_on_pause: bool = True, at: bool = True, dm: bool = True,
+                       owners_only: bool = False) -> None:
+        """检查 @ 和私信。运行中被叫停时（stop_on_pause），处理完当前这一条就不再继续。
+
+        owners_only：只看主人的私信（活跃时段以外用）。私信额度用完了、或者关了“自动回复私信”时，
+        也只点开主人的会话——别人的未读留着不动。"""
         rules = self.db.rules()
         b = self._ensure_browser()
         inbox = Inbox(b)
         halted = (lambda: stop_on_pause and not self._want_run)
-        self._set("running" if self._want_run else "idle", "去看看有没有人找她")
+        self._set("running" if self._want_run else "idle", "去看看主人有没有找她" if owners_only else "去看看有没有人找她")
         kinds = self._notice_kinds(rules)
         key = self._epoch_key(rules)
-        if self._inbox_epoch != key:
+        if self._inbox_epoch != key and not owners_only:
             # 这次启动后第一次看消息，或者新的一天活跃时段刚开始：之前的都不回
             self.activity = "inbox"
             self._baseline_inbox(inbox, rules, self._notice_kinds(rules, with_budget=False))
@@ -894,10 +1159,11 @@ class Agent(threading.Thread):
                                           status="pending", reason="处理中")
                 self._safe_handle(inbox, mid, it, it["kind"], rules)
                 self._run_urgent()
-        if dm and rules.get("auto_reply_dm") and not halted():
+        only = None if (self._dm_for_all(rules) and not owners_only) else self._owner_names(rules)
+        if dm and (only is None or only) and not halted():
             self.activity = "inbox"
             try:
-                for it in inbox.fetch_unread_dms(need_profile=lambda u: self._need_profile(u, rules)):
+                for it in inbox.fetch_unread_dms(need_profile=lambda u: self._need_profile(u, rules), only=only):
                     if it.get("profile"):
                         self.db.save_dm_user(it["user"], it["profile"], checked="follow_btn" in it["profile"])
                     if halted():
@@ -907,6 +1173,7 @@ class Agent(threading.Thread):
                     mid = self.db.add_message(kind="dm", ext_id=it["ext_id"], user_name=it["user"],
                                               content=it["text"], status="pending", reason="处理中")
                     self._safe_handle(inbox, mid, it, "dm", rules)
+                    self._dm_catch_up(inbox, mid, it, rules, halted)
                     self._run_urgent()
             finally:
                 with cancel.shield():  # 叫停了也先把私信面板关掉，免得盖住页面
@@ -916,11 +1183,60 @@ class Agent(threading.Thread):
                         pass
                 self.activity = "watch" if self._want_run else ""
 
+    def _dm_catch_up(self, inbox: Inbox, mid: int, it: dict, rules: dict, halted=lambda: False) -> None:
+        """回完一个人的私信，趁聊天还开着，看看 TA 有没有哪几句话还没回应到（她打字时新发来的、
+        她回完以后马上又发的），有就接着回。最多接 3 轮，免得两边一直你一句我一句停不下来。"""
+        answered = list(it.get("lines") or [it.get("text") or ""])
+        for _ in range(3):
+            if halted():
+                return
+            row = self.db.query("SELECT status, reply FROM messages WHERE id=?", (mid,))
+            if not row or row[0]["status"] != "replied" or not row[0]["reply"]:
+                return                               # 这一批没回出去（待你处理 / 失败 / 到上限）：不接着往下
+            try:
+                missed = inbox.dm_missed(it["user"], answered, row[0]["reply"])
+            except Exception:  # noqa: BLE001
+                log.warning("检查有没有漏回的私信出错", exc_info=True)
+                return
+            if not missed:
+                return
+            text = "\n".join(missed)[-400:]
+            ext = "dm_" + _hid(it["user"], str(row[0]["reply"])[:60], text, today_str())
+            if self.db.message_exists(ext):
+                return
+            log.info("%s 还有 %d 句话她没回应到（她回复的时候新发来的），接着回", it["user"], len(missed))
+            it = {"ext_id": ext, "user": it["user"], "text": text, "lines": missed, "shares": [], "need_share": False,
+                  "profile": {}}
+            answered = list(missed)
+            mid = self.db.add_message(kind="dm", ext_id=ext, user_name=it["user"], content=text, status="pending",
+                                      reason="处理中")
+            self._safe_handle(inbox, mid, it, "dm", rules)
+
+    def _thread_context(self, inbox: Inbox, it: dict) -> list[dict]:
+        """对方那条评论所在的那一串评论，标出哪几句是她自己说的。读不到返回空。"""
+        try:
+            rows = inbox.thread_context(it)
+        except Exception:  # noqa: BLE001
+            return []
+        if not isinstance(rows, list):
+            return []
+        mine = {re.sub(r"\s+", "", t) for t in self.db.my_comment_texts()}
+        their = re.sub(r"\s+", "", it.get("text") or "")
+        out = []
+        for r in rows:
+            sq = re.sub(r"\s+", "", r["text"])
+            if their and sq == their and r["user"] == it.get("user"):
+                continue                             # 对方这条本身不重复列
+            out.append({"user": r["user"], "text": r["text"], "me": sq in mine})
+        return out
+
     def _log_notice_check(self, inbox: Inbox, kinds: tuple, found: list[dict]) -> None:
         """每次看完“互动消息”都在日志里记一笔，没有新消息也记；通知面板打不开的，一小时在动态里提醒一次。"""
         n_at = sum(1 for it in found if it.get("kind") == "at")
         n_rp = sum(1 for it in found if it.get("kind") == "reply")
         stats = getattr(inbox, "last_notice", None) or {}
+        if stats.get("opened") and not stats.get("rows") and not getattr(inbox, "_notice_blank", False):
+            log.warning("看互动消息：通知面板打开了，但没读到一条通知（如果右上角“通知”有红点，说明没读出来）")
         if stats.get("opened") is False:
             log.warning("看互动消息：通知面板没打开，这次没看成（@ 和“接着聊”都会受影响）")
             now = time.time()
@@ -976,7 +1292,7 @@ class Agent(threading.Thread):
             return
         if kind == "dm":
             self.db.add_dm(user, "them", text)
-            if rules.get("dm_scope", "all") == "followers":
+            if rules.get("dm_scope", "all") == "followers" and not self.db.owner(user):
                 u = self.db.dm_user(user) or {}
                 follows = u.get("follows_me", -1)
                 if follows == 0:
@@ -986,23 +1302,34 @@ class Agent(threading.Thread):
                 if follows != 1:
                     self._hold(mid, "没能确认对方有没有关注她，先放着等你看", status="pending")
                     return
-        hit = safety.keyword_hit(text, rules)
-        if hit:
+        owner = self.db.owner(user) if kind == "dm" and rules.get("owner_enabled", True) else None
+        # 关键字自动回复：命中你设的关键字，直接发你写好的话，不走模型
+        canned = safety.auto_reply(text, rules)
+        if canned:
+            self._quick_reply(inbox, mid, it, kind, canned, "命中关键字，自动回复")
+            return
+        hit = None if owner else safety.keyword_hit(text, rules)
+        if hit and hit.startswith("屏蔽词"):
             self.mood.event("hostile")
-            self._hold(mid, f"命中「{hit}」", rules=rules)
+            self._hold(mid, f"命中{hit}", rules=rules)
+            return
+        if hit and rules.get("sensitive_guard", True):
+            # 敏感话题开关开着：不聊这个话题，直接告诉对方主要原因
+            self._quick_reply(inbox, mid, it, kind, safety.sensitive_reply(hit), f"涉及敏感话题「{hit}」，直接说明了原因")
             return
         if kind == "reply":
             self._handle_thread(inbox, mid, it, rules)
             return
         if kind == "dm":
             self.mood.event("dm_share" if it.get("shares") else "dm", user=user)
-        if self.db.replies_to_user_today(user) >= _int(rules.get("per_user_daily"), 3):
-            self._hold(mid, "今天对这个人的回复已到上限", status="pending")
-            return
         budget_key = "replies_at" if kind == "at" else "replies_dm"
-        if not self.budget.can(budget_key):
-            self.db.update_message(mid, status="skipped_limit", reason="今日回复额度已用完", handled_at=now_str())
-            return
+        if not owner:                              # 和主人聊天不设上限
+            if self.db.replies_to_user_today(user) >= _int(rules.get("per_user_daily"), 3):
+                self._hold(mid, "今天对这个人的回复已到上限", status="pending")
+                return
+            if not self.budget.can(budget_key):
+                self.db.update_message(mid, status="skipped_limit", reason="今日回复额度已用完", handled_at=now_str())
+                return
 
         if kind == "at":
             if it.get("video_gone"):
@@ -1018,9 +1345,12 @@ class Agent(threading.Thread):
                 self.db.update_message(mid, status="failed", reason=str(e), handled_at=now_str())
                 return
             self.db.update_message(mid, video_title=video.get("desc", "")[:100])
+            if rules.get("listen_enabled", True):
+                video["speech"] = self._listen(inbox.b, video, rules)     # 回 @ 时也听一听视频里说了什么
             frames = (inbox.feed.capture_frames(int(rules.get("frames_per_video") or 4), 6)
                       if self.brain.router.task_can_see("vision") else [])
-            draft = self.brain.reply_at(video, user, text, frames)
+            draft = self.brain.reply_at(video, user, text, frames, memory=self.memory.comment_context(user, text),
+                                        context=self._thread_context(inbox, it))
         else:
             history = self.db.dm_history(user)
             video, frames = None, []
@@ -1055,7 +1385,13 @@ class Agent(threading.Thread):
                     video, frames = {"unreadable": True, "url": url}, []
             if video is None and it.get("need_share"):
                 video = {"need_share": True}  # 光问视频、没发视频卡片：请对方重新发一次
-            draft = self.brain.reply_dm(user, history, text, video=video, frames=frames)
+            try:
+                mem_ctx = self.memory.dm_context(user, text)
+            except Exception:  # noqa: BLE001
+                log.warning("读记忆失败", exc_info=True)
+                mem_ctx = ""
+            draft = self.brain.reply_dm(user, history, text, video=video, frames=frames, owner=owner, memory=mem_ctx,
+                                        sticker=self._sticker_ok(rules, "dm"))
         self.db.update_message(mid, cost=draft.cost, tokens=draft.tokens)
         if not draft.ok:
             self._hold(mid, draft.reason, reply=draft.text, rules=rules)
@@ -1063,13 +1399,29 @@ class Agent(threading.Thread):
         bus.emit("reply_at" if kind == "at" else "reply_dm", user)
         sent = inbox.reply_mention(it, draft.text) if kind == "at" else inbox.reply_dm(it, draft.text)
         if sent:
-            self.budget.use(budget_key)
+            if owner:
+                self._owner_mark(user)             # 刚和主人聊过：主动找 TA 的时间重新算；也不占别人的私信额度
+            else:
+                self.budget.use(budget_key)
             self.db.update_message(mid, status="replied", reply=draft.text, reason="", handled_at=now_str())
             where = "评论区的 @" if kind == "at" else "私信"
+            note = getattr(inbox, "last_reply_note", "") if kind == "at" else ""
             self.db.add_event("reply_at" if kind == "at" else "reply_dm", f"回复了 @{user} 的{where}",
-                              f"“{text[:30]}” → “{draft.text[:40]}”", ref=f"msg:{mid}")
+                              f"“{text[:30]}” → “{draft.text[:40]}”" + (f"（{note}）" if isinstance(note, str) and note else ""),
+                              ref=f"msg:{mid}")
             if kind == "dm":
                 self.db.add_dm(user, "me", draft.text)
+                self._dm_sticker(inbox, user, getattr(draft, "sticker", None), rules)
+                self.memory.remember_dm(user, text, draft.text, video if isinstance(video, dict) else None,
+                                        owner=bool(owner))
+                if owner:
+                    self.db.owner_touch(user, closer=0.5)
+                try:
+                    self.memory.update_card(user)
+                except (LLMError, BudgetExceeded):
+                    pass
+            else:
+                self.memory.remember_at(user, text, draft.text, video)
         elif getattr(sent, "uncertain", False):
             # 点了发送但没法确认：可能已经发出去了，不自动重发（免得发两遍），请你去抖音里看一眼
             self.budget.use(budget_key)
@@ -1077,9 +1429,45 @@ class Agent(threading.Thread):
                                    handled_at=now_str())
             self.db.add_event("info", f"回复 @{user} 可能已经发出去了", UNCERTAIN_REASON, ref=f"msg:{mid}")
         else:
-            self.db.update_message(mid, status="failed", reply=draft.text, reason="发送失败，可能需要校准页面定位",
+            self.db.update_message(mid, status="failed", reply=draft.text, reason=_fail_reason(inbox),
                                    handled_at=now_str())
             inbox.b.dump(f"send_fail_{kind}")
+
+    def _quick_reply(self, inbox: Inbox, mid: int, it: dict, kind: str, text: str, why: str) -> None:
+        """不走模型，直接发一句现成的话（关键字自动回复、敏感话题说明原因）。"""
+        user = it["user"]
+        key = {"at": "replies_at", "dm": "replies_dm", "reply": "thread_replies"}[kind]
+        free = kind == "dm" and user in self._owner_names(self.db.rules())      # 和主人聊天不设上限、不占额度
+        if not free and not self.budget.can(key):
+            self.db.update_message(mid, status="skipped_limit", reason="今日回复额度已用完", handled_at=now_str())
+            return
+        if kind != "dm":
+            if it.get("video_gone"):
+                self._skip_gone(mid, user)
+                return
+            if not it.get("video_url"):
+                self._hold(mid, "认不出对方是在哪个视频下找她的", status="pending")
+                return
+            try:
+                inbox.open_mention_video(it, with_comments=False)
+            except FeedReadError as e:
+                self.db.update_message(mid, status="failed", reason=str(e), handled_at=now_str())
+                return
+        sent = inbox.reply_dm(it, text) if kind == "dm" else inbox.reply_mention(it, text)
+        if sent or getattr(sent, "uncertain", False):
+            if free:
+                self._owner_mark(user)
+            else:
+                self.budget.use(key)
+            self.db.update_message(mid, status="replied" if sent else "uncertain", reply=text, reason=why,
+                                   handled_at=now_str())
+            if kind == "dm":
+                self.db.add_dm(user, "me", text)
+            self.db.add_event("reply_dm" if kind == "dm" else "reply_at", f"回复了 @{user}（{why}）",
+                              f"“{it['text'][:30]}” → “{text[:40]}”", ref=f"msg:{mid}")
+        else:
+            self.db.update_message(mid, status="failed", reply=text, reason=_fail_reason(inbox),
+                                   handled_at=now_str())
 
     # ---------- 有人回复她的评论：接着聊 ----------
     def _handle_thread(self, inbox: Inbox, mid: int, it: dict, rules: dict) -> None:
@@ -1117,12 +1505,20 @@ class Agent(threading.Thread):
         if not history and mine:
             history = [{"role": "me", "content": mine}]
         last = th["count"] + 1 >= cap
-        draft = self.brain.reply_thread(video, user, text, history + [], last)
+        parent = self.db.reply_parent(mine)            # 她当初回复的那条评论（楼主）：这一串的开头
+        draft = self.brain.reply_thread(video, user, text, history + [], last, parent=parent,
+                                        memory=self.memory.comment_context(user, text),
+                                        context=self._thread_context(inbox, it))
         self.db.update_message(mid, cost=draft.cost, tokens=draft.tokens)
         if not draft.ok:
             self._hold(mid, draft.reason, reply=draft.text, rules=rules)
             return
         bus.emit("thread_reply", user)
+        if parent:
+            # 她那条评论本身是回复在别人评论下面的：对方的回复也在那一串里，直接去那一串找
+            it["root_text"], it["root_user"] = parent["text"], parent["user_name"]
+            if not it.get("root_cid") and str(parent["cid"]).isdigit():
+                it["root_cid"] = str(parent["cid"])
         sent_t = inbox.reply_mention(it, draft.text)
         if sent_t:
             self.budget.use("thread_replies")
@@ -1133,12 +1529,13 @@ class Agent(threading.Thread):
             self.db.update_message(mid, status="replied", reply=draft.text, reason="", handled_at=now_str())
             self.db.add_event("thread_reply", f"接着和 @{user} 聊（这串第 {th['count'] + 1}/{cap} 次）",
                               f"“{text[:30]}” → “{draft.text[:40]}”", ref=f"msg:{mid}")
+            self.memory.remember_thread(tid, user, text, draft.text, video)
         elif getattr(sent_t, "uncertain", False):
             self.budget.use("thread_replies")
             self.db.update_message(mid, status="uncertain", reply=draft.text, reason=UNCERTAIN_REASON,
                                    handled_at=now_str())
         else:
-            self.db.update_message(mid, status="failed", reply=draft.text, reason="发送失败，可能需要校准页面定位",
+            self.db.update_message(mid, status="failed", reply=draft.text, reason=_fail_reason(inbox),
                                    handled_at=now_str())
 
     # ---------- 互关好友 ----------
@@ -1196,20 +1593,28 @@ class Agent(threading.Thread):
         rows = self.db.query("SELECT title FROM videos WHERE interest >= 7 AND title != '' ORDER BY id DESC LIMIT 12")
         mood = self.mood.current()
         self.current = {**self.current, "step": "在构思想发的作品"}
-        d = self.brain.draft_post([r["title"] for r in rows], f"{mood['label']}（{mood['reason']}）", force=force)
+        try:
+            mem = self.memory.post_material()
+        except Exception:  # noqa: BLE001 —— 记忆读不到不影响写作品
+            mem = ""
+        d = self.brain.draft_post([r["title"] for r in rows], f"{mood['label']}（{mood['reason']}）", force=force,
+                                  memory=mem)
         if not d["want"]:
             self.db.add_event("info", "她想了想，今天不发作品", d["why"] or f"心情：{mood['label']}")
             return None
+        rules = self.db.rules()
+        form = draft_form(rules.get("post_form"))
+        if form == "upload":
+            form = "voice"                      # 她自己写的没有“你上传的”这种形式
         did = self.db.add_draft(status="wish", kind="image", title=d["title"], text=d["text"], tags=d["tags"],
                                 cards=d["cards"], image_prompt=d["image_prompt"], mood=mood["key"],
-                                reason=d["why"], source="manual" if force else "auto")
+                                reason=d["why"], source="manual" if force else "auto", form=form)
         media = []
         try:
-            media += render_cards_for(self.db, did, d)
-        except Exception as e:  # noqa: BLE001 —— 卡片画不出来也不影响草稿
-            log.warning("画文字卡片失败：%s", e)
-        rules = self.db.rules()
-        if d["image_prompt"] and rules.get("image_gen_auto", True):
+            media += render_voice_image(self.db, did, d) if form == "voice" else render_cards_for(self.db, did, d)
+        except Exception as e:  # noqa: BLE001 —— 图画不出来也不影响草稿
+            log.warning("画作品的图片失败：%s", e, exc_info=True)
+        if form == "cards" and d["image_prompt"] and rules.get("image_gen_auto", True):
             from ..publish import imagegen
             if imagegen.available(self.db, rules):
                 try:
@@ -1227,6 +1632,23 @@ class Agent(threading.Thread):
                     log.warning("AI 生图失败：%s", e)
                     self.db.add_event("error", "AI 生图失败（草稿里还有文字卡片）", str(e)[:200])
         self.db.update_draft(did, media=media)
+        if form == "voice" or rules.get("voice_auto"):     # 配音图片视频：每次都自动配好音；图文卡片：看设置
+            from ..publish import voice as tts
+            if not tts.available(self.db, rules):
+                if form == "voice":
+                    self.db.add_event("info", "作品还没配音", "还没设置她的声音（规则与预算 → 她的声音），这次先只做了图片；"
+                                      "设置好以后在作品里点“重新生成图片并配音”", ref=f"draft:{did}")
+            else:
+                try:
+                    self.current = {**self.current, "step": "给作品配音"}
+                    cost = narrate_draft(self.db, did)
+                    if cost:
+                        self.budget.use("cost", cost)
+                except OperationCancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 —— 配音失败不影响草稿（还是图文）
+                    log.warning("作品配音失败：%s", e)
+                    self.db.add_event("error", "作品配音失败（草稿里图片还在，可以手动再配）", str(e)[:200])
         self.db.add_event("publish_wish", "您的小可爱想发作品", f"《{d['title']}》{d['why']}", ref=f"draft:{did}")
         bus.emit("publish_wish", d["title"])
         return did
@@ -1250,7 +1672,8 @@ class Agent(threading.Thread):
             self.db.update_draft(did, status="failed", error="今天发布作品的数量已经到上限了（在“规则与预算”里可以调）")
             return
         files, kinds = [], set()
-        for m in d["media"]:
+        voiced = [m for m in d["media"] if m.get("source") == "voice" and media_path(did, m).exists()]
+        for m in (voiced[-1:] or d["media"]):      # 有配音视频：只发这个视频（文字卡片已经在视频里了）
             f = media_path(did, m)
             if f.exists():
                 files.append(f)
@@ -1295,6 +1718,7 @@ class Agent(threading.Thread):
         self.db.add_event("published", f"发布了作品《{d['title'][:20]}》", msg + "（已声明：内容由AI生成）",
                           ref=f"draft:{did}")
         self.mood.event("publish_ok")
+        self.memory.remember("post", f"我发了一个作品《{d['title'][:30]}》", importance=4, dedupe=f"post:{did}")
         bus.emit("published", d["title"])
         if self._want_run and self.browser:
             Feed(self.browser).open()
@@ -1487,9 +1911,107 @@ def render_cards_for(db: Database, did: int, d: dict) -> list[dict]:
     return [{"name": n, "kind": "image", "source": "card"} for n in names]
 
 
+FORMS = ("voice", "cards", "upload")
+
+
+def draft_form(value) -> str:
+    """作品的形式。以前的草稿没有记（空）：按图文卡片。"""
+    v = str(value or "")
+    return v if v in FORMS else "cards"
+
+
+def drop_source(did: int, media: list, sources: tuple) -> list:
+    """去掉草稿里某几种来源的图片 / 视频（文件也删掉；你从电脑上添加的原文件不在草稿文件夹里，不会动）。"""
+    keep = []
+    for m in media:
+        if m.get("source") in sources:
+            for n in (m.get("name"), m.get("audio")):
+                if n and not m.get("path"):
+                    (DRAFTS_DIR / str(did) / os.path.basename(n)).unlink(missing_ok=True)
+        else:
+            keep.append(m)
+    return keep
+
+
+def render_voice_image(db: Database, did: int, d: dict) -> list[dict]:
+    """配音图片视频用的那一张图：标题和正文全写在一张图上，图上有桌宠（随机动作表情姿势）。返回媒体列表（1 项）。"""
+    from ..pet.host import pet_settings
+    from ..publish import voicecard
+
+    bg, _panel = card_background(db, d)
+    name = f"voicecard_{int(time.time() * 1000) % 10**9}.jpg"
+    info = voicecard.render(d.get("title") or "", d.get("text") or "", db.persona().get("name") or "雨雨",
+                            DRAFTS_DIR / str(did) / name, rig_name=str(pet_settings(db).get("rig") or "default"),
+                            bg_path=bg)
+    if info.get("cut"):
+        log.info("配音图片：正文太长，图上没写完（配音会读完整的）")
+    return [{"name": name, "kind": "image", "source": "voicecard", "pose": info.get("mood", "")}]
+
+
+def drop_voice(did: int, media: list) -> list:
+    """去掉草稿里的配音视频（文案或卡片改了，旧的配音就不对了）。"""
+    keep = []
+    for m in media:
+        if m.get("source") == "voice":
+            for n in (m.get("name"), m.get("audio")):
+                if n:
+                    (DRAFTS_DIR / str(did) / n).unlink(missing_ok=True)
+        else:
+            keep.append(m)
+    return keep
+
+
+def narrate_draft(db: Database, did: int) -> float:
+    """用她的声音把草稿的文案读出来，和图片合成一个视频，放进草稿。返回花费（元）。
+
+    配音图片视频（form=voice）：按现在的标题和正文重新画那一张图（桌宠换一个随机动作），整个视频只有这一张图，
+    画面不动、不翻页。图文卡片（form=cards）：文字卡片和别的图片按顺序各停一会儿。"""
+    from ..publish import narrate
+    from ..publish import voice as tts
+
+    d = db.draft(did)
+    if not d:
+        raise ValueError("找不到这个草稿")
+    text = tts.speech_text(d.get("title") or "", d.get("text") or "")
+    if len(text) < 4:
+        raise ValueError("正文太短了，先写点内容再配音")
+    media = drop_voice(did, list(d["media"]))
+    if draft_form(d.get("form")) == "voice":
+        media = render_voice_image(db, did, d) + drop_source(did, media, ("voicecard", "card"))
+        db.update_draft(did, media=media)
+        images = [media_path(did, media[0])]
+    else:
+        images = [media_path(did, m) for m in media if m.get("kind") == "image" and media_path(did, m).exists()]
+    if not images:
+        raise ValueError("还没有图片，先生成文字卡片或加一张图再配音")
+    audio, ext, cost = tts.synthesize(db, db.rules(), text)
+    folder = DRAFTS_DIR / str(did)
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time()) % 10**8
+    a_name, v_name = f"voice_{stamp}.{ext}", f"voice_{stamp}.mp4"
+    (folder / a_name).write_bytes(audio)
+    seconds = narrate.make_video(images, folder / a_name, folder / v_name)
+    media.append({"name": v_name, "kind": "video", "source": "voice", "audio": a_name, "seconds": round(seconds, 1)})
+    db.update_draft(did, media=media)
+    return cost
+
+
 def _mmss(sec: float) -> str:
     sec = int(max(0, sec))
     return f"{sec // 60}:{sec % 60:02d}"
+
+
+# 主动找主人聊天：按心情隔多久（分钟，最短～最长）
+OWNER_GAP_MIN = {"clingy": (25, 60), "excited": (35, 80), "bored": (40, 90), "happy": (45, 100), "sulky": (60, 150),
+                 "calm": (90, 180), "grumpy": (120, 240), "sleepy": (180, 300)}
+OWNER_UNANSWERED_MAX = 3      # 她连着说了这么多句主人都没回（比如回了一句 + 又主动找了两次）：先不打扰
+OWNER_QUIET_HOURS = 8         # 不打扰多久以后可以再问候一次
+
+
+def _fail_reason(inbox) -> str:
+    """回复没发出去的原因：收件箱那边说得清就用它说的（比如“评论区里没找到对方那条评论”），说不清再用笼统的。"""
+    note = getattr(inbox, "last_reply_note", "")
+    return note if isinstance(note, str) and note else "发送失败，可能需要校准页面定位"
 
 
 def dm_gap_seconds(rules: dict) -> int:

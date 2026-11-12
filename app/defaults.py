@@ -3,9 +3,15 @@ from __future__ import annotations
 
 DEFAULT_PERSONA = {
     "name": "雨雨",
-    "bio": "爱看户外和美食的 AI 虚拟女孩雨雨，正在努力学人类的幽默感",
+    "bio": "爱看户外和美食的虚拟女孩雨雨，正在努力学人类的幽默感",
     "signature": "今天也要元气满满 ♡",
-    "traits": {"energy": 80, "sharp": 25, "talkative": 40, "cute": 60, "temper": 35, "volatility": 50},
+    "traits": {"energy": 80, "sharp": 25, "talkative": 40, "cute": 60, "temper": 35, "volatility": 50,
+               "humor": 60, "curious": 65, "confident": 55, "empathy": 65, "clingy": 45},
+    "archetype": "genki",          # 性格底色（见 persona.ARCHETYPES），空 = 不选
+    "self_name": "我",             # 怎么称呼自己
+    "emote": "auto",               # 表情习惯：auto 跟着撒娇程度 / kaomoji 颜文字 / emoji / none 不用
+    "mbti": "",
+    "catch_freq": "sometimes",     # 口头禅用得多不多：often 经常 / sometimes 偶尔 / rare 少
     "interests": ["户外旅行", "甜品美食", "穿搭", "萌宠"],
     "catchphrases": "绝绝子、记下啦、我先替你们尝尝（虽然我吃不到）",
     "avoid": "吵架撕番、制造焦虑、低俗擦边",
@@ -79,8 +85,37 @@ DEFAULT_RULES = {
     "keywords": ["加微信", "私聊发你", "内部消息", "稳赚"],
     "on_hit": "pending",           # pending: 放进待你处理 / log: 只记日志
     "interest_threshold": 6,       # 0-10，高于它才截帧细看
-    "like_tendency": "normal",     # 点赞倾向：picky 挑剔（赞最近看过的前 15%）/ normal 适中（前 25%）/ generous 大方（前 40%）
+    # 敏感话题：开 = 对方聊到敏感话题时，直接回一句说明原因（不走模型）；关 = 照常回复（发出前的安全检查还在）
+    "sensitive_guard": True,
+    # 关键字自动回复：对方的话里出现关键字，直接发你写好的话，不走模型。[{"keys": "价格，多少钱", "reply": "……"}]
+    "auto_replies": [],
+    # 听视频里的声音（Whisper，本机语音转文字）：tiny 最快 / base 推荐 / small 最准
+    "listen_enabled": True,
+    "listen_model": "base",
+    # 主人：她会主动找主人聊天、分享视频；和主人聊天不设回复上限，记忆不会忘
+    # 只有互关好友可以设为主人。主动找主人聊天不设次数：什么时候找、隔多久再找，看她当时的心情
+    "owner_enabled": True,
+    "owner_share_per_day": 2,      # 每天最多主动给主人分享几个视频
     "frames_per_video": 4,
+    # 抖音自带的小表情（[比心] 这样的）：让她说话时偶尔带一个
+    "douyin_emoji": True,
+    # 她自己的表情包（用桌宠形象画的）：私信里发 / 评论里带；每天最多发几张
+    "sticker_dm": True,
+    "sticker_comment": False,
+    "sticker_per_day": 10,
+    # 她的声音（BreezeBlue 语音合成）：发作品时把文案读出来，和文字卡片合成一个视频。Key 加密后单独存，不在这里
+    "voice_auto": False,           # 她做“图文卡片”形式的作品时，也自动配音做成视频（配音图片视频这种形式总是自动配音）
+    # 她自己写作品时用哪种形式：voice 配音图片视频（文案写在一张带桌宠的图上 + 她读出来）/ cards 图文卡片
+    "post_form": "voice",
+    "voice_name": "",              # 音色 ID（voc_ 开头，在 BreezeBlue 控制台里复制）
+    "voice_model": "",             # 模型，留空自动（中文用 breeze-tts-2）
+    "voice_rate": 1.0,             # 语速 0.5～2
+    "voice_volume": 100,           # 音量 1～200（%）
+    "voice_instruction": "",       # 表演指令：用一句话告诉她怎么读，比如“用轻快、带一点撒娇的语气读”
+    "voice_guidance": 3.0,         # 多听指令的话：1～10（只在写了表演指令时有用）
+    "voice_base": "",              # 接口地址，留空 = https://api.breeze.blue
+    "voice_proxy": "",             # 代理（连不上时填，比如 http://127.0.0.1:7890）
+    "voice_price": 5.0,            # 元 / 万字（汉字），用来估算花费
 }
 
 DEFAULT_UI = {"theme": "pink"}

@@ -8,6 +8,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
+
+from .. import cancel
 
 from ..db import today_str
 from .browser import DouyinBrowser
@@ -32,6 +35,72 @@ def video_url(href: str) -> str:
 # 对方在问某个视频的内容（“这个视频讲了什么”“帮我分析一下”“提炼一下重点”之类）
 VIDEO_ASK = re.compile(r"视频|作品|分析|提炼|总结|概括|讲了|说了什么|讲的|讲什么|重点|关键信息|帮我看")
 
+
+# 一条评论所在的那一串：楼主 + 楼里到这条评论为止的回复，每条 {user 名字, text 正文}。在那条评论的元素上执行。
+THREAD_ROWS_JS = r"""
+(el, itemSel) => {
+  const top = (el.parentElement && el.parentElement.closest(itemSel)) || el;
+  const rows = [top, ...top.querySelectorAll(itemSel)];
+  const own = (row, sel) => [...row.querySelectorAll(sel)].find((x) => x.closest(itemSel) === row);
+  const textOf = (row) => {
+    let box = own(row, '[data-e2e="comment-content"], .comment-item-content');
+    if (!box) {
+      const info = own(row, '.comment-item-info-wrap');
+      const nx = info && info.nextElementSibling;
+      if (nx && !nx.matches('.comment-item-stats-container') && !nx.querySelector('.comment-item-stats-container, button')) box = nx;
+    }
+    if (!box) return '';
+    let out = '';
+    const walk = (n) => {
+      if (n.nodeType === 3) { out += n.textContent; return; }
+      if (n.nodeType !== 1) return;
+      if (n.tagName === 'IMG') { out += n.getAttribute('alt') || ''; return; }
+      for (const c of n.childNodes) walk(c);
+    };
+    walk(box);
+    return out.replace(/\s+/g, ' ').trim().slice(0, 200);
+  };
+  const userOf = (row) => {
+    const a = [...row.querySelectorAll('a[href*="/user/"]')].find((x) => x.closest(itemSel) === row && (x.textContent || '').trim());
+    return a ? (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 30) : '';
+  };
+  const out = [];
+  for (const row of rows) {
+    out.push({ user: userOf(row), text: textOf(row) });
+    if (row === el && row !== top) break;      // 到对方这条为止（后面的是更晚的回复）
+  }
+  return out;
+}
+"""
+
+# 评论区里还没看过、下面有“展开 N 条回复”的评论：给它们编上号（data-aiw-thread），返回 [{key 编号, label 按钮上的字}]。
+# 看过的评论记上 data-aiw-seen，下次不再看。参数：评论的选择器、展开按钮的选择器（只要普通 CSS 的）。
+THREADS_JS = r"""
+([itemSel, expandSels]) => {
+  const out = [];
+  window.__aiwThread = window.__aiwThread || 0;
+  for (const row of document.querySelectorAll(itemSel)) {
+    if (row.hasAttribute('data-aiw-seen')) continue;
+    row.setAttribute('data-aiw-seen', '1');
+    let btn = null;
+    for (const s of expandSels) {
+      try { btn = row.querySelector(s); } catch (e) { btn = null; }
+      if (btn) break;
+    }
+    if (!btn) {
+      btn = [...row.querySelectorAll('button, [role="button"]')]
+        .find((b) => /展开\s*\d*\s*条回复|展开更多/.test(b.textContent || '')) || null;
+    }
+    if (!btn) continue;
+    const label = (btn.textContent || '').replace(/\s+/g, '').slice(0, 30);
+    if (label.includes('收起')) continue;
+    const key = String(++window.__aiwThread);
+    row.setAttribute('data-aiw-thread', key);
+    out.push({ key, label });
+  }
+  return out;
+}
+"""
 
 # 从某个元素往上找能滚动的容器（侧边评论区），往下滚一屏；找不到就滚整个页面（视频详情页的评论在页面下方）
 SCROLL_MORE_JS = r"""
@@ -154,6 +223,8 @@ class Inbox:
         self.sec_uids: dict[str, str] = {}  # 私信列表里的名字 -> 主页 id
         self.feed = Feed(b)
         self.last_notice: dict = {}  # 上次看“互动消息”的情况（给日志用）
+        self.last_reply_note = ""    # 上次回复 @ / 评论的补充说明（没找到那条评论、改成 @ 回去了……）
+        self._notice_blank = False   # 面板里明确写着“没有消息”
 
     # ---------- @ 我的（右上角“通知” → “互动消息”面板） ----------
     def open_notice_panel(self) -> bool:
@@ -167,7 +238,48 @@ class Inbox:
         self.b.check_captcha()
         return ok
 
+    def _mouse_away(self) -> None:
+        """把鼠标挪到页面左边的空白处。“通知”是鼠标停在上面就弹出来的面板：鼠标不挪开它会一直开着，
+        盖住旁边的私信面板（私信的“返回”“关闭”就点不到了）。"""
+        try:
+            self.b.page.mouse.move(40, 420)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _notice_out_of_the_way(self) -> None:
+        """要点私信面板之前：通知面板还弹着就先让它收起来（只挪鼠标，不按 Esc，免得把私信面板也关了）。"""
+        if self.b.find("notice_panel", timeout=300) is None:
+            return
+        self._mouse_away()
+        for _ in range(4):
+            cancel.sleep(0.4)
+            if self.b.find("notice_panel", timeout=200) is None:
+                return
+        log.info("通知面板挪开鼠标后还开着，点一下空白处")
+        try:
+            self.b.page.mouse.click(40, 420)
+        except Exception:  # noqa: BLE001
+            pass
+        cancel.sleep(0.5)
+
+    def _notice_rows(self, wait_s: float = 6.0) -> list:
+        """面板刚打开时通知还在加载：等通知出来再读（原来一打开就读，经常读到 0 条）。
+        面板里明确写着没有消息，或者等够了时间，才算没有。"""
+        end = time.time() + wait_s
+        while True:
+            rows = self.b.find_all("notice_item")[:40]
+            if rows:
+                return rows
+            panel_text = self.b.text_of(self.b.find("notice_panel", timeout=300), 300)
+            self._notice_blank = any(w in panel_text for w in
+                                     as_list(self.b.sel.get("notice_empty_text") or ["暂无消息", "暂无通知"]))
+            if self._notice_blank or time.time() >= end:
+                return []
+            cancel.sleep(0.5)
+
     def close_notice_panel(self) -> None:
+        self._mouse_away()
+        self.b.pause(0.3, 0.6)
         if self.b.find("notice_panel", timeout=500) is None:
             return
         try:
@@ -249,7 +361,10 @@ class Inbox:
         if not self.open_notice_panel():
             return []
         items, seen = [], set()
-        rows = self.b.find_all("notice_item")[:40]
+        self._notice_blank = False
+        rows = self._notice_rows()
+        if not rows and not self._notice_blank:
+            self._dump_once("notice_rows_empty", "通知面板打开了，但等了几秒也没读到一条通知")
         counts = {"at": 0, "reply": 0}
         for row in rows:
             it = self._parse_notice(row, mine)
@@ -301,34 +416,176 @@ class Inbox:
         raise FeedReadError("不知道对方是在哪个视频下找她的（没有视频链接），这次没法回复")
 
     def reply_mention(self, item: dict, text: str) -> bool:
-        """在视频评论区找到对方那条评论（优先按评论 id，其次按内容 + 名字），点“回复”后发送。找不到就不发。
+        """在视频评论区找到对方那条评论（优先按评论 id，其次按内容 + 名字），点“回复”后发送。
 
-        回复她评论的（kind=reply）通常折叠在她那条评论下面：先在顶层找，找不到就展开她那条评论的回复再找。"""
+        找的顺序（每一步都记日志）：① 已经加载出来的评论里直接找；② 知道楼主是哪条评论（互动消息里带的，
+        或者她当初回复的就是那条）：找到楼主、把那一串回复展开了找；③ 像人一样从“互动消息”里点这条通知进去
+        （抖音自己会打开那个视频，通常把这条评论放到评论区最前面——评论几千上万条的视频，新评论排得很后，
+        靠往下翻是翻不到的）；④ 她那条评论在顶层：展开它下面的回复；⑤ 一边往下翻一边找；
+        ⑥ 一边往下翻、一边把折叠着的回复一串串展开找（回复她的至少在 2 条回复以上的串里）。
+
+        都找不到：是 @ 她的，就在评论区发一条 @ 对方的评论把话带到（对方一样会收到提醒）；
+        是回复她评论的，不发，原因记在 last_reply_note。"""
+        self.last_reply_note = ""
         if not item.get("video_url"):
             return False  # 不知道是哪个视频，不能乱发
         if not self.feed.open_comments():
+            self.last_reply_note = "那个视频的评论区没打开"
             return False
+        who = item.get("user") or "对方"
         is_reply = item.get("kind") == "reply"
-        target = self._find_comment(item, deep=not is_reply)
-        if target is None and is_reply:
-            # 回复她评论的，通常折叠在她那条评论下面：先找到并展开她的评论，再找
-            mine = item.get("mine") or ""
-            if mine and self._find_comment({"text": mine, "user": ""}) is not None:
+        mine = item.get("mine") or ""
+        target = self._find_comment(item, deep=False)
+        step = "已加载的评论里"
+        if target is None and (item.get("root_cid") or item.get("root_text")):
+            step = "楼主那串回复里"
+            target = self._find_in_thread(item, item.get("root_cid") or "", item.get("root_text") or "",
+                                          item.get("root_user") or "")
+        if target is None:
+            res = self._reply_via_notice(item, text)
+            if res is not None:
+                return res                      # 从通知点进去找到了，已经回复过（发出去了 / 没发出去 / 不确定）
+            if not self.feed.open_comments():   # 点通知的时候评论区可能被收起来了
+                self.last_reply_note = "那个视频的评论区没打开"
+                return False
+        if target is None and is_reply and mine and not item.get("root_text"):
+            # 她那条评论是顶层评论：找到它、展开下面折叠的回复
+            step = "她那条评论下面"
+            if self._find_comment({"text": mine, "user": ""}) is not None:
                 self._expand_replies(mine)
-            target = self._find_comment(item, deep=False) or self._find_comment(item)
-        if target is None and item.get("root_cid"):
-            # 这条评论是回复在别人评论下面的（楼中楼）：先找到楼主那条评论，展开它的回复再找
-            target = self._find_in_thread(item, item["root_cid"])
+                target = self._find_comment(item, deep=False)
+        if target is None and not is_reply:
+            step = "往下翻评论区"
+            target = self._find_comment(item)
         if target is None:
-            # 不知道楼主是谁：把评论区里折叠着的回复一串串展开找（有上限，不会没完没了）
-            target = self._search_threads(item)
+            # 不知道楼主是谁：一边往下翻、一边把折叠着的回复一串串展开找（有上限，不会没完没了）
+            step = "一串串展开折叠的回复"
+            target = self._search_threads(item, min_replies=2 if is_reply else 1)
         if target is None:
-            self._dump_once("mention_comment_missing", f"在视频评论区里没找到 {item.get('user')} 那条评论")
+            loaded = len(self.b.find_all("comment_item"))
+            known = len(getattr(self.b, "notice_comments", None) or [])
+            log.warning("找 %s 的评论：都没找到（评论 id：%s，楼主 id：%s，认出她的评论：%s；评论区加载了 %d 条%s；"
+                        "互动消息接口里记到 %d 条评论）", who, item.get("cid") or "不知道",
+                        item.get("root_cid") or "不知道", "是" if mine else "否", loaded,
+                        "，已经到底" if self._comments_end() else "，还没到底", known)
+            # 两种情况分开保存：评论太多翻不到的 / 评论区里根本没几条的
+            self._dump_once("mention_comment_missing" if loaded >= 60 else "mention_comment_missing_short",
+                            f"在视频评论区里没找到 {who} 那条评论")
             self.feed.close_comments()
+            if not is_reply and item.get("user"):
+                return self._at_back(item, text)
+            self.last_reply_note = "在评论区里没找到对方那条回复（可能排得太靠后、被折叠了，或者已经删除）"
             return False
+        log.info("找 %s 的评论：在%s找到了", who, step)
         ok = self.feed.reply_on_item(target, text, (item.get("text") or "")[:12], item.get("user") or "")
         self.feed.close_comments()
         return ok
+
+    def _at_back(self, item: dict, text: str):
+        """对方 @ 了她，但在评论区里找不到那条评论（评论太多）：发一条 @ 对方的评论把话带到。
+        @ 不上（候选里没有这个人）就不发——不带 @ 的话对方收不到提醒，等于自说自话。"""
+        who = item["user"]
+        log.info("找不到 %s @ 她的那条评论，改成在评论区发一条 @%s 的评论回复", who, who)
+        res = self.feed.comment(text, mention=who, require_mention=True)
+        if res:
+            self.last_reply_note = f"没找到对方那条评论，改成在评论区 @{who} 回复的"
+        elif not getattr(res, "uncertain", False):
+            self.last_reply_note = (f"在评论区里没找到 {who} @ 她的那条评论（这个视频评论太多，新评论排得很后），"
+                                    f"想改成 @{who} 回复也没成功")
+        return res
+
+    def _notice_row(self, item: dict):
+        """互动消息面板里的这一条通知（按名字 + 内容认）；面板打不开 / 找不到返回 None。"""
+        if not self.open_notice_panel():
+            return None
+        mine = [item["mine"]] if item.get("mine") else None
+        for row in self._notice_rows():
+            again = self._parse_notice(row, mine)
+            if again and again["user"] == item.get("user") and again["text"] == item.get("text"):
+                return row
+        return None
+
+    def _reply_via_notice(self, item: dict, text: str):
+        """像人一样回复：点“互动消息”里的这条通知，抖音自己打开那个视频，并把这条评论放在评论区最前面，
+        在那儿点“回复”。
+
+        返回发送结果；这条路走不通（通知找不到了、点开以后评论区最前面没有这条评论）返回 None，
+        由后面的办法接着找。点开的如果是新标签页，回复完关掉、回到原来的页面。"""
+        who = item.get("user") or "对方"
+        if not item.get("user") or not item.get("text"):
+            return None
+        page = self.b.page
+        before_url = page.url
+        row = self._notice_row(item)
+        if row is None:
+            log.info("从通知点进去找 %s 的评论：互动消息里没找到这条通知", who)
+            self.close_notice_panel()
+            return None
+        # 点通知右边的视频封面（点名字 / 头像会去对方主页，点评论里的 @ 会去被 @ 的人的主页）
+        spot = row
+        try:
+            thumb = row.locator("img").last
+            if thumb.count() > 0:
+                spot = thumb
+        except Exception:  # noqa: BLE001
+            spot = row
+        tab = None
+        try:
+            with page.context.expect_page(timeout=5000) as info:
+                spot.click(timeout=3000)
+            tab = info.value
+        except Exception:  # noqa: BLE001 —— 没有新开标签页：可能是在当前页面里打开的
+            tab = None
+        if tab is not None:
+            try:
+                tab.wait_for_load_state("domcontentloaded", timeout=15000)
+                tab.set_default_timeout(15000)
+            except Exception:  # noqa: BLE001
+                pass
+            self.b.page = tab
+            if getattr(self.b, "_emu", None):
+                self.b._ensure_layout(tab)
+        try:
+            if tab is None:
+                self.b.pause(1.5, 2.5)
+                self.close_notice_panel()          # 还在当前页面：通知面板弹着会盖住评论区
+            how = "开了新标签页" if tab is not None else ("页面换了" if self.b.page.url != before_url else "页面没变")
+            if tab is not None and not video_url(str(self.b.page.url)):
+                log.info("从通知点进去找 %s 的评论：打开的不是视频（%s），不用这个办法", who, str(self.b.page.url)[:90])
+                return None
+            target = None
+            if self.feed.open_comments():
+                self.b.pause(0.8, 1.5)
+                target = self._find_comment(item, deep=False)
+            log.info("从通知点进去找 %s 的评论：%s（%s），%s", who, how, str(self.b.page.url)[:90],
+                     "找到了" if target is not None else "评论区最前面没有这条评论")
+            if target is None:
+                self._dump_once("notice_open_no_comment", f"从通知点进去以后没看到 {who} 那条评论")
+                return None
+            res = self.feed.reply_on_item(target, text, (item.get("text") or "")[:12], item.get("user") or "")
+            self.feed.close_comments()
+            return res
+        finally:
+            if tab is not None:
+                self.b.page = page
+                emu = getattr(self.b, "_emu", None)
+                cdp = emu.pop(tab, None) if isinstance(emu, dict) else None
+                try:
+                    if cdp is not None:
+                        cdp.detach()
+                    tab.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.b._activate_tab(page)
+                self.close_notice_panel()
+            elif page.url != before_url:
+                try:
+                    page.keyboard.press("Escape")       # 关掉弹出来的视频
+                    if page.url != before_url:
+                        page.go_back(wait_until="commit", timeout=10000)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.b.pause(0.8, 1.4)
 
     def _find_comment(self, item: dict, deep: bool = True):
         """在打开的评论区里找到对方那条评论。
@@ -383,26 +640,41 @@ class Inbox:
             self.b.check_captcha()
         return None
 
-    def _expand_all(self, root, max_clicks: int = 12) -> None:
-        """把这条评论下面的回复全部展开（“展开 N 条回复”“展开更多”一直点，直到没有或点够次数）。"""
-        for _ in range(max_clicks):
-            btn = None
-            for s in as_list(self.b.sel.get("comment_expand")):
-                try:
-                    for cand in root.locator(s).all()[:4]:
-                        if not cand.is_visible(timeout=300):
-                            continue
-                        if "收起" in (cand.inner_text(timeout=500) or ""):
-                            continue  # 已经展开了：这个按钮现在是“收起”，别点回去
-                        btn = cand
-                        break
-                except Exception:  # noqa: BLE001
-                    continue
-                if btn is not None:
+    def _expand_once(self, root) -> bool:
+        """点一次这条评论下面的“展开 N 条回复 / 展开更多”。没有可点的了返回 False。"""
+        btn = None
+        for s in as_list(self.b.sel.get("comment_expand")):
+            try:
+                for cand in root.locator(s).all()[:4]:
+                    if not cand.is_visible(timeout=300):
+                        continue
+                    if "收起" in (cand.inner_text(timeout=500) or ""):
+                        continue  # 已经展开了：这个按钮现在是“收起”，别点回去
+                    btn = cand
                     break
-            if btn is None or not self.b.safe_click(btn, "展开回复"):
+            except Exception:  # noqa: BLE001
+                continue
+            if btn is not None:
+                break
+        if btn is None or not self.b.safe_click(btn, "展开回复"):
+            return False
+        self.b.pause(0.9, 1.6)
+        return True
+
+    def _expand_all(self, root, max_clicks: int = 12) -> None:
+        """把这条评论下面的回复全部展开（一直点，直到没有或点够次数）。"""
+        for _ in range(max_clicks):
+            if not self._expand_once(root):
                 return
-            self.b.pause(0.9, 1.6)
+
+    def _expand_until(self, root, item: dict, max_clicks: int):
+        """一边展开这一串回复一边找，找到就停（回复多的串不用全展开）。"""
+        hit = self._match_in(root, item)
+        for _ in range(max_clicks):
+            if hit is not None or not self._expand_once(root):
+                break
+            hit = self._match_in(root, item)
+        return hit
 
     def _match_in(self, root, item: dict):
         """在一串回复里找对方那条（按评论 id，或按内容 + 名字）。"""
@@ -420,42 +692,90 @@ class Inbox:
             subs = []
         return self._match_comment(subs, item)
 
-    def _find_in_thread(self, item: dict, root_cid: str):
-        root = self._root_by_cid(root_cid)
+    def _find_in_thread(self, item: dict, root_cid: str, root_text: str = "", root_user: str = ""):
+        """楼主那条评论已知（按 id，或按内容 + 作者）：找到它，展开它下面的回复找。"""
+        root = self._root_by_cid(root_cid) if root_cid else None
+        if root is None and root_text:
+            root = self._find_comment({"text": root_text, "user": root_user})
         if root is None:
+            log.info("找 %s 的评论：楼主那条评论没找到", item.get("user") or "对方")
             return None
-        self._expand_all(root)
-        return self._match_in(root, item)
+        return self._expand_until(root, item, max_clicks=30)
 
-    def _search_threads(self, item: dict, max_threads: int = 40, max_seconds: float = 150.0):
-        """一串串展开折叠的回复去找（从上往下，最多展开 max_threads 串、最多找 max_seconds 秒）。"""
-        import time as _t
+    @staticmethod
+    def _reply_count(text: str) -> int:
+        """“展开 3 条回复”里的 3；读不出来返回 0。"""
+        m = re.search(r"(\d+)\s*条回复", text or "")
+        return int(m.group(1)) if m else 0
 
-        start = _t.time()
-        done = 0
-        for c in self.b.find_all("comment_item"):
-            if done >= max_threads or _t.time() - start > max_seconds:
-                break
-            has_btn = False
-            for s in as_list(self.b.sel.get("comment_expand"))[:3]:
-                try:
-                    if c.locator(s).count() > 0:
-                        has_btn = True
-                        break
-                except Exception:  # noqa: BLE001
+    def _thread_candidates(self) -> list:
+        """评论区里还没看过、下面有折叠回复的评论：[(这条评论, “展开 N 条回复”几个字)]。
+
+        用网页脚本一次读出来（以前是一条条评论去问“你下面有没有展开按钮”，评论上千条时光问就要一两分钟）；
+        看过的评论做上记号，往下翻出新评论以后再读，只会读到新的。"""
+        item_sel = as_list(self.b.sel.get("comment_item"))[0]
+        css = [x for x in as_list(self.b.sel.get("comment_expand")) if ":has-text" not in x and ":text" not in x]
+        try:
+            rows = self.b.page.evaluate(THREADS_JS, [item_sel, css])
+        except Exception:  # noqa: BLE001
+            rows = None
+        if not isinstance(rows, list):
+            return []
+        return [(self.b.page.locator(f"[data-aiw-thread='{r['key']}']").first, str(r.get("label") or ""))
+                for r in rows if isinstance(r, dict) and r.get("key")]
+
+    def _search_threads(self, item: dict, max_threads: int = 40, max_seconds: float = 240.0, min_replies: int = 1):
+        """一串串展开折叠的回复去找（从上往下，最多展开 max_threads 串、最多找 max_seconds 秒）。
+
+        min_replies：这串至少要有几条回复才值得展开。回复她评论的，一定在她的回复后面，
+        所以那一串至少有 2 条回复——只有 1 条回复的串（评论区里大多数是这种）直接跳过，省下大半时间。
+
+        已经加载出来的都看完了还没找到，就往下翻、加载下一批评论接着找，直到评论区到底、翻够了、或者到时间
+        （以前只看刚打开评论区时加载的那一二十条：回复她的那一串排在后面就永远找不到）。"""
+        start = time.time()
+        done = skipped = 0
+        last_n, stale = -1, 0
+
+        def over() -> bool:
+            return done >= max_threads or time.time() - start > max_seconds
+
+        for _ in range(int(self.b.sel.get("comment_search_rounds") or 40)):
+            for c, label in self._thread_candidates():
+                if over():
+                    break
+                n = self._reply_count(label)
+                if n and n < min_replies:
+                    skipped += 1
                     continue
-            if not has_btn:
-                continue
-            done += 1
-            try:
-                c.scroll_into_view_if_needed(timeout=2000)
-            except Exception:  # noqa: BLE001
-                pass
-            self._expand_all(c, max_clicks=6)
-            hit = self._match_in(c, item)
-            if hit is not None:
-                return hit
+                done += 1
+                try:
+                    c.scroll_into_view_if_needed(timeout=2000)
+                except Exception:  # noqa: BLE001
+                    pass
+                hit = self._expand_until(c, item, max_clicks=6)
+                if hit is not None:
+                    return hit
+                self.b.check_captcha()
+            if over() or self._comments_end():
+                break
+            items = self.b.find_all("comment_item")
+            stale = stale + 1 if len(items) == last_n else 0
+            if stale >= 3:
+                break  # 连续几次都没有加载出新评论：到底了
+            last_n = len(items)
+            self._load_more_comments(items)
             self.b.check_captcha()
+            if item.get("cid"):
+                # 新加载出来的评论里直接就有这条（按评论 id 认，很快）
+                try:
+                    loc = self.b.page.locator(self.feed.cid_selector(item["cid"])).last
+                    if loc.count() > 0:
+                        loc.scroll_into_view_if_needed(timeout=2000)
+                        return loc
+                except Exception:  # noqa: BLE001
+                    pass
+        log.info("找 %s 的评论：展开了 %d 串回复（跳过 %d 串只有 1 条回复的），评论区翻到 %d 条，用了 %d 秒，没找到",
+                 item.get("user") or "对方", done, skipped, max(last_n, 0), int(time.time() - start))
         return None
 
     def _comments_end(self) -> bool:
@@ -531,6 +851,7 @@ class Inbox:
         return self.b.find("dm_panel", timeout=800) is not None
 
     def open_dm_panel(self) -> bool:
+        self._notice_out_of_the_way()
         if self._dm_panel_open():
             return True
         entry = self.b.find("dm_entry", timeout=4000)
@@ -553,16 +874,46 @@ class Inbox:
         return bool(re.search(r"\d", text or ""))
 
     def close_dm_panel(self) -> None:
-        """处理完私信后关掉面板，免得盖住刷视频的页面。"""
+        """处理完私信后关掉面板，免得盖住刷视频的页面。
+
+        2026-11 实测：聊天开着的时候页面上有两个“关闭”（会话列表一个、聊天一个，叠在同一个位置），
+        排在前面的那个被聊天那一层盖着，点它会一直等到超时；能点到的是最上面（排在最后）的那个。
+        所以从后往前挨个试，普通点不到再换“不等可点直接点”和“用网页脚本点”，都不行按 Esc；全都不行才记一条警告。"""
         if not self._dm_panel_open():
             return
-        btn = self.b.find("dm_close", timeout=1000)
-        if btn is None or not self.b.safe_click(btn, "关闭私信面板"):
+        self._notice_out_of_the_way()      # 通知面板弹着会盖住关闭按钮
+        btns = []
+        for sel in as_list(self.b.sel.get("dm_close")):
             try:
-                self.b.page.keyboard.press("Escape")
+                btns = list(self.b.page.locator(sel).all())
             except Exception:  # noqa: BLE001
-                pass
+                btns = []
+            if btns:
+                break
+        ways = (("普通点击", lambda b: b.click(timeout=1500)),
+                ("强制点击", lambda b: b.click(timeout=1500, force=True)),
+                ("脚本点击", lambda b: b.evaluate(
+                    "el => el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}))")))
+        reason = ""
+        for name, fn in ways:
+            for btn in reversed(btns):
+                cancel.checkpoint()
+                try:
+                    fn(btn)
+                except Exception as e:  # noqa: BLE001
+                    reason = f"{name}：{str(e).splitlines()[0][:80]}"
+                    continue
+                self.b.pause(0.5, 1.0)
+                if not self._dm_panel_open():
+                    return
+        try:
+            self.b.page.keyboard.press("Escape")
+        except Exception:  # noqa: BLE001
+            pass
         self.b.pause(0.6, 1.2)
+        if self._dm_panel_open():
+            log.warning("私信面板没关掉，可能会挡住后面的操作（找到 %d 个关闭按钮%s）", len(btns),
+                        f"，最后一次：{reason}" if reason else "")
 
     def _chat_title(self) -> str:
         return self.b.text_of(self.b.find("dm_chat_title", timeout=800), 40).strip()
@@ -576,6 +927,7 @@ class Inbox:
 
     def _back_to_list(self) -> bool:
         """回到会话列表。打开着的聊天会盖住列表（列表在页面上仍算“可见”，但点不到），所以先点返回。"""
+        self._notice_out_of_the_way()      # 通知面板弹着会盖住“返回”
         if self._chat_title():
             back = self.b.find("dm_back", timeout=1500)
             if back is not None and self.b.safe_click(back, "私信返回"):
@@ -867,14 +1219,18 @@ class Inbox:
                 continue
         return False
 
-    def fetch_unread_dms(self, limit: int = 10, need_profile=None) -> list[dict]:
-        """need_profile(user) 返回 True 时，顺便去对方主页读资料（昵称、抖音号、头像、有没有关注她）。"""
+    def fetch_unread_dms(self, limit: int = 10, need_profile=None, only=None, skip=None) -> list[dict]:
+        """need_profile(user) 返回 True 时，顺便去对方主页读资料（昵称、抖音号、头像、有没有关注她）。
+
+        only：只看这些人的未读（主人；别人的会话不点开，未读留着）。skip：这些人的未读不点开。"""
         if not self.open_dm_panel() or not self._back_to_list():
             return []
         users, avatars = [], {}
         for conv in self.b.find_all("dm_conversation_item")[:20]:
             if self._has_unread(conv):
                 u = self._conv_user(conv)
+                if (only is not None and u not in only) or (skip and u in skip):
+                    continue
                 if u and u not in users:
                     users.append(u)
                     avatars[u] = self._conv_avatar(conv)
@@ -937,13 +1293,18 @@ class Inbox:
             if not lines:
                 continue
             text = "\n".join(lines)[-400:]
-            out.append({"ext_id": "dm_" + _hid(user, text, today_str()), "user": user, "text": text,
+            # 这批消息的“身份证”里带上她上一句说的话：对方隔一会儿又说了一遍同样的话（“在吗”“哈哈”），
+            # 中间她回过话了，就是新的一批——以前只按“谁 + 说了什么 + 哪天”认，同一天说第二遍会被当成处理过、不回
+            prev = next((m["text"] for m in reversed(msgs) if m["from_me"]), "")
+            out.append({"ext_id": "dm_" + _hid(user, prev[:60], text, today_str()), "user": user, "text": text,
+                        "lines": lines[-12:],
                         "shares": shares[:1], "need_share": need_share, "profile": profile,
                         "recent": [("我：" if m["from_me"] else "对方：") + (m["text"] or f"[{m['kind']}]") for m in msgs]})
         self._back_to_list()
         return out
 
     def reply_dm(self, item: dict, text: str) -> bool:
+        self.last_reply_note = ""
         user = item.get("user", "")
         if not self._open_conv(user):
             return False
@@ -963,6 +1324,141 @@ class Inbox:
             log.warning("私信好像没发出去（最新一条：%s）", msgs[-1]["text"][:30])
             return False
         return True
+
+    def dm_missed(self, user: str, answered: list, reply: str) -> list[str]:
+        """她刚回完 user 的私信：看看有没有哪几句对方的话她还没回应到。返回这些话（按时间顺序）。
+
+        两种情况会漏：① 她读完消息、想回复、打字的这段时间里，对方又发了新的——这些话排在她的回复前面，
+        下次再看时“最后一条是她发的”，就被当成回过了；② 她回完以后聊天窗口还开着，对方马上又发了一条——
+        窗口开着，这条直接算“已读”，会话上没有未读红点，下一轮也不会去看它。
+        做法：聊天还开着时，把“她上一次说话之后对方说的所有话”数一遍，去掉这次已经回应的，剩下的就是漏掉的。"""
+        try:
+            if self._chat_title() != user and not self._open_conv(user):
+                return []
+            msgs = self._read_chat(15)
+        except Exception:  # noqa: BLE001
+            return []
+        mine = [i for i, m in enumerate(msgs) if m["from_me"]]
+        if not mine:
+            return []
+        key = _squash(reply)[:10]
+        sent = next((i for i in reversed(mine) if key and key in _squash(msgs[i]["text"])), None)
+        if sent is None:
+            return []                          # 没认出她刚发的那句：不乱猜
+        start = sent
+        while start > 0 and not msgs[start - 1]["from_me"]:
+            start -= 1                         # 她的回复前面、连着的对方的话
+        before = [m["text"] for m in msgs[start:sent] if m["kind"] == "text" and m["text"]]
+        left = [_squash(a) for a in (answered or [])]
+        missed = []
+        for t in before:
+            if _squash(t) in left:
+                left.remove(_squash(t))            # 这句这次回应过了
+            else:
+                missed.append(t)
+        after = [m["text"] for m in msgs[sent + 1:] if not m["from_me"] and m["kind"] == "text" and m["text"]]
+        return (missed + after)[-8:]
+
+    def thread_context(self, item: dict, limit: int = 10) -> list[dict]:
+        """对方那条评论所在的那一串评论（楼主 + 楼里的回复，页面上的顺序）：[{"user": 名字, "text": 内容}]。
+        回复之前读给模型，让她接得上这一串的上下文。评论区里一时找不到那条评论就返回空（不影响回复）。"""
+        try:
+            if not self.feed.open_comments():
+                return []
+            target = self._find_comment(item, deep=False)
+            if target is None and (item.get("root_cid") or item.get("root_text")):
+                target = self._find_in_thread(item, item.get("root_cid") or "", item.get("root_text") or "",
+                                              item.get("root_user") or "")
+            if target is None:
+                return []
+            rows = target.evaluate(THREAD_ROWS_JS, as_list(self.b.sel.get("comment_item"))[0])
+        except Exception:  # noqa: BLE001
+            return []
+        out = [{"user": str(r.get("user") or "")[:30], "text": str(r.get("text") or "")[:160]}
+               for r in (rows or []) if isinstance(r, dict) and r.get("text")]
+        return out[:1] + out[1:][-(limit - 1):] if len(out) > limit else out
+
+    def send_dm_file(self, user: str, path) -> bool:
+        """在和 user 的私信里发一张图 / 一个 GIF（她自己的表情包）。聊天没开着就先打开。
+
+        抖音私信的“选择文件”是一个隐藏的上传框：把文件交给它，有的版本直接发出去，有的会弹一个确认框要点“发送”。
+        发完看最新一条是不是她发的、而且不是文字，确认发出去了。"""
+        if self._chat_title() != user and not self._open_conv(user):
+            return False
+        before_n = len(self.b.find_all("dm_message_item"))
+        before = self._dm_newest()
+        inp = None
+        for s in as_list(self.b.sel.get("dm_file_input")):
+            try:
+                loc = self.b.page.locator(s).first
+                if loc.count() > 0:
+                    inp = loc
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if inp is None:
+            log.warning("发表情包：没找到私信里上传文件的地方")
+            self._dump_once("dm_file_input_missing", "私信里没找到上传图片的入口")
+            return False
+        try:
+            inp.set_input_files(str(path))
+        except Exception as e:  # noqa: BLE001
+            log.warning("发表情包：文件没能交给上传框：%s", str(e).splitlines()[0][:120])
+            return False
+        for _ in range(24):                       # 最多等 12 秒：上传 + 可能的确认框
+            cancel.sleep(0.5)
+            btn = self.b.find("dm_file_confirm", timeout=200)
+            if btn is not None:
+                self.b.safe_click(btn, "发送图片")
+            if self._dm_file_sent(before, before_n):
+                self.b.pause(0.6, 1.2)
+                self.b.check_captcha()
+                return True
+        log.warning("发表情包：图片交上去了，但没看到它出现在聊天里")
+        self._dump_once("dm_file_send_fail", "私信里发图片后没看到它出现在聊天里")
+        return False
+
+    def _dm_newest(self, n: int = 3) -> list:
+        """聊天里最新的 n 条消息各自的样子：是不是她发的、是不是图片、一小段能区分的内容（发图前后对比用）。"""
+        try:
+            return self.b.page.evaluate(DM_NEWEST_JS, [
+                as_list(self.b.sel.get("dm_message_item"))[0],
+                (as_list(self.b.sel.get("dm_from_me")) or ["[class*='isFromMe']"])[0],
+                as_list(self.b.sel.get("dm_image_bubble")) or ["[class*='MessageItemImage']"],
+                bool(self.b.sel.get("dm_newest_first", True)), n]) or []
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _dm_file_sent(self, before: list, before_n: int) -> bool:
+        """图片发出去了没有。
+
+        2026-11 实测：聊天窗口只保留最近十来条消息，新的一条进来、最旧的一条就被挤掉，所以“消息条数变多了”
+        这个办法不灵（发出去了条数还是 12，以前因此误报“没发出去”）。改成看最新的一条：是她发的、
+        是一张图片（或者没有字），而且和发之前最新的那几条不一样了。条数真的变多了也算。"""
+        now = self._dm_newest()
+        if now and isinstance(now[0], dict) and now != before:
+            top = now[0]
+            if top.get("me") and (top.get("image") or not top.get("text")):
+                return True
+        return len(self.b.find_all("dm_message_item")) > before_n
+
+
+# 读聊天里最新几条消息的样子（参数：消息的选择器、“她发的”标记、图片气泡的选择器、是不是最新的排在最前、要几条）
+DM_NEWEST_JS = r"""
+([itemSel, meSel, imgSels, newestFirst, n]) => {
+  const items = [...document.querySelectorAll(itemSel)];
+  const pick = newestFirst ? items.slice(0, n) : items.slice(-n).reverse();
+  return pick.map((el) => {
+    let box = null;
+    for (const s of imgSels) { try { box = el.querySelector(s); } catch (e) { box = null; } if (box) break; }
+    const pic = box ? (box.tagName === 'IMG' ? box : box.querySelector('img')) : null;
+    const src = pic ? (pic.currentSrc || pic.src || '') : '';
+    const text = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    return { me: !!el.closest(meSel), image: !!box, text: text,
+             sig: text + '|' + (box ? 'img:' + src.length + ':' + src.slice(-24) : '') };
+  });
+}
+"""
 
 
 def update_bio(b: DouyinBrowser, bio: str) -> tuple[bool, str]:

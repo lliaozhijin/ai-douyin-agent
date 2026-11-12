@@ -81,6 +81,14 @@ if not exist "web\assets\fonts\ZCOOLKuaiLe-Regular.ttf" (
   echo [3/6] 字体已存在
 )
 
+rem ---------- 3.5 语音模型（打进安装包，用户不用再下载；下载失败也没关系，软件第一次用时会再下载） ----------
+if not exist "assets\models\whisper\faster-whisper-base\model.bin" (
+  echo [3/6] 下载语音模型 base（约 145MB，只需要下载一次）...
+  "%VPY%" tools\fetch_whisper.py base
+) else (
+  echo [3/6] 语音模型已存在
+)
+
 rem ---------- 4. 测试 ----------
 echo [4/6] 运行测试...
 "%VPY%" -m unittest discover -s tests || goto :fail

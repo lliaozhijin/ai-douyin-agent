@@ -13,7 +13,7 @@ from ..paths import SELECTORS_FILE
 
 log = logging.getLogger(__name__)
 
-SELECTORS_VERSION = 19  # 改了默认定位就加 1，旧的 selectors.json 会自动备份并更新
+SELECTORS_VERSION = 23  # 改了默认定位就加 1，旧的 selectors.json 会自动备份并更新
 
 DEFAULT_SELECTORS: dict = {
     "_说明": "抖音网页改版后，如果某个动作失效，修改这里对应的定位即可。修改后重启软件生效。",
@@ -64,8 +64,16 @@ DEFAULT_SELECTORS: dict = {
     "product_card_close": ["#videoSideBar #svg_icon_circle_close", "#videoSideBar [class*='close']"],
     "comment_item": ["[data-e2e='comment-item']"],
     "comment_input": [".comment-input-inner-container [contenteditable='true']",
+                      ".comment-input-container [contenteditable='true']",
                       "[data-e2e='comment-input'] [contenteditable='true']",
                       ".public-DraftEditor-content"],
+    # 评论输入框没点开时只是一行“留下你的精彩评论吧”的占位文字，要先点一下它，可以打字的输入框才会出现
+    "comment_input_open": [".comment-input-inner-container", ".comment-input-container",
+                           "text=留下你的精彩评论吧"],
+    # 输入框右边红色的发送按钮（输入了内容 / 配了图以后才出现）。平时按回车发送；回车没发出去时点它
+    "comment_send": [".commentInput-right-ct span:has(path[fill='#FE2C55'])",
+                     ".comment-input-container span:has(path[fill='#FE2C55'])",
+                     ".commentInput-right-ct span:has(svg):nth-of-type(4)"],
     "comment_reply_text": "回复",
     # 每条评论里的各个部分（2026-11 实测网页结构）
     "comment_user": [".comment-item-info-wrap a[href*='/user/']"],
@@ -90,6 +98,7 @@ DEFAULT_SELECTORS: dict = {
     "notice_panel": ["[data-e2e='listDlgTest-container']"],
     "notice_item": ["[data-e2e='listDlgTest-container'] div[style*='height']:has([data-e2e='user-name-card'])"],
     "notice_user": ["[data-e2e='user-name-card']"],
+    "notice_empty_text": ["暂无消息", "暂无通知", "暂无互动消息"],
     "notice_content": ["pre"],
     "notice_at_keywords": ["@了你", "提到了你", "在评论中@了你"],
     "notice_reply_keywords": ["回复了你的评论", "回复了你"],
@@ -152,6 +161,17 @@ DEFAULT_SELECTORS: dict = {
     "dm_text_bubble": ["[class*='MessageItemText']"],
     "dm_share_link": ["a[href*='/video/']", "a[href*='modal_id=']", "a[href*='/note/']"],
     "dm_unsupported_text": "暂不支持该消息类型",
+    # 私信输入框旁边“选择文件”的隐藏上传框（可以发 jpg / png / gif / mp4）；选完文件后如果弹出确认框，点里面的“发送”
+    "dm_file_input": ["[data-e2e='msg-input'] input.semi-upload-hidden-input[type='file']",
+                      "[data-e2e='msg-input'] input[type='file']"],
+    "dm_file_confirm": ["[id='pc-im-popup-container'] button:has-text('发送')", ".semi-modal button:has-text('发送')",
+                        "[class*='im-saas'] button:has-text('发送')"],
+    # 聊天里的图片消息（2026-11 实测：class 带 MessageItemImage）。分享的视频卡片也有封面图，不算图片消息
+    "dm_image_bubble": ["[class*='MessageItemImage']", "[class*='MessageItemEmoji']", "[class*='MessageItemSticker']"],
+    # 评论输入框右边“图片”按钮背后的隐藏上传框（png / jpg / webp）
+    "comment_file_input": [".comment-input-container input[type='file']", ".commentInput-right-ct input[type='file']"],
+    "comment_image_preview": [".comment-input-container img[src^='blob:']", ".comment-input-container img[src*='douyinpic']",
+                              ".comment-input-container [class*='image'] img"],
     "dm_input": ["[data-e2e='msg-input'] [contenteditable='true']", "[data-e2e='msg-input'] textarea"],
 
     # 编辑资料（2026-11 实测：入口是主页名字旁边的铅笔图标；简介是富文本编辑器，不是 textarea）
@@ -172,6 +192,8 @@ DEFAULT_SELECTORS: dict = {
     "sms_verify": [".second-verify-panel", ".uc-ui-verify_sms-verify", "input[placeholder*='验证码']:visible",
                    "text=接收短信验证码", "text=获取验证码", "text=发送验证码", "text=短信验证",
                    "text=验证手机", "text=手机号验证", "text=身份验证"],
+    # 刷视频 / 点私信时抖音弹的“二次验证”（短信验证码）面板和它的遮罩：开着的时候页面上什么都点不了
+    "second_verify": ["#uc-second-verify .second-verify-mask", ".second-verify-panel", ".uc-ui-verify_sms-verify"],
     # 不要放“text=验证码”这种宽泛的文字：评论、文案里出现“验证码”三个字也会被当成弹了验证
     "captcha": ["#captcha_container", ".captcha_verify_container", "iframe[src*='verifycenter']",
                 "iframe[src*='captcha']", "text=请完成下列验证"],

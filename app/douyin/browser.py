@@ -119,6 +119,7 @@ class DouyinBrowser:
         self.notice_comments: list[dict] = []
         self.following: dict[str, dict] = {}   # 打开自己的“关注”列表时读到的人：主页 id -> 资料（含是否互关）
         self.me_uid = ""                         # 她自己账号的主页 id（读互关好友时排除自己）
+        self.media: dict[str, list] = {}         # 视频 id -> 抖音网页自己加载的播放地址（听视频声音时用）
         self._emu: dict = {}                     # 被系统缩小窗口时，给页面固定大小用的调试会话（标签页 -> 会话）
         self._hide_checked = 0.0
 
@@ -415,6 +416,8 @@ class DouyinBrowser:
             self._collect_following(data)
         if "/notice" in url:
             self._collect_notices(data)
+        if "/aweme/" in url:
+            self._collect_media(data)
         for u in _iter_users(data):
             name = (u.get("nickname") or "").strip()
             if not name or not u.get("sec_uid"):
@@ -469,6 +472,38 @@ class DouyinBrowser:
         if found:
             seen = {c["cid"] for c in found}
             self.notice_comments = (found + [c for c in self.notice_comments if c["cid"] not in seen])[:400]
+
+    def _collect_media(self, data) -> None:
+        """推荐页、视频详情的返回内容里带着每个视频的播放地址：记下来，听视频声音时直接用（不额外请求接口）。"""
+        def walk(o, depth: int = 0) -> None:
+            if depth > 8:
+                return
+            if isinstance(o, dict):
+                vid, video = o.get("aweme_id"), o.get("video")
+                if vid and isinstance(video, dict):
+                    urls = []
+                    for key in ("play_addr", "play_addr_h264", "download_addr"):
+                        addr = video.get(key)
+                        if isinstance(addr, dict):
+                            urls += [u for u in (addr.get("url_list") or []) if isinstance(u, str) and u.startswith("http")]
+                    if urls:
+                        self.media[str(vid)] = list(dict.fromkeys(urls))[:4]
+                for v in o.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v, depth + 1)
+            elif isinstance(o, list):
+                for v in o[:60]:
+                    walk(v, depth + 1)
+
+        try:
+            walk(data)
+            while len(self.media) > 300:
+                self.media.pop(next(iter(self.media)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def media_urls(self, video_id: str) -> list:
+        return list(self.media.get(str(video_id or ""), []))
 
     def notice_comment(self, text: str, user: str = "") -> dict | None:
         """按评论内容（和作者昵称）找到互动消息里的那条评论数据。"""
@@ -690,6 +725,7 @@ class DouyinBrowser:
                 except Exception:  # noqa: BLE001
                     pass
                 self.check_captcha()
+                end = max(end, time.time() + timeout / 2)      # 刷新以后至少再等一半的时间，不会刚刷新完就放弃
                 continue
             cancel.sleep(1)
         return None
@@ -744,7 +780,9 @@ class DouyinBrowser:
             self.click(loc)
             return True
         except Exception as e:  # noqa: BLE001
-            log.warning("点击%s失败：%s", what, why(e))
+            reason = why(e)
+            log.warning("点击%s失败：%s", what, reason)
+            self._blocked_by_verify(reason)
             return False
 
     def click_open(self, loc, what: str, opened) -> bool:
@@ -765,6 +803,7 @@ class DouyinBrowser:
                 fn()
             except Exception as e:  # noqa: BLE001
                 reasons.append(f"{name}：{why(e)}")
+                self._blocked_by_verify(reasons[-1])
             if opened(3000 if i == 0 else 2500):
                 if i:
                     log.info("点%s：%s没成功，换成%s打开了（%s）", what, tries[0][0], name, "；".join(reasons)[:300])
@@ -813,7 +852,8 @@ class DouyinBrowser:
         cancel.checkpoint()
         if not self.page:
             return
-        for s in as_list(self.sel.get("captcha")):
+        # 滑块 / 图形验证，以及刷视频中途弹的“二次验证”（短信验证码）：后者开着时遮罩盖住整页，什么都点不了
+        for s in as_list(self.sel.get("captcha")) + as_list(self.sel.get("second_verify")):
             try:
                 if self.page.locator(s).first.is_visible(timeout=300):
                     raise CaptchaDetected(s)
@@ -821,6 +861,23 @@ class DouyinBrowser:
                 raise
             except Exception:  # noqa: BLE001
                 continue
+
+    def _any_visible(self, key: str) -> bool:
+        if not self.page:
+            return False
+        for sel in as_list(self.sel.get(key)):
+            try:
+                if self.page.locator(sel).first.is_visible(timeout=300):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def _blocked_by_verify(self, reason: str) -> None:
+        """点不动是因为验证框的遮罩挡着（日志里是 second-verify / captcha … intercepts pointer events）：
+        马上按“弹了验证”处理，交给你去验证，而不是一直空点。"""
+        if "intercepts pointer events" in reason and ("verify" in reason or "captcha" in reason):
+            self.check_captcha()
 
     def sms_visible(self) -> bool:
         """页面上是不是在要求填手机短信验证码。"""
@@ -844,7 +901,7 @@ class DouyinBrowser:
             return False
         exact = ("text=请完成下列验证", "text=获取验证码", "text=发送验证码", "text=接收短信验证码")
         strong = [s for s in as_list(self.sel.get("captcha")) + as_list(self.sel.get("sms_verify"))
-                  if not s.startswith("text=") or s in exact]
+                  + as_list(self.sel.get("second_verify")) if not s.startswith("text=") or s in exact]
         try:
             pages = [pg for pg in self.ctx.pages if not pg.is_closed()]
         except Exception:  # noqa: BLE001
@@ -860,7 +917,7 @@ class DouyinBrowser:
 
     def verify_kind(self) -> str:
         """现在页面上要你处理的验证：sms 手机验证码 / captcha 滑块或图形验证 / 空字符串 没有。"""
-        if self.sms_visible():
+        if self.sms_visible() or self._any_visible("second_verify"):
             return "sms"
         return "captcha" if self.captcha_visible() else ""
 

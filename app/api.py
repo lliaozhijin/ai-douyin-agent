@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -86,7 +87,7 @@ class Api:
 
     EVENT_GROUPS = {
         "interact": ["like", "collect", "comment", "at_friend", "comment_like", "comment_reply"],
-        "reply": ["reply_at", "reply_dm", "thread_reply"],
+        "reply": ["reply_at", "reply_dm", "thread_reply", "owner_chat", "owner_share"],
         "watch": ["skip"],
         "publish": ["publish_wish", "published"],
         "system": ["pause", "info", "error"],
@@ -188,12 +189,30 @@ class Api:
     # ---------- 消息中心 ----------
     @_api
     def get_messages(self, flt: str = "all"):
-        items = self._db.messages(flt)
-        users = self._db.dm_users_map([m["user_name"] for m in items if m["kind"] == "dm"])
+        self._purge_comment_messages()
+        items = self._db.messages(flt, limit=1000)
+        owners = {o["name"]: o for o in self._db.owners()}
         for m in items:
-            u = users.get(m["user_name"]) if m["kind"] == "dm" else None
+            m["owner"] = (owners.get(m["user_name"]) or {}).get("call", "") if m["kind"] == "dm" and m["user_name"] in owners else None
+        # 同一个人的私信和评论区消息合在一个框里：评论区那几条也带上 TA 的头像、昵称（私信里读到过的话）
+        users = self._db.dm_users_map(list({m["user_name"] for m in items if m["user_name"]}))
+        for m in items:
+            u = users.get(m["user_name"])
             m["user"] = {k: u[k] for k in ("nickname", "douyin_id", "avatar", "url", "follows_me")} if u else None
-        return {"items": items, "counts": self._db.message_counts()}
+        return {"items": items, "counts": self._db.message_counts(), "comment_keep_days": self._db.COMMENT_KEEP_DAYS}
+
+    def _purge_comment_messages(self) -> None:
+        """评论区聊完的记录过期就删（私信一直留着）。一小时最多整理一次。"""
+        now = time.time()
+        if now - getattr(self, "_purged_at", 0.0) < 3600:
+            return
+        self._purged_at = now
+        try:
+            n = self._db.purge_comment_messages()
+            if n:
+                log.info("消息中心：删掉了 %d 条评论区的旧记录（和对方 %d 天没有新一轮对话了）", n, self._db.COMMENT_KEEP_DAYS)
+        except Exception:  # noqa: BLE001
+            log.warning("整理评论区的旧记录出错", exc_info=True)
 
     @_api
     def message_action(self, mid: int, action: str, text: str = ""):
@@ -221,19 +240,34 @@ class Api:
     # ---------- 人设 ----------
     @_api
     def get_persona(self):
+        from .agent.persona import ARCHETYPES, SELF_NAMES, TRAIT_DEFAULTS
         p = self._db.persona()
-        return {**p, "avatar_url": self._avatar_url(p), "douyin_bio_preview": douyin_bio(p)}
+        p["traits"] = {**TRAIT_DEFAULTS, **(p.get("traits") or {})}
+        return {**p, "avatar_url": self._avatar_url(p), "douyin_bio_preview": douyin_bio(p),
+                "archetypes": [{"id": k, "name": v[0], "desc": v[1]} for k, v in ARCHETYPES.items()],
+                "self_names": SELF_NAMES}
 
     @_api
     def save_persona(self, persona: dict):
         cur = self._db.persona()
-        allowed = {"name", "bio", "signature", "traits", "interests", "catchphrases", "avoid", "extra"}
+        allowed = {"name", "bio", "signature", "traits", "interests", "catchphrases", "avoid", "extra",
+                   "archetype", "self_name", "emote", "mbti", "catch_freq"}
         for k, v in (persona or {}).items():
             if k in allowed:
                 cur[k] = v
         cur["name"] = (cur.get("name") or "雨雨").strip()[:20]
         cur["signature"] = (cur.get("signature") or "").strip()[:80]
-        for k in ("vibe", "archetype", "custom"):  # 旧版本的“给人的感觉”、试用过的人设类型：不再使用
+        from .agent.persona import ARCHETYPES, CATCH_FREQ, EMOTE_STYLES
+        if cur.get("archetype") not in ARCHETYPES:
+            cur["archetype"] = ""
+        if cur.get("catch_freq") not in CATCH_FREQ:
+            cur["catch_freq"] = "sometimes"
+        if cur.get("emote") not in EMOTE_STYLES:
+            cur["emote"] = "auto"
+        cur["self_name"] = (str(cur.get("self_name") or "我").strip() or "我")[:6]
+        cur["mbti"] = str(cur.get("mbti") or "").strip().upper()[:4]
+        cur["extra"] = str(cur.get("extra") or "")[:1500]
+        for k in ("vibe", "custom"):  # 旧版本的“给人的感觉”：不再使用
             cur.pop(k, None)
         self._db.set_json("persona", cur)
         if self._pet:
@@ -406,6 +440,17 @@ class Api:
         # AI 生图可以选的服务商（OpenAI 兼容接口的）
         rules["image_options"] = [{"id": p["id"], "name": p["name"], "has_key": bool(p.get("api_key_enc"))}
                                   for p in self._db.providers() if p["kind"] == "openai"]
+        from .publish import stickers
+        from .publish import voice as tts
+        mutual = self._db.mutual_names()
+        rules["owners"] = [dict(o, mutual=o["name"] in mutual) for o in self._db.owners()]
+        rules["owner_choices"] = mutual           # 只有互关好友可以设为主人
+        rules["voice_has_key"] = tts.has_key(self._db)
+        rules["voice_ready"] = tts.available(self._db, rules)
+        for k in ("voice_name", "voice_model"):      # 以前 CosyVoice 的设置不显示
+            rules[k] = tts.cfg(rules)[k]
+        rules["sticker_moods"] = stickers.mood_names()
+        rules["listen_status"] = self._agent.listener.status() if hasattr(self._agent, "listener") else {}
         return rules
 
     @_api
@@ -414,7 +459,121 @@ class Api:
         for k, v in (rules or {}).items():
             if k in cur:
                 cur[k] = v
+        cur["auto_replies"] = [{"keys": str(a.get("keys") or "").strip()[:200], "reply": str(a.get("reply") or "").strip()[:300]}
+                               for a in (cur.get("auto_replies") or []) if isinstance(a, dict)
+                               and str(a.get("keys") or "").strip() and str(a.get("reply") or "").strip()][:50]
         self._db.set_json("rules", cur)
+        refused = []
+        if isinstance((rules or {}).get("owners"), list):
+            refused = self._db.save_owners(rules["owners"])
+        return {"ok": True, "owners_refused": refused}
+
+    # ---------- 她的声音 / 表情包 ----------
+    def _voice_rules(self, override: dict | None) -> dict:
+        """试听、设计音色时用界面上还没保存的设置。"""
+        rules = self._db.rules()
+        for k, v in (override or {}).items():
+            if k.startswith("voice_") and k in rules:
+                rules[k] = v
+        return rules
+
+    @_api
+    def voice_test(self, text: str = "", override: dict | None = None):
+        """用现在选的音色读一句话，返回可以直接播放的音频。"""
+        from .publish import voice as tts
+        text = tts.speech_text("", (text or "").strip() or "你好呀，我是" + (self._db.persona().get("name") or "雨雨")
+                               + "，这是我的声音，好听吗？")
+        audio, ext, cost = tts.synthesize(self._db, self._voice_rules(override), text[:120])
+        if cost:
+            self._budget.use("cost", cost)
+        return {"audio": f"data:audio/{'mpeg' if ext == 'mp3' else ext};base64," + base64.b64encode(audio).decode()}
+
+    @_api
+    def voice_save_key(self, key: str):
+        """保存（或清掉）BreezeBlue 的 API Key：加密后存在本机，不会再显示出来。"""
+        from .publish import voice as tts
+        tts.save_key(self._db, key)
+        return {"has_key": tts.has_key(self._db)}
+
+    @_api
+    def voice_list(self, kind: str = "personal", override: dict | None = None):
+        """读 BreezeBlue 账号里的音色（personal 你自己的 / default 官方中文女声），方便直接选。"""
+        from .publish import voice as tts
+        return {"voices": tts.list_voices(self._db, self._voice_rules(override), kind)}
+
+    @_api
+    def draft_voice(self, did: int):
+        """给草稿配音：把文案读出来，和图片合成一个视频。"""
+        from .agent.runner import narrate_draft
+        from .publish import voice as tts
+        d = self._db.draft(did)
+        if not d or d["status"] in ("publishing", "published"):
+            raise ValueError("这个作品已经在发布或已发布，不能再改了")
+        if not tts.available(self._db, self._db.rules()):
+            raise ValueError("还没设置她的声音：到“规则与预算 → 她的声音”里填好 BreezeBlue 的 Key 和音色 ID")
+        cost = narrate_draft(self._db, int(did))
+        if cost:
+            self._budget.use("cost", cost)
+        return True
+
+    @_api
+    def draft_voice_audio(self, did: int):
+        """草稿里配音的那段声音（界面上试听）。"""
+        from .agent.runner import media_path
+        d = self._db.draft(did)
+        for m in (d or {}).get("media", []):
+            if m.get("source") == "voice" and m.get("audio"):
+                f = media_path(did, {"name": m["audio"]})
+                if f.exists():
+                    return {"audio": "data:audio/mpeg;base64," + base64.b64encode(f.read_bytes()).decode()}
+        raise ValueError("这个草稿还没有配音")
+
+    @_api
+    def sticker_preview(self, mood: str = "", text: str = ""):
+        """看看她的表情包：不给情绪就返回全部情绪的预览图，给了就画那一张（会动的）。"""
+        from .pet.host import pet_settings
+        from .pet.rig import load as load_rig
+        from .publish import stickers
+        rig = load_rig(str(pet_settings(self._db).get("rig") or "default"))
+        buf = io.BytesIO()
+        if not mood:
+            stickers.sheet(rig, cols=4, size=200).save(buf, format="JPEG", quality=88)
+            return {"image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}
+        frames = stickers.render_gif(rig, mood, (text or "").strip()[:8])
+        pal = [f.quantize(colors=128) for f in frames]
+        pal[0].save(buf, format="GIF", save_all=True, append_images=pal[1:], duration=90, loop=0, disposal=1)
+        return {"image": "data:image/gif;base64," + base64.b64encode(buf.getvalue()).decode()}
+
+    # ---------- 记忆 ----------
+    @_api
+    def get_memory(self, tab: str = "events", q: str = "", person: str = ""):
+        from .agent.memory import FORGET_BELOW, HALF_LIFE_DAYS
+        data = self._agent.memory.listing(tab, (q or "").strip(), (person or "").strip())
+        data["half_life"] = HALF_LIFE_DAYS
+        data["forget_below"] = FORGET_BELOW
+        return data
+
+    @_api
+    def memory_action(self, action: str, target="", value=0):
+        mem = self._agent.memory
+        if action == "delete":
+            mem.delete(int(target))
+        elif action == "importance":
+            mem.set_importance(int(target), int(value))
+        elif action == "forget_person":
+            n = mem.forget_person(str(target))
+            self._db.add_event("info", f"忘掉了 {target}", f"印象卡、聊天记录和 {n} 条有关的记忆都删掉了")
+        elif action == "refresh_card":
+            mem.update_card(str(target), force=True)
+        elif action == "delete_diary":
+            mem.delete_diary(int(target))
+        elif action == "add_note":
+            text = str(value or "").strip()
+            if not text:
+                raise ValueError("内容不能为空")
+            mem.remember("note", text, importance=5)
+        else:
+            raise ValueError(f"未知操作 {action}")
         return True
 
     # ---------- 互关好友 ----------
@@ -439,7 +598,7 @@ class Api:
         if not name:
             raise ValueError("先输入好友的抖音昵称")
         uid = "name:" + name
-        self._db.save_friend(uid, {"nickname": name, "mutual": True})
+        self._db.save_friend(uid, {"nickname": name, "mutual": True, "manual": True})
         self._db.set_friend_choice(uid, True, "")
         return True
 
@@ -448,10 +607,16 @@ class Api:
         from .agent.runner import media_path
         from PIL import Image
 
+        from . import media_server
+        media_server.serve(self._media_file)       # 预览用的本机小服务（只启动一次）
         out = []
         for m in media:
             f = media_path(did, m)
-            item = {**m, "exists": f.exists(), "thumb": "", "file": f.name}
+            item = {**m, "exists": f.exists(), "thumb": "", "file": f.name,
+                    # 预览：图片点开看大图、视频和配音直接播放
+                    "url": media_server.url(did, m["name"]) if f.exists() else "", "audio_url": ""}
+            if m.get("audio") and media_path(did, {"name": m["audio"]}).exists():
+                item["audio_url"] = media_server.url(did, m["audio"])
             if f.exists() and m.get("kind") == "image":
                 try:
                     im = Image.open(f).convert("RGB")
@@ -463,6 +628,39 @@ class Api:
                     pass
             out.append(item)
         return out
+
+    def _media_file(self, did: int, name: str):
+        """预览服务来问“这个草稿的这个文件在哪”：只认草稿里登记过的图片 / 视频 / 配音，别的一律不给。"""
+        from .agent.runner import media_path
+        d = self._db.draft(did)
+        for m in (d or {}).get("media", []):
+            if m.get("name") == name:
+                return media_path(did, m)
+            if m.get("audio") == name:
+                return media_path(did, {"name": name})
+        return None
+
+    @_api
+    def open_draft_media(self, did: int, name: str):
+        """用电脑上的播放器 / 看图软件打开草稿里的一个文件（软件里播放不了的视频格式用它）。"""
+        f = self._media_file(int(did), str(name))
+        if f is None or not f.is_file():
+            raise ValueError("文件不见了")
+        _open_folder(f)
+        return True
+
+    @_api
+    def delete_draft(self, did: int):
+        """删掉一条“不发了”的作品记录，连同它的文字卡片、AI 配图、配音文件。你从电脑上添加的原文件不会动。"""
+        import shutil
+        d = self._db.draft(did)
+        if not d:
+            raise ValueError("找不到这个作品")
+        if d["status"] != "discarded":
+            raise ValueError("只有点过“不发了”的作品才能删除")
+        self._db.delete_draft(did)
+        shutil.rmtree(DRAFTS_DIR / str(int(did)), ignore_errors=True)
+        return True
 
     @_api
     def list_drafts(self):
@@ -487,6 +685,11 @@ class Api:
         d["bg_default"] = str(rules.get("card_bg_default") or "")
         d["panel_default"] = bool(rules.get("card_panel_default", True))
         d["can_ai_image"] = imagegen.available(self._db, self._db.rules())
+        from .publish import voice as tts
+        d["can_voice"] = tts.available(self._db, rules)
+        d["has_voice"] = any(m.get("source") == "voice" for m in d["media"])
+        from .agent.runner import draft_form
+        d["form"] = draft_form(d.get("form"))       # voice 配音图片视频 / cards 图文卡片 / upload 你上传的
         d["publish_step"] = ""
         if d["status"] == "publishing" and self._agent.activity == "publish":
             d["publish_step"] = str((self._agent.current or {}).get("step") or "").replace("发作品：", "")
@@ -496,8 +699,10 @@ class Api:
 
     @_api
     def new_draft(self):
+        from .agent.runner import draft_form
         did = self._db.add_draft(status="wish", kind="image", title="", text="", tags=[], media=[], cards=[],
-                                 reason="你自己新建的作品", source="manual", seen=1)
+                                 reason="你自己新建的作品", source="manual", seen=1,
+                                 form=draft_form(self._db.rules().get("post_form") or "voice"))
         return did
 
     @_api
@@ -520,20 +725,74 @@ class Api:
             kw["media"] = [by[n] for n in data["order"] if n in by]
         if d["status"] == "failed":
             kw["status"], kw["error"] = "wish", ""
+        changed = kw.get("title", d["title"]) != d["title"] or kw.get("text", d["text"]) != d["text"]
+        if changed and any(m.get("source") == "voice" for m in d["media"]):
+            from .agent.runner import drop_voice           # 文案改了：旧的配音不对了，去掉（可以重新配）
+            kw["media"] = drop_voice(did, kw.get("media", d["media"]))
         self._db.update_draft(did, **kw)
+        if changed and any(m.get("source") == "voicecard" for m in d["media"]):
+            # 配音图片：图上写的是旧文案，马上按新文案重画（配音要你点“重新生成图片并配音”）
+            from .agent.runner import drop_source, render_voice_image
+            d = self._db.draft(did)
+            self._db.update_draft(did, media=render_voice_image(self._db, did, d)
+                                  + drop_source(did, d["media"], ("voicecard",)))
         return True
 
     @_api
-    def draft_cards(self, did: int):
-        """按现在的标题、正文和文字卡片重新画卡片图（替换掉原来的卡片图）。"""
-        from .agent.runner import render_cards_for
+    def draft_cards(self, did: int, from_text: bool = True):
+        """重新生成文字卡片（替换掉原来的卡片图）。
+
+        from_text=True（“重新生成文字卡片”按钮）：按正文输入框里现在的全部内容重新分卡片——正文里每一句都在卡片上；
+        from_text=False（“按上面的内容重画”）：按“编辑文字卡片的内容”里写的来画。"""
+        from .agent.runner import drop_source, render_cards_for
+        from .publish.cards import cards_from_text
         d = self._db.draft(did)
         if not d:
             raise ValueError("找不到这个草稿")
+        if d["status"] in ("publishing", "published"):
+            raise ValueError("这个作品已经在发布或已发布，不能再改了")
+        if from_text:
+            if not (d.get("text") or "").strip():
+                raise ValueError("正文还是空的，先写点内容再生成卡片")
+            d["cards"] = cards_from_text(d["text"])
+            self._db.update_draft(did, cards=d["cards"])
         new = render_cards_for(self._db, did, d)
-        others = [m for m in d["media"] if m.get("source") != "card"]
-        self._db.update_draft(did, media=new + others)
+        self._db.update_draft(did, media=new + drop_source(did, d["media"], ("card", "voice", "voicecard")))
         return True
+
+    @_api
+    def draft_set_form(self, did: int, form: str):
+        """换作品的形式：voice 配音图片视频（文案写在一张带桌宠的图上，她读出来）/ cards 图文卡片 /
+        upload 只用你上传的图片或视频。换的时候把上一种形式自动生成的图、配音去掉（你上传的不动）。"""
+        from .agent.runner import FORMS, drop_source, narrate_draft, render_cards_for, render_voice_image
+        from .publish import voice as tts
+        from .publish.cards import cards_from_text
+        if form not in FORMS:
+            raise ValueError("没有这种作品形式")
+        d = self._db.draft(did)
+        if not d:
+            raise ValueError("找不到这个草稿")
+        if d["status"] in ("publishing", "published"):
+            raise ValueError("这个作品已经在发布或已发布，不能再改了")
+        media = drop_source(did, d["media"], ("card", "voice", "voicecard"))
+        self._db.update_draft(did, form=form, media=media)
+        d = self._db.draft(did)
+        has_text = bool((d.get("title") or "").strip() or (d.get("text") or "").strip())
+        voiced = False
+        if form == "voice" and has_text:
+            if tts.available(self._db, self._db.rules()) and len(tts.speech_text(d["title"], d["text"])) >= 4:
+                cost = narrate_draft(self._db, int(did))        # 画那一张图 + 配音 + 合成视频
+                if cost:
+                    self._budget.use("cost", cost)
+                voiced = True
+            else:
+                self._db.update_draft(did, media=render_voice_image(self._db, did, d) + media)
+        elif form == "cards" and has_text:
+            if not d.get("cards") and (d.get("text") or "").strip():
+                d["cards"] = cards_from_text(d["text"])
+                self._db.update_draft(did, cards=d["cards"])
+            self._db.update_draft(did, media=render_cards_for(self._db, did, d) + media)
+        return {"form": form, "voiced": voiced}
 
     # ---------- 文字卡片的背景图库 ----------
     def _backgrounds(self) -> list[dict]:
@@ -541,17 +800,25 @@ class Api:
 
         from .agent.runner import backgrounds_dir
 
+        from .publish import backgrounds as builtin
         folder = backgrounds_dir()
         out = []
+        try:      # 内置的可爱背景：第一次用到时画好放进图库（你删掉过的不再放）
+            builtin.ensure(folder, self._db.get_json("bg_builtin_removed", []))
+        except Exception:  # noqa: BLE001
+            log.warning("内置背景没画出来", exc_info=True)
         if not folder.exists():
             return out
-        for f in sorted(folder.glob("bg_*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)[:40]:
+        files = sorted(folder.glob("bg_*.jpg"), key=lambda p: (builtin.is_builtin(p.name), -p.stat().st_mtime if not
+                                                              builtin.is_builtin(p.name) else 0, p.name))
+        for f in files[:70]:      # 你上传的排前面（新的在前），内置的排后面
             try:
                 im = Image.open(f).convert("RGB")
                 im.thumbnail((150, 200))
                 buf = io.BytesIO()
                 im.save(buf, format="JPEG", quality=78)
-                out.append({"name": f.name, "thumb": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()})
+                out.append({"name": f.name, "label": builtin.LABELS.get(f.name, "你上传的"),
+                            "thumb": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()})
             except Exception:  # noqa: BLE001
                 continue
         return out
@@ -600,7 +867,12 @@ class Api:
             kw["card_panel"] = 1 if panel else 0
         self._db.update_draft(did, **kw)
         d = self._db.draft(did)
-        if d.get("cards") or d.get("title") or any(m.get("source") == "card" for m in d["media"]):
+        if any(m.get("source") == "voicecard" for m in d["media"]):
+            # 配音图片也用这张背景：重画那一张图（旧的配音视频里是旧图，去掉，要重新配）
+            from .agent.runner import drop_source, render_voice_image
+            self._db.update_draft(did, media=render_voice_image(self._db, did, d)
+                                  + drop_source(did, d["media"], ("voicecard", "voice")))
+        elif d.get("cards") or d.get("title") or any(m.get("source") == "card" for m in d["media"]):
             new = render_cards_for(self._db, did, d)
             others = [m for m in d["media"] if m.get("source") != "card"]
             self._db.update_draft(did, media=new + others)
@@ -634,6 +906,10 @@ class Api:
         f = backgrounds_dir() / os.path.basename(str(name or ""))
         if f.exists() and f.name.startswith("bg_"):
             f.unlink()
+            from .publish import backgrounds as builtin
+            if builtin.is_builtin(f.name):      # 内置背景：记下来，以后不再自动放回图库
+                gone = self._db.get_json("bg_builtin_removed", [])
+                self._db.set_json("bg_builtin_removed", sorted(set(gone) | {f.name}))
         rules = self._db.rules()
         if rules.get("card_bg_default") == f.name:
             rules["card_bg_default"] = ""
@@ -913,7 +1189,46 @@ class Api:
 
     @_api
     def about(self):
-        return {"name": APP_NAME, "version": APP_VERSION, "data_dir": str(DATA_DIR)}
+        return {"name": APP_NAME, "version": APP_VERSION, "data_dir": str(DATA_DIR), "oss": OSS_COMPONENTS}
+
+
+# 软件运行时用到的开源组件（开发、打包时才用的工具不在这里）。“关于”里照着这张表显示
+OSS_COMPONENTS = [
+    {"name": "Python", "use": "软件的运行环境", "license": "PSF License", "url": "https://www.python.org/"},
+    {"name": "pywebview", "use": "软件窗口和界面", "license": "BSD-3-Clause", "url": "https://github.com/r0x0r/pywebview"},
+    {"name": "Microsoft Edge WebView2", "use": "显示界面的内核（Windows 自带）", "license": "Microsoft 软件许可",
+     "url": "https://developer.microsoft.com/microsoft-edge/webview2/"},
+    {"name": "pythonnet / clr-loader", "use": "pywebview 在 Windows 上调用 WebView2", "license": "MIT",
+     "url": "https://github.com/pythonnet/pythonnet"},
+    {"name": "bottle / proxy_tools / typing_extensions", "use": "pywebview 的依赖", "license": "MIT / PSF",
+     "url": "https://github.com/bottlepy/bottle"},
+    {"name": "Playwright for Python", "use": "操作她的浏览器（刷视频、评论、私信）", "license": "Apache-2.0",
+     "url": "https://github.com/microsoft/playwright-python"},
+    {"name": "greenlet / pyee", "use": "Playwright 的依赖", "license": "MIT", "url": "https://github.com/python-greenlet/greenlet"},
+    {"name": "Requests", "use": "调用你配置的模型服务商接口", "license": "Apache-2.0", "url": "https://github.com/psf/requests"},
+    {"name": "urllib3 / certifi / idna / charset-normalizer", "use": "Requests 的依赖", "license": "MIT / MPL-2.0 / BSD",
+     "url": "https://github.com/urllib3/urllib3"},
+    {"name": "Pillow", "use": "头像、文字卡片、桌宠图片处理", "license": "MIT-CMU（HPND）", "url": "https://github.com/python-pillow/Pillow"},
+    {"name": "NumPy", "use": "桌宠形象的抠图和拆部件", "license": "BSD-3-Clause", "url": "https://github.com/numpy/numpy"},
+    {"name": "ONNX Runtime", "use": "桌宠换形象时在本机抠图", "license": "MIT", "url": "https://github.com/microsoft/onnxruntime"},
+    {"name": "anime-segmentation（isnetis 模型）", "use": "抠图模型", "license": "Apache-2.0",
+     "url": "https://github.com/SkyTNT/anime-segmentation"},
+    {"name": "faster-whisper", "use": "听视频里的声音（语音转文字）", "license": "MIT", "url": "https://github.com/SYSTRAN/faster-whisper"},
+    {"name": "OpenAI Whisper（模型）", "use": "语音识别模型", "license": "MIT", "url": "https://github.com/openai/whisper"},
+    {"name": "CTranslate2", "use": "在本机运行 Whisper 模型", "license": "MIT", "url": "https://github.com/OpenNMT/CTranslate2"},
+    {"name": "PyAV（FFmpeg）", "use": "读取视频里的声音", "license": "BSD-3-Clause（FFmpeg：LGPL）", "url": "https://github.com/PyAV-Org/PyAV"},
+    {"name": "tokenizers / huggingface_hub", "use": "Whisper 的分词和模型下载", "license": "Apache-2.0",
+     "url": "https://github.com/huggingface/tokenizers"},
+    {"name": "imageio-ffmpeg", "use": "听视频声音、给作品配音时调用 ffmpeg", "license": "BSD-2-Clause",
+     "url": "https://github.com/imageio/imageio-ffmpeg"},
+    {"name": "FFmpeg（独立程序）", "use": "解出视频里的声音；把她读文案的声音和文字卡片合成视频", "license": "LGPL / GPL",
+     "url": "https://ffmpeg.org/"},
+    {"name": "Breeze TTS 2（BreezeBlue 的在线服务）", "use": "她的声音：语音合成（需要你自己的 Key，声音在对方服务器上生成）",
+     "license": "在线服务按 BreezeBlue 的条款；商用需要付费订阅", "url": "https://breezeblue.ai/"},
+    {"name": "SQLite", "use": "保存人设、记忆、记录（Python 自带）", "license": "Public Domain", "url": "https://www.sqlite.org/"},
+    {"name": "站酷快乐体 ZCOOL KuaiLe", "use": "界面和文字卡片的字体", "license": "SIL Open Font License 1.1",
+     "url": "https://github.com/googlefonts/zcool-kuaile"},
+]
 
 
 def _png_url(img, max_side: int = 0) -> str:
@@ -925,14 +1240,21 @@ def _png_url(img, max_side: int = 0) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def _parse_cards(text: str) -> list:
-    """文字卡片的编辑格式：每张卡片一段（空行分隔），第一行是小标题，后面每行一句。"""
+def _parse_cards(text: str) -> list[dict]:
+    """把编辑框里的文字变回卡片：空一行隔开每张卡片；想要小标题就把它写在第一行、后面每行一句；
+    第一行写一个“-”表示这张没有小标题；一张卡片只有一行，就是一句话的卡片（没有小标题）。"""
+    from .publish.cards import MAX_CARDS, MAX_LINES
     cards = []
-    for block in str(text or "").replace("\r", "").split("\n\n"):
-        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
-        if lines:
-            cards.append({"title": lines[0][:16], "lines": [ln[:24] for ln in lines[1:5]]})
-    return cards[:4]
+    for block in re.split(r"\n\s*\n", (text or "").strip()):
+        rows = [r.strip() for r in block.splitlines() if r.strip()]
+        if not rows:
+            continue
+        if len(rows) == 1:
+            cards.append({"title": "", "lines": [rows[0][:80]]})
+        else:
+            title = "" if rows[0] in ("-", "－", "—") else rows[0][:20]
+            cards.append({"title": title, "lines": [r[:60] for r in rows[1:MAX_LINES + 1]]})
+    return cards[:MAX_CARDS]
 
 
 def _open_folder(path) -> None:

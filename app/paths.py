@@ -10,7 +10,9 @@
     <安装目录>/data/debug/         调试用的页面截图和 HTML
     <安装目录>/data/drafts/        作品草稿的图片和视频
     <安装目录>/data/pet/           你上传的桌宠形象
-    <安装目录>/data/models/        抠图模型（第一次用时下载）
+    <安装目录>/data/stickers/      她发过的表情包（只留最近 60 张）
+    <安装目录>/_internal/assets/models/whisper/  安装包自带的语音模型（base）
+    <安装目录>/data/models/        抠图模型、其他大小的语音模型（第一次用时下载）
 """
 from __future__ import annotations
 
@@ -70,6 +72,7 @@ SELECTORS_FILE = DATA_DIR / "selectors.json"
 SESSION_FILE = DATA_DIR / "douyin_session.bin"  # 抖音登录状态的加密备份（退出登录时删除）
 DRAFTS_DIR = DATA_DIR / "drafts"      # 作品草稿的图片 / 视频（每个草稿一个文件夹）
 PET_DIR = DATA_DIR / "pet"            # 你上传的桌宠形象（抠好的图、拆好的部件）
+STICKER_DIR = DATA_DIR / "stickers"   # 她发过的表情包（自动清理旧的）
 MODELS_DIR = DATA_DIR / "models"      # 第一次用时下载的模型（抠图）
 WEB_DIR = resource_root() / "web"
 ASSETS_DIR = resource_root() / "assets"
@@ -77,5 +80,5 @@ FONT_FILE = WEB_DIR / "assets" / "fonts" / "ZCOOLKuaiLe-Regular.ttf"
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, AVATAR_DIR, PROFILE_DIR, LOG_DIR, DEBUG_DIR, FRAMES_DIR, DRAFTS_DIR, PET_DIR, MODELS_DIR):
+    for d in (DATA_DIR, AVATAR_DIR, PROFILE_DIR, LOG_DIR, DEBUG_DIR, FRAMES_DIR, DRAFTS_DIR, PET_DIR, MODELS_DIR, STICKER_DIR):
         d.mkdir(parents=True, exist_ok=True)

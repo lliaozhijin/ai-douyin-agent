@@ -25,6 +25,8 @@ const S = {
   hist: { day: "", group: "", page: 1, data: null },  // 历史记录页
   st: null,
   msgFilter: "all",
+  mem: { tab: "events", q: "", person: "", data: null },   // 记忆页
+  about: null,
   msgs: [],
   counts: {},
   selMsg: null,
@@ -60,10 +62,11 @@ const ICON = {
   pet: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="9" r="5"/><path d="M8 14l-2 7M16 14l2 7M9 21h6"/><circle cx="10.2" cy="8.5" r=".6" fill="currentColor"/><circle cx="13.8" cy="8.5" r=".6" fill="currentColor"/></svg>',
   history: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 7v5l3 2"/></svg>',
   logo: '<span class="logo-word">Rain</span>',
+  memory: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3V4z"/><path d="M5 17a3 3 0 0 1 3-3h11"/><path d="M9 8h6"/></svg>',
   check: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>',
 };
 const PAGES = [
-  ["dashboard", "仪表盘"], ["history", "历史记录"], ["inbox", "消息中心"], ["drafts", "作品"], ["persona", "人设"], ["pet", "桌宠"],
+  ["dashboard", "仪表盘"], ["history", "历史记录"], ["inbox", "消息中心"], ["memory", "记忆"], ["drafts", "作品"], ["persona", "人设"], ["pet", "桌宠"],
   ["models", "模型与 API Key"], ["rules", "规则与预算"], ["settings", "设置"],
 ];
 
@@ -190,7 +193,7 @@ function renderSide() {
 const EVENT_PILL = {
   like: ["brand", "点赞"], collect: ["brand", "收藏"], comment: ["brand", "点赞 + 评论"], reply_at: ["ok", "回复 @"], reply_dm: ["ok", "回复私信"],
   comment_like: ["brand", "赞评论"], comment_reply: ["ok", "回复评论"], thread_reply: ["ok", "接着聊"],
-  at_friend: ["brand", "@好友"], publish_wish: ["warn", "想发作品"], published: ["ok", "发布作品"],
+  at_friend: ["brand", "@好友"], sticker: ["brand", "表情包"], owner_chat: ["ok", "找主人聊天"], owner_share: ["ok", "分享给主人"], publish_wish: ["warn", "想发作品"], published: ["ok", "发布作品"],
   skip: ["neutral", "划走"], pause: ["bad", "暂停"], info: ["neutral", "提示"], error: ["bad", "出错"],
 };
 
@@ -506,50 +509,84 @@ async function loadMessages() {
   const d = await call("get_messages", S.msgFilter);
   S.msgs = d.items;
   S.counts = d.counts;
+  S.keepDays = d.comment_keep_days || 5;
   if (S.selMsg && !S.msgs.find((m) => m.id === S.selMsg)) S.selMsg = null;
   if (!S.selMsg && S.msgs.length) S.selMsg = S.msgs[0].id;
 }
 
 const KIND_TEXT = { at: "评论里 @ 了她", reply: "回复了她的评论", dm: "私信" };
 
+/* 同一个人的消息合成一组，不管是私信还是评论区：左边每人只有一个框（显示最新的一条），
+   右边按时间显示和 TA 的来回，每一条标着是私信、评论里 @ 她，还是回复她的评论 */
+function msgGroups() {
+  const groups = new Map();
+  for (const m of S.msgs) {          // S.msgs 是新的在前
+    const key = m.user_name || "";
+    if (!groups.has(key)) groups.set(key, { key, dm: false, cmt: false, owner: null, who: null, items: [] });
+    const g = groups.get(key);
+    g.items.push(m);
+    if (m.kind === "dm") g.dm = true; else g.cmt = true;
+    if (m.owner !== null && m.owner !== undefined && g.owner === null) g.owner = m.owner;
+    if (!g.who && m.user) g.who = m;   // 读到过 TA 的头像、昵称的那一条
+  }
+  return Array.from(groups.values());
+}
+const groupWhere = (g) => (g.dm && g.cmt ? "私信 + 评论区" : g.dm ? "私信" : "评论区");
+
 function renderInbox() {
   const c = S.counts || {};
   const tabs = [["all", "全部", c.all_count], ["at", "评论区", c.at_count], ["dm", "私信", c.dm_count],
     ["pending", "待你处理", c.pending_count], ["skipped", "已跳过", c.skipped_count]]
     .map(([k, l, n]) => `<button type="button" role="tab" aria-selected="${S.msgFilter === k}" data-act="msg-filter" data-f="${k}">${l} · ${n || 0}</button>`).join("");
-  const list = S.msgs.length ? S.msgs.map((m) => {
-    const [cls, label] = MSG_STATUS[m.status] || ["neutral", m.status];
-    return `<button type="button" class="msg-item" data-act="msg-sel" data-id="${m.id}" ${S.selMsg === m.id ? 'aria-current="true"' : ""}>
-      ${userAvatar(m)}
+  const groups = msgGroups();
+  const m = S.msgs.find((x) => x.id === S.selMsg);
+  const cur = m ? groups.find((g) => g.items.includes(m)) : null;
+  const list = groups.length ? groups.map((g) => {
+    const top = g.items[0];
+    const pend = g.items.filter((x) => x.status === "pending").length;
+    const [cls, label] = MSG_STATUS[top.status] || ["neutral", top.status];
+    return `<button type="button" class="msg-item" data-act="msg-sel" data-id="${top.id}" ${cur === g ? 'aria-current="true"' : ""}>
+      ${userAvatar(g.who || top)}
       <span style="display:flex;flex-direction:column;gap:4px;min-width:0;flex:1">
-        <span class="who"><b>@${esc(displayName(m))} · ${KIND_TEXT[m.kind] || "私信"}</b><span>${esc(hhmm(m.created_at))}</span></span>
-        ${m.user && m.user.douyin_id ? `<span class="txt">抖音号：${esc(m.user.douyin_id)}</span>` : ""}
-        <span class="txt">“${esc((m.content || "").slice(0, 60))}”</span>
-        <span class="pill ${cls}" style="align-self:flex-start">${label}</span>
+        <span class="who"><b>@${esc(displayName(g.who || top))}${g.owner !== null ? " · 主人" : ""} · ${groupWhere(g)}</b><span>${esc(hhmm(top.created_at))}</span></span>
+        <span class="txt">${top.kind === "dm" ? "" : "［评论区］"}“${esc((top.content || "").slice(0, 60))}”</span>
+        <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <span class="pill ${cls}">${label}</span>
+          ${g.items.length > 1 ? `<span class="pill neutral">共 ${g.items.length} 条</span>` : ""}
+          ${pend ? `<span class="pill warn">${pend} 条待处理</span>` : ""}
+        </span>
       </span></button>`;
   }).join("") : `<p class="empty">还没有消息</p>`;
 
-  const m = S.msgs.find((x) => x.id === S.selMsg);
-  let detail = `<p class="empty">选一条消息看看</p>`;
-  if (m) {
+  let detail = `<p class="empty">选一个人看看</p>`;
+  if (m && cur) {
     const [cls, label] = MSG_STATUS[m.status] || ["neutral", m.status];
+    // 最近的来回，旧的在上、新的在下；点一条可以对那一条做操作
+    const SHOWN = 100;
+    const who = cur.who || m;
+    const talk = cur.items.slice(0, SHOWN).reverse().map((x) => {
+      const [c2, l2] = MSG_STATUS[x.status] || ["neutral", x.status];
+      return `
+        <div class="talk-turn ${x.id === m.id ? "sel" : ""}">
+          <button type="button" class="talk-meta" data-act="msg-sel" data-id="${x.id}">${esc(x.created_at.slice(5, 16))} · ${KIND_TEXT[x.kind] || "私信"}${x.video_title ? ` · 视频：${esc(x.video_title.slice(0, 24))}` : ""} <span class="pill ${c2}">${l2}</span></button>
+          <div class="them">${userAvatar(x.user ? x : who, 36)}<div class="bubble">${esc(x.content)}</div></div>
+          ${x.reply ? `<div class="me">${avatar(36)}<div class="bubble">${esc(x.reply)}</div></div>` : ""}
+        </div>`;
+    }).join("");
     detail = `
-      <div class="actions" style="justify-content:space-between"><h2>${HEART}@${esc(displayName(m))} ${{ at: "在评论里 @ 了她", reply: "回复了她的评论" }[m.kind] || "发来私信"}</h2><span class="pill ${cls}">${label}</span></div>
-      ${m.kind === "dm" ? `
+      <div class="actions" style="justify-content:space-between"><h2>${HEART}和 @${esc(displayName(who))} 的${cur.dm && cur.cmt ? "私信和评论区对话" : cur.dm ? "私信" : "评论区对话"}</h2><span class="pill neutral">${cur.items.length > SHOWN ? `最近 ${SHOWN} 条（共 ${cur.items.length} 条）` : `共 ${cur.items.length} 条`}</span></div>
       <div class="u-card">
-        ${userAvatar(m, 56)}
+        ${userAvatar(who, 56)}
         <div class="u-info">
-          <b>${esc(displayName(m))}</b>
-          <span>抖音号：${esc((m.user && m.user.douyin_id) || "还没读到")}</span>
-          <span>私信列表里的名字：${esc(m.user_name)} · ${followText(m.user)}</span>
+          <b>${esc(displayName(who))}${cur.owner !== null ? `（主人${cur.owner ? "，她叫 TA “" + esc(cur.owner) + "”" : ""}）` : ""}</b>
+          ${cur.dm ? `<span>抖音号：${esc((who.user && who.user.douyin_id) || "还没读到")}</span>
+          <span>私信列表里的名字：${esc(m.user_name)} · ${followText(who.user)}</span>` : `<span>只在评论区聊过，还没有私信</span>`}
         </div>
-        ${m.user && m.user.url ? `<button type="button" class="btn btn-sm" data-act="open-video" data-url="${esc(m.user.url)}">打开主页</button>` : ""}
-      </div>` : ""}
-      ${m.video_title ? `<div style="padding:12px 14px;background:var(--bubble-them);border-radius:16px">视频：${esc(m.video_title)}</div>` : ""}
-      <div class="chat">
-        <div class="them">${userAvatar(m, 40)}<div class="bubble">${esc(m.content)}</div></div>
-        ${m.reply ? `<div class="me">${avatar(40)}<div class="bubble">${esc(m.reply)}</div></div>` : ""}
+        ${who.user && who.user.url ? `<button type="button" class="btn btn-sm" data-act="open-video" data-url="${esc(who.user.url)}">打开主页</button>` : ""}
+        <button type="button" class="btn btn-sm" data-act="mem-person" data-name="${esc(m.user_name)}">她对 TA 的记忆</button>
       </div>
+      <div class="chat talk" id="talk-box">${talk}</div>
+      <p class="hint" style="margin:0">下面的操作针对选中的这一条（${esc(m.created_at.slice(5, 16))}，<span class="pill ${cls}">${label}</span>）；点上面某一条的时间可以换一条。</p>
       ${m.reason ? `<p style="margin:0;color:var(--warn-text)">${m.status === "replied" ? "" : "没有自动发出："}${esc(m.reason)}</p>` : ""}
       <dl class="meta">
         <div><dt>类型</dt><dd>${{ at: "评论 @", reply: "回复她的评论" }[m.kind] || "私信"}</dd></div>
@@ -566,13 +603,84 @@ function renderInbox() {
       </div>`;
   }
   $("#main").innerHTML = `
-    <header class="page-head"><div><h1>消息中心</h1><p>谁 @ 了她、谁给她发了私信，她是怎么回的，都在这里</p></div>
+    <header class="page-head"><div><h1>消息中心</h1><p>谁 @ 了她、谁给她发了私信，她是怎么回的，都在这里。同一个人的私信和评论区消息合在一个框里。私信记录一直保留；评论区的记录，和这个人 ${S.keepDays || 5} 天没有新一轮对话就自动删除</p></div>
       <button type="button" class="btn" data-act="check-inbox">立即检查新消息</button></header>
     <div class="tabs" role="tablist" aria-label="筛选">${tabs}</div>
     <div class="row">
-      <section class="card msg-list grow-2" aria-label="消息列表">${list}</section>
+      <section class="card msg-list grow-2" aria-label="消息列表（每人一条）">${list}</section>
       <section class="card grow-3">${detail}</section>
     </div>`;
+  const box = $("#talk-box"); if (box) box.scrollTop = box.scrollHeight;
+}
+
+/* ---------- 记忆 ---------- */
+const MEM_KIND = { video: "看过的视频", dm: "私信", thread: "评论区", at: "被 @", post: "发作品", note: "你告诉她的" };
+const IMPORTANCE = [[1, "1 · 小事"], [2, "2"], [3, "3 · 一般"], [4, "4"], [5, "5 · 重要（永远不忘）"]];
+
+async function loadMemory() {
+  S.mem.data = await call("get_memory", S.mem.tab, S.mem.q, S.mem.person);
+}
+
+function renderMemory() {
+  const d = S.mem.data || {};
+  const tabs = [["events", "具体的事"], ["people", "私信好友"], ["diary", "日记"]]
+    .map(([k, l]) => `<button type="button" role="tab" aria-selected="${S.mem.tab === k}" data-act="mem-tab" data-t="${k}">${l}</button>`).join("");
+  let body = "";
+  if (S.mem.tab === "events") {
+    const rows = (d.events || []).map((r) => `
+      <tr>
+        <td style="white-space:nowrap;color:var(--muted)">${esc(r.day.slice(5))}<br>${esc(MEM_KIND[r.kind] || r.kind)}</td>
+        <td>${esc(r.summary)}${r.person ? `<br><small style="color:var(--muted)">和 ${esc(r.person)} 有关</small>` : ""}</td>
+        <td style="white-space:nowrap">${r.kept ? `<span class="pill ok">不会忘</span>` : `<span class="pill ${r.now < 0.5 ? "warn" : "neutral"}">强度 ${r.now}</span>`}<br><small style="color:var(--muted)">想起 ${r.recalls} 次 · 半衰期 ${Math.round(r.half_life)} 天</small></td>
+        <td><label class="sr-only" for="imp-${r.id}">重要程度</label><select id="imp-${r.id}" class="input mem-imp" data-id="${r.id}" style="min-width:150px">${IMPORTANCE.map(([v, l]) => `<option value="${v}" ${r.importance === v ? "selected" : ""}>${l}</option>`).join("")}</select></td>
+        <td><button type="button" class="btn btn-sm btn-danger" data-act="mem-del" data-id="${r.id}">删除</button></td>
+      </tr>`).join("");
+    body = `
+      <section class="card"><h2>${HEART}她记得的事${S.mem.person ? `（和 ${esc(S.mem.person)} 有关的）` : ""}</h2>
+        <p class="hint" style="margin:0">一共 ${d.total || 0} 条。每条记忆的强度每 ${d.half_life || 30} 天减半；被想起一次，强度回升、半衰期变长。强度低于 ${d.forget_below || 0.25} 就会忘掉（细节删除，只留在当天的日记里）。重要程度设成 5 的、和主人有关的永远不忘。</p>
+        <div class="actions">
+          <label class="sr-only" for="mem-q">搜索记忆</label><input id="mem-q" class="input" style="max-width:260px" placeholder="搜一搜，比如 橘猫" value="${esc(S.mem.q)}">
+          <button type="button" class="btn btn-sm" data-act="mem-search">搜索</button>
+          ${S.mem.person || S.mem.q ? `<button type="button" class="btn btn-sm" data-act="mem-clear">看全部</button>` : ""}
+        </div>
+        <div class="actions"><label class="sr-only" for="mem-note">告诉她一件要记住的事</label><input id="mem-note" class="input" placeholder="告诉她一件要一直记住的事，比如：我喜欢橘猫，不吃香菜">
+          <button type="button" class="btn btn-sm" data-act="mem-note">让她记住</button></div>
+        ${rows ? `<div class="table-wrap"><table class="oss-table mem-table"><thead><tr><th>哪天</th><th>内容</th><th>记得多牢</th><th>重要程度</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="empty">还没有记忆。她刷视频、回私信之后，这里会慢慢多起来</p>`}
+      </section>`;
+  } else if (S.mem.tab === "people") {
+    const cards = (d.people || []).map((p) => `
+      <section class="card">
+        <div class="actions" style="justify-content:space-between"><h2>${HEART}${esc(p.name)}${p.owner ? ` <span class="pill ok">主人</span>` : ""}</h2><span style="color:var(--muted)">聊过 ${p.chats} 次 · ${p.n} 条记忆 · 上次 ${esc((p.last_at || "").slice(5, 16))}</span></div>
+        ${p.card ? `<p style="margin:0">${esc(p.card)}</p>` : `<p style="margin:0;color:var(--muted)">还没整理出印象（再聊几次会自动整理，也可以点“现在整理”）</p>`}
+        <dl class="meta">
+          <div><dt>说话风格</dt><dd>${esc(p.style || "—")}</dd></div>
+          <div><dt>常聊的话题</dt><dd>${esc(p.topics || "—")}</dd></div>
+          <div><dt>要记住的事</dt><dd>${esc(p.facts || "—")}</dd></div>
+        </dl>
+        <div class="actions">
+          <button type="button" class="btn btn-sm" data-act="mem-person" data-name="${esc(p.name)}">看和 TA 有关的记忆</button>
+          <button type="button" class="btn btn-sm" data-act="mem-card" data-name="${esc(p.name)}">现在整理印象</button>
+          <button type="button" class="btn btn-sm btn-danger" data-act="mem-forget" data-name="${esc(p.name)}">忘掉这个人</button>
+        </div>
+      </section>`).join("");
+    body = `<p class="hint" style="margin:0">只有和她私信聊过的人才有印象卡。评论区里的人不建卡：她只记那一串评论和那个视频的上下文，过几天就淡了。</p>
+      ${cards || `<section class="card"><p class="empty">还没有私信好友</p></section>`}`;
+  } else {
+    const LV = { day: "日记", week: "周记", month: "月记" };
+    const items = (d.diary || []).map((x) => `
+      <section class="card">
+        <div class="actions" style="justify-content:space-between"><h2>${HEART}${esc(x.period)} · ${LV[x.level] || x.level}${x.mood ? ` · ${esc(x.mood)}` : ""}</h2>
+          <button type="button" class="btn btn-sm btn-danger" data-act="mem-diary-del" data-id="${x.id}">删除</button></div>
+        <p style="margin:0;line-height:1.9;white-space:pre-wrap">${esc(x.content)}</p>
+      </section>`).join("");
+    body = `<p class="hint" style="margin:0">她每天写一篇大约 500 字的日记（同一件事只写一次）。过完的一周合并成周记，过完的一个月合并成月记；一个多月以前的日记只留周记，半年以前的只留月记。</p>
+      ${items || `<section class="card"><p class="empty">还没有日记。过完一天（或者当天活跃时段结束后）她会自己写</p></section>`}`;
+  }
+  $("#main").innerHTML = `
+    <header class="page-head"><div><h1>记忆</h1><p>她记得什么、对谁有什么印象、每天写了什么日记。你可以删掉某条记忆、调整它有多重要，或者让她忘掉某个人</p></div></header>
+    <div class="tabs" role="tablist" aria-label="记忆分类">${tabs}</div>
+    ${body}`;
+  const q = $("#mem-q"); if (q) q.addEventListener("keydown", (e) => { if (e.key === "Enter") ACT["mem-search"](); });
 }
 
 /* ---------- 人设 ---------- */
@@ -580,7 +688,13 @@ const TRAITS = [
   ["energy", "性子", "安安静静", "元气满满"], ["sharp", "说话风格", "软萌温柔", "小嘴犀利"],
   ["talkative", "话多不多", "一两句", "一大段"], ["cute", "撒娇程度", "正经", "超可爱，带颜文字 (｡･ω･｡)ﾉ♡"],
   ["temper", "小脾气", "温顺好脾气", "动不动闹小脾气"], ["volatility", "情绪起伏", "情绪稳定", "喜怒都写在脸上"],
+  ["humor", "幽默感", "一本正经", "爱玩梗抖机灵"], ["curious", "好奇心", "随缘不多问", "什么都想问"],
+  ["confident", "自信", "害羞内向", "自信大方"], ["empathy", "共情", "理性冷静", "感性体贴"],
+  ["clingy", "黏人", "独立", "黏人、想被关注"],
 ];
+const CATCH_FREQ = [["often", "经常"], ["sometimes", "偶尔"], ["rare", "少"]];
+const EMOTES = [["auto", "跟着撒娇程度走"], ["kaomoji", "颜文字 (≧▽≦)"], ["emoji", "emoji 表情"], ["none", "不用表情"]];
+const MBTI = ["", "INFP", "ENFP", "INFJ", "ENFJ", "INTP", "ENTP", "INTJ", "ENTJ", "ISFP", "ESFP", "ISFJ", "ESFJ", "ISTP", "ESTP", "ISTJ", "ESTJ"];
 const INTEREST_OPTIONS = ["户外旅行", "甜品美食", "穿搭", "萌宠", "数码", "手账文具", "美妆", "音乐", "游戏", "摄影剪辑", "健身", "读书"];
 
 function renderPersona() {
@@ -620,7 +734,7 @@ function renderPersona() {
           </div>
           <div class="field"><label for="p-signature">个性签名</label>
             <input id="p-signature" class="input" maxlength="80" value="${esc(p.signature)}">
-            <small>显示在侧边栏。点“同步到抖音简介”会自动加上 AI 标识：${esc(p.douyin_bio_preview || "")}</small></div>
+            <small>显示在侧边栏。点“同步到抖音简介”会自动加上 AI 标识（只在主页简介里，她说话时不带这几个字）：${esc(p.douyin_bio_preview || "")}</small></div>
           <div class="actions"><button type="button" class="btn btn-sm" data-act="sync-sig">同步到抖音简介</button></div>
         </section>
         <section class="card"><h2>${HEART}基本信息</h2>
@@ -628,20 +742,33 @@ function renderPersona() {
           <div class="field"><label for="p-bio">一句话简介</label><input id="p-bio" class="input" value="${esc(p.bio)}"></div>
         </section>
         <section class="card"><h2>${HEART}性格</h2>
-          <p class="hint" style="margin:0">拖动滑块，自己调她的性格；兴趣、口头禅和悄悄话也都可以随意改。</p>
+          <p class="hint" style="margin:0">先选一个性格底色，再拖滑块细调；兴趣、口头禅和自定义身份提示词也都可以随意改。只要这些设定还在，不管什么时候、在哪里和她说话，她都是同一个她。</p>
+          <div class="field"><span class="label">性格底色（单选，再点一下取消）</span>
+            <div class="chips">${(p.archetypes || []).map((a) => `<button type="button" class="chip" aria-pressed="${p.archetype === a.id}" data-act="archetype" data-v="${esc(a.id)}" title="${esc(a.desc)}">${esc(a.name)}</button>`).join("")}</div></div>
+          <div class="grid">
+            <div class="field"><label for="p-self">怎么称呼自己</label>
+              <input id="p-self" class="input" maxlength="6" list="self-names" value="${esc(p.self_name || "我")}"><datalist id="self-names">${(p.self_names || []).map((n) => `<option value="${esc(n)}">`).join("")}</datalist></div>
+            <div class="field"><label for="p-emote">表情习惯</label>
+              <select id="p-emote" class="input">${EMOTES.map(([k, l]) => `<option value="${k}" ${(p.emote || "auto") === k ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+            <div class="field"><label for="p-mbti">MBTI（可以不选）</label>
+              <select id="p-mbti" class="input">${MBTI.map((m) => `<option value="${m}" ${(p.mbti || "") === m ? "selected" : ""}>${m || "不选"}</option>`).join("")}</select></div>
+          </div>
           <div class="grid">${traits}</div>
           <div class="field"><span class="label">她感兴趣的内容（刷到这些更愿意停下来看）</span><div class="chips">${chips}</div>
             <div class="actions"><input id="new-interest" class="input" style="max-width:220px" placeholder="自定义兴趣"><button type="button" class="btn btn-sm" data-act="add-interest">+ 添加</button></div></div>
           <div class="grid">
-            <div class="field"><label for="p-catch">口头禅（偶尔用）</label><input id="p-catch" class="input" value="${esc(p.catchphrases)}"></div>
+            <div class="field"><label for="p-catch">口头禅</label><input id="p-catch" class="input" value="${esc(p.catchphrases)}"></div>
+            <div class="field"><label for="p-catchf">口头禅用得多不多</label>
+              <select id="p-catchf" class="input">${CATCH_FREQ.map(([k, l]) => `<option value="${k}" ${(p.catch_freq || "sometimes") === k ? "selected" : ""}>${l}</option>`).join("")}</select></div>
             <div class="field"><label for="p-avoid">不喜欢 / 不评论的内容</label><input id="p-avoid" class="input" value="${esc(p.avoid)}"></div>
           </div>
-          <div class="field"><label for="p-extra">悄悄话（会直接告诉模型）</label><textarea id="p-extra" class="input" rows="3">${esc(p.extra)}</textarea></div>
+          <div class="field"><label for="p-extra">自定义身份提示词</label><textarea id="p-extra" class="input" rows="5" maxlength="1500" placeholder="给她再加一些更鲜明的特点，比如：说话爱用叠词；看到猫就走不动道；讨厌香菜；喜欢先夸一个具体的小细节再提问……">${esc(p.extra)}</textarea>
+            <small>这段话会原样写进她的身份里，每次说话都带着。写得越具体，她的个性越鲜明。</small></div>
         </section>
         <section class="card" style="flex-direction:row;align-items:flex-start;gap:14px">
           <input type="checkbox" checked disabled id="ai-flag" style="margin-top:2px">
           <div><label for="ai-flag" style="font-weight:700">公开 AI 身份（固定开启）</label>
-          <p style="margin:6px 0 0;color:var(--muted);line-height:1.7">有人问“你是不是真人”，她会如实回答自己是 AI；同步到抖音的简介会带上 AI 标识。这是抖音规则和国家 AI 内容标识的要求，关不掉哦。</p></div>
+          <p style="margin:6px 0 0;color:var(--muted);line-height:1.7">她平时说话不会把“AI虚拟人”挂在嘴边；但有人认真问“你是不是真人”，她会如实回答自己是 AI；同步到抖音的简介会带上 AI 标识。这是抖音规则和国家 AI 内容标识的要求，关不掉哦。</p></div>
         </section>
       </div>
       <section class="card grow-2"><h2>${HEART}和她聊两句试试</h2>
@@ -665,6 +792,8 @@ function collectPersona() {
     name: $("#p-name").value.trim(), bio: $("#p-bio").value.trim(),
     signature: $("#p-signature").value.trim(), catchphrases: $("#p-catch").value.trim(),
     avoid: $("#p-avoid").value.trim(), extra: $("#p-extra").value.trim(),
+    archetype: p.archetype || "", self_name: $("#p-self").value.trim() || "我", emote: $("#p-emote").value,
+    mbti: $("#p-mbti").value, catch_freq: $("#p-catchf").value,
     interests: p.interests || [],
     traits: Object.fromEntries(TRAITS.map(([k]) => [k, Number($("#t-" + k).value)])),
   };
@@ -826,10 +955,10 @@ function renderRules() {
           </div></section>
         <section class="card"><h2>${HEART}回复规则</h2>
           <h3 class="sub-h">刷视频时</h3>
-          <div class="toggle-row"><label for="r-liketd">点赞倾向<span class="hint" style="display:block;margin:2px 0 0">和她最近看过的视频比，只赞最出挑的那部分；推荐页全是喜欢的内容时也不会见一个赞一个。赞别人的评论也跟着这一档（看了的视频都会看评论区，视频没赞也照样评论、赞评论）</span></label>
-            <select id="r-liketd" class="input" style="max-width:260px">
-              ${[["picky", "挑剔：只赞最喜欢的约 15%"], ["normal", "适中：约 25%（推荐）"], ["generous", "大方：约 40%"]].map(([k, v]) => `<option value="${k}" ${(r.like_tendency || "normal") === k ? "selected" : ""}>${v}</option>`).join("")}
-            </select></div>
+          <p class="hint" style="margin:0">点不点赞、评不评论、收不收藏，由她按自己的性格、兴趣和记忆判断（人设页里调）；这里的每日上限会按活跃时段匀着用。同一个视频她只评论一次。</p>
+          <label class="toggle-row"><span>听视频里的声音（把说的话、唱的词转成文字一起判断；浏览器是静音播放的，不会吵到你）<span class="hint" style="display:block;margin:2px 0 0">${listenHint(r)}</span></span><input id="r-listen" type="checkbox" ${r.listen_enabled !== false ? "checked" : ""}></label>
+          <div class="toggle-row"><label for="r-lmodel">语音模型</label>
+            <select id="r-lmodel" class="input" style="max-width:260px">${[["tiny", "tiny：最快（约 75MB）"], ["base", "base：推荐（约 145MB）"], ["small", "small：最准、最慢（约 480MB）"]].map(([k, v]) => `<option value="${k}" ${(r.listen_model || "base") === k ? "selected" : ""}>${v}</option>`).join("")}</select></div>
           <label class="toggle-row"><span>刷到广告直接划走（不看、不点赞、不评论，也不花模型的钱）</span><input id="r-ads" type="checkbox" ${r.skip_ads !== false ? "checked" : ""}></label>
           <label class="toggle-row"><span>刷到特别喜欢、想以后再看的视频时收藏（她自己决定收不收）</span><input id="r-col" type="checkbox" ${r.collect_enabled !== false ? "checked" : ""}></label>
           <label class="toggle-row"><span>刷视频时给喜欢的评论点赞、回复别人的评论</span><input id="r-cm" type="checkbox" ${r.engage_comments !== false ? "checked" : ""}></label>
@@ -859,22 +988,27 @@ function renderRules() {
           <label class="toggle-row"><span>有人回复她的评论时，接着回复</span><input id="r-th" type="checkbox" ${r.auto_reply_thread !== false ? "checked" : ""}></label>
           <div class="toggle-row"><label for="r-thmax">同一条评论下，她最多回复几次</label><input id="r-thmax" type="number" min="1" max="20" class="input" style="max-width:120px" value="${r.thread_max_replies ?? 3}"></div>
           <div class="toggle-row"><label for="r-thday">每天最多接着聊（条）</label><input id="r-thday" type="number" min="0" class="input" style="max-width:120px" value="${r.limits.thread_replies ?? 20}"></div>
-          <p class="hint">回到上限时，最后一句她会自然地收个尾（比如“聊得好开心～”），之后这串对话就不再回了。对方说了敏感的话会直接停。</p>
+          <p class="hint">回到上限时，最后一句她会自然地收个尾（比如“聊得好开心～”），之后这串对话就不再回了。评论区里她不记人，只记这一串评论和这个视频的上下文。</p>
           <div class="toggle-row"><label for="r-per">同一个人每天最多回复</label><input id="r-per" type="number" min="1" class="input" style="max-width:120px" value="${r.per_user_daily}"></div>
         </section>
         ${friendsSection(r)}
+        ${ownersSection(r)}
       </div>
       <div class="col grow-1">
-        <section class="card"><h2>${HEART}敏感话题（碰到就不回）</h2>
-          <p class="hint">先用关键词快速过滤，再让模型判断一次意思，两道都过才会发出去。点一下可以开关，鼠标停留能看到关键词。</p>
+        <section class="card"><h2>${HEART}敏感话题</h2>
+          <label class="toggle-row"><span>聊到敏感话题时，直接告诉对方为什么不聊<span class="hint" style="display:block;margin:2px 0 0">开：对方的话里出现下面选中话题的关键词，她直接回一句“这个话题涉及××，我不方便聊”，不走模型。关：照常让她回复（发出去之前的安全检查还在）。对主人不做这一步。</span></span><input id="r-sg" type="checkbox" ${r.sensitive_guard !== false ? "checked" : ""}></label>
           <div class="chips">${topics}</div>
-          <div class="field"><label for="r-kw">自定义屏蔽词（用逗号分隔）</label><textarea id="r-kw" class="input" rows="3">${esc((r.keywords || []).join(", "))}</textarea></div>
-          <fieldset style="margin:0;padding:0;border:0;display:flex;flex-direction:column;gap:8px"><legend class="label" style="font-size:13px;color:var(--sub);margin-bottom:8px">碰到之后</legend>
+          <p class="hint" style="margin:0">点一下可以开关某个话题，鼠标停留能看到关键词。</p>
+          <div class="field"><label for="r-kw">自定义屏蔽词（用逗号分隔；命中就不回复）</label><textarea id="r-kw" class="input" rows="2">${esc((r.keywords || []).join(", "))}</textarea></div>
+          <fieldset style="margin:0;padding:0;border:0;display:flex;flex-direction:column;gap:8px"><legend class="label" style="font-size:13px;color:var(--sub);margin-bottom:8px">命中屏蔽词、或者她写的回复没通过安全检查时</legend>
             <label style="display:flex;gap:10px;align-items:center"><input type="radio" name="hit" value="pending" ${r.on_hit === "pending" ? "checked" : ""}>不回复，放进“待你处理”</label>
             <label style="display:flex;gap:10px;align-items:center"><input type="radio" name="hit" value="log" ${r.on_hit === "log" ? "checked" : ""}>不回复，只记在日志里</label>
           </fieldset>
         </section>
+        ${autoReplySection(r)}
+        ${emoteSection(r)}
         ${publishSection(r)}
+        ${voiceSection(r)}
         <section class="card" style="background:var(--tint)">
           <div style="display:flex;gap:16px;align-items:flex-start">${avatar(84)}
           <div class="col" style="gap:10px"><h2>她答应你的（固定开启）</h2>
@@ -907,12 +1041,162 @@ function collectRules() {
     rest_every: num("#r-every"), rest_min: num("#r-rmin"), rest_max: Math.max(num("#r-rmax"), num("#r-rmin")),
     at_interval: Math.max(1, num("#r-atint") || 10), dm_reply_mode: $("#r-dmmode").value,
     interest_threshold: num("#r-thr"), frames_per_video: num("#r-frames"),
-    auto_reply_at: $("#r-at").checked, auto_reply_dm: $("#r-dm").checked, engage_comments: $("#r-cm").checked, collect_enabled: $("#r-col").checked, skip_ads: $("#r-ads").checked, like_tendency: $("#r-liketd").value, dm_scope: $("#r-scope").value,
+    auto_reply_at: $("#r-at").checked, auto_reply_dm: $("#r-dm").checked, engage_comments: $("#r-cm").checked, collect_enabled: $("#r-col").checked, skip_ads: $("#r-ads").checked, listen_enabled: $("#r-listen").checked, listen_model: $("#r-lmodel").value, dm_scope: $("#r-scope").value,
     share_watch_minutes: Math.max(0.5, Number($("#r-watch").value) || 3), share_frames: Math.max(0, Math.min(12, num("#r-sframes"))),
     per_user_daily: num("#r-per"), topics: r.topics,
     keywords: $("#r-kw").value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean),
     on_hit: (document.querySelector('input[name="hit"]:checked') || {}).value || "pending",
+    sensitive_guard: $("#r-sg").checked,
+    auto_replies: $$(".ar-row").map((row) => ({ keys: row.querySelector(".ar-keys").value.trim(), reply: row.querySelector(".ar-reply").value.trim() })),
+    owner_enabled: $("#r-own").checked, owner_share_per_day: Math.max(0, num("#r-ownshare") || 0),
+    douyin_emoji: $("#r-dyemoji").checked, sticker_dm: $("#r-stdm").checked, sticker_comment: $("#r-stcm").checked,
+    sticker_per_day: Math.max(0, num("#r-stday") || 0),
+    ...collectVoice(),
+    owners: $$(".own-row").map((row) => ({
+      name: row.dataset.name || "", call: row.querySelector(".own-call").value.trim(),
+      relation: row.querySelector(".own-rel").value.trim(), enabled: row.querySelector(".own-on").checked,
+      chat: row.querySelector(".own-chat").checked, share: row.querySelector(".own-share").checked,
+      closeness: Number(row.dataset.close || 0),
+    })),
   };
+}
+
+function listenHint(r) {
+  const st = r.listen_status || {};
+  if (st.broken) return "现在用不了：" + esc(st.broken);
+  if (st.installed === false) return "还没装听声音的组件（faster-whisper），装好之前她只按画面和文案判断";
+  if (!(st.models || []).length) return "第一次用时会下载语音模型，之后离线可用";
+  const own = st.bundled || [];
+  return "可以直接用的语音模型：" + (st.models || []).map((m) => esc(m) + (own.includes(m) ? "（软件自带）" : "（已下载）")).join("、")
+    + "。换成别的模型时，第一次用会先下载";
+}
+
+/* 表情：抖音自带的小表情 + 她自己的表情包（用桌宠形象画的） */
+function emoteSection(r) {
+  return `<section class="card"><h2>${HEART}表情和表情包</h2>
+    <label class="toggle-row"><span>说话时偶尔带抖音自带的小表情<span class="hint" style="display:block;margin:2px 0 0">比如 [比心]、[捂脸]，发出去会显示成表情。人设里“表情习惯”选了“不用表情”时不会带。</span></span><input id="r-dyemoji" type="checkbox" ${r.douyin_emoji !== false ? "checked" : ""}></label>
+    <label class="toggle-row"><span>私信里发她自己的表情包<span class="hint" style="display:block;margin:2px 0 0">用桌宠现在的形象画的会动的小图，配字是她按聊天内容自己想的。回完文字后再发，大约四五条里配一次。</span></span><input id="r-stdm" type="checkbox" ${r.sticker_dm !== false ? "checked" : ""}></label>
+    <label class="toggle-row"><span>评论时也可以配一张表情包<span class="hint" style="display:block;margin:2px 0 0">默认关。评论里的图是不会动的。</span></span><input id="r-stcm" type="checkbox" ${r.sticker_comment ? "checked" : ""}></label>
+    <div class="toggle-row"><label for="r-stday">每天最多发几张表情包</label><input id="r-stday" type="number" min="0" max="100" class="input" style="max-width:120px" value="${r.sticker_per_day ?? 10}"></div>
+    <div class="actions"><button type="button" class="btn btn-sm" data-act="sticker-sheet">看看她的表情包</button>
+      <label class="sr-only" for="st-mood">情绪</label><select id="st-mood" class="input" style="max-width:120px">${(r.sticker_moods || []).map((m) => `<option>${esc(m)}</option>`).join("")}</select>
+      <label class="sr-only" for="st-text">配字</label><input id="st-text" class="input" style="max-width:140px" maxlength="8" placeholder="配字，比如 冲鸭">
+      <button type="button" class="btn btn-sm" data-act="sticker-one">画一张试试</button></div>
+    <div id="sticker-box"></div></section>`;
+}
+
+/* 她的声音：BreezeBlue 语音合成（发作品时读文案）：填 Key、填音色 ID、试听 */
+function voiceSection(r) {
+  return `<section class="card"><h2>${HEART}她的声音</h2>
+    <p class="hint">用 BreezeBlue（Breeze TTS 2）把作品的文案读出来，和文字卡片合成一个视频发布（在“作品”页点“用她的声音配音”，可以先试听）。到 breezeblue.ai 注册、在控制台里拿 API Key 和音色 ID（voc_ 开头）：可以用官方音色，也可以在那边用文字描述设计一个只属于她的音色。合成的声音是 AI 生成的，发布时照样声明“内容由 AI 生成”；不要克隆别人的声音。${r.voice_ready ? "" : `<b style="color:var(--warn-text)"> 现在还没设置好：要填 Key 和音色 ID。</b>`}</p>
+    <div class="field"><label for="v-key">BreezeBlue API Key ${r.voice_has_key ? `<span class="pill ok">已保存</span>` : `<span class="pill warn">还没填</span>`}</label>
+      <div class="actions"><input id="v-key" type="password" class="input" autocomplete="off" placeholder="${r.voice_has_key ? "已经保存了；要换就填新的" : "粘贴 Key，然后点保存 Key"}">
+        <button type="button" class="btn btn-sm" data-act="voice-key">保存 Key</button>
+        ${r.voice_has_key ? `<button type="button" class="btn btn-sm btn-danger" data-act="voice-key-clear">清掉</button>` : ""}</div>
+      <span class="hint">Key 用 Windows 加密后存在这台电脑上，不会显示出来，也不会发到别处。</span></div>
+    <div class="field"><label for="v-name">音色 ID</label>
+      <div class="actions"><input id="v-name" class="input" value="${esc(r.voice_name || "")}" placeholder="voc_xxxxxxxxxxxx">
+        <button type="button" class="btn btn-sm" data-act="voice-list" data-kind="personal">读我账号里的音色</button>
+        <button type="button" class="btn btn-sm" data-act="voice-list" data-kind="default">看官方中文女声</button></div>
+      <div id="voice-list-box"></div></div>
+    <div class="field"><label for="v-ins">表演指令（可不填）：用一句话告诉她怎么读</label><input id="v-ins" class="input" maxlength="300" value="${esc(r.voice_instruction || "")}" placeholder="比如：用轻快、带一点撒娇的语气读，像在跟朋友分享"></div>
+    <div class="grid">
+      <div class="field"><label for="v-rate">语速（0.5～2，1 是正常）</label><input id="v-rate" type="number" step="0.05" min="0.5" max="2" class="input" value="${r.voice_rate ?? 1}"></div>
+      <div class="field"><label for="v-vol">音量（1～200，100 是正常）</label><input id="v-vol" type="number" min="1" max="200" class="input" value="${r.voice_volume ?? 100}"></div>
+      <div class="field"><label for="v-guide">多听指令的话（1～10，写了表演指令才有用）</label><input id="v-guide" type="number" step="0.5" min="1" max="10" class="input" value="${r.voice_guidance ?? 3}"></div>
+      <div class="field"><label for="v-price">价格（元 / 万字，估算花费用）</label><input id="v-price" type="number" step="0.5" min="0" class="input" value="${r.voice_price ?? 5}"></div>
+    </div>
+    <details class="d-cards-edit"><summary>连不上或要指定模型时再看这里</summary>
+      <div class="field"><label for="v-proxy">代理（可不填；连不上 BreezeBlue 时填，比如 http://127.0.0.1:7890）</label><input id="v-proxy" class="input" value="${esc(r.voice_proxy || "")}"></div>
+      <div class="field"><label for="v-model">模型（留空自动选；中文用 breeze-tts-2）</label><input id="v-model" class="input" value="${esc(r.voice_model || "")}" placeholder="留空"></div>
+      <div class="field"><label for="v-base">接口地址（留空 = https://api.breeze.blue）</label><input id="v-base" class="input" value="${esc(r.voice_base || "")}"></div></details>
+    <div class="toggle-row"><label for="v-form">她自己写作品时用哪种形式<span class="hint" style="display:block;margin:2px 0 0">配音图片视频：文案写在一张带桌宠的图上，写完自动配好音。图文卡片：封面 + 文字卡片。每个作品里还可以再换。</span></label>
+      <select id="v-form" class="input" style="max-width:200px"><option value="voice" ${(r.post_form || "voice") !== "cards" ? "selected" : ""}>配音图片视频（默认）</option><option value="cards" ${r.post_form === "cards" ? "selected" : ""}>图文卡片</option></select></div>
+    <label class="toggle-row"><span>图文卡片形式的作品也自动配音<span class="hint" style="display:block;margin:2px 0 0">关着也可以在“作品”页手动点“用她的声音配音”。配好的视频要你确认后才会发布。</span></span><input id="v-auto" type="checkbox" ${r.voice_auto ? "checked" : ""}></label>
+    <div class="actions"><label class="sr-only" for="v-say">试听的话</label><input id="v-say" class="input" placeholder="输入一句话试听（不填就读一句自我介绍）">
+      <button type="button" class="btn btn-sm" data-act="voice-test">试听</button></div>
+    <div id="voice-box"></div>
+  </section>`;
+}
+
+function collectVoice() {
+  const g = (id) => $(id);
+  return {
+    voice_name: g("#v-name").value.trim(), voice_instruction: g("#v-ins").value.trim(),
+    voice_rate: Math.min(2, Math.max(0.5, Number(g("#v-rate").value) || 1)),
+    voice_volume: Math.min(200, Math.max(1, Number(g("#v-vol").value) || 100)),
+    voice_guidance: Math.min(10, Math.max(1, Number(g("#v-guide").value) || 3)),
+    voice_price: Math.max(0, Number(g("#v-price").value) || 0),
+    voice_proxy: g("#v-proxy").value.trim(), voice_model: g("#v-model").value.trim(), voice_base: g("#v-base").value.trim(),
+    voice_auto: g("#v-auto").checked, post_form: g("#v-form").value,
+  };
+}
+
+/* 关键字自动回复：对方的话里出现关键字，直接发你写好的话，不走模型 */
+function autoReplySection(r) {
+  const rows = (r.auto_replies || []).map((a, i) => `
+    <div class="ar-row list-row">
+      <div class="field"><label for="ar-k-${i}">关键字（多个用逗号分开）</label><input id="ar-k-${i}" class="input ar-keys" value="${esc(a.keys || "")}" placeholder="比如：价格，多少钱"></div>
+      <div class="field"><label for="ar-r-${i}">自动回复的话</label><textarea id="ar-r-${i}" class="input ar-reply" rows="2" maxlength="300">${esc(a.reply || "")}</textarea></div>
+      <button type="button" class="btn btn-sm btn-danger" data-act="ar-del" data-i="${i}">删掉这条</button>
+    </div>`).join("");
+  return `<section class="card"><h2>${HEART}关键字自动回复</h2>
+    <p class="hint" style="margin:0">别人在私信、@ 她或回复她的评论里说到你设的关键字，她直接发你写好的话，不经过模型（不花钱，也最快）。可以设很多条，从上往下第一条命中的生效。</p>
+    ${rows || `<p class="empty">还没有设置</p>`}
+    <div class="actions"><button type="button" class="btn btn-sm" data-act="ar-add">+ 加一条</button></div></section>`;
+}
+
+/* 主人：她会主动找主人聊天、分享视频；和主人聊天不设上限，记忆不会忘 */
+/* 主人：只能从互关好友里选（从抖音“关注”列表里核实过的；手动添加的好友不算） */
+function ownerChoices(r) {
+  const fr = (S.friends && S.friends.friends) || null;
+  return fr ? fr.filter((f) => !f.manual && f.nickname) : (r.owner_choices || []).map((n) => ({ nickname: n }));
+}
+function ownersSection(r) {
+  const close = (v) => (v >= 80 ? "非常亲密" : v >= 50 ? "很亲近" : v >= 20 ? "熟悉了" : "刚认识");
+  const all = ownerChoices(r);
+  const byName = Object.fromEntries(all.map((f) => [f.nickname, f]));
+  const fetch = (S.friends && S.friends.fetch) || {};
+  const taken = new Set((r.owners || []).map((o) => o.name));
+  const free = all.filter((f) => !taken.has(f.nickname));
+  const rows = (r.owners || []).map((o, i) => {
+    const f = byName[o.name];
+    return `
+    <div class="own-row list-row" data-close="${Number(o.closeness || 0)}" data-name="${esc(o.name || "")}">
+      <div class="own-head">
+        ${f && f.avatar ? `<img class="own-avatar" src="${esc(f.avatar)}" alt="" referrerpolicy="no-referrer">` : `<span class="own-avatar letter">${esc((o.name || "?").slice(0, 1))}</span>`}
+        <span class="own-who"><b>${esc(o.name || "")}</b>${f && f.douyin_id ? `<small>抖音号 ${esc(f.douyin_id)}</small>` : ""}</span>
+        ${f ? `<span class="pill ok">互关好友</span>` : `<span class="pill warn">互关名单里没有 TA</span>`}
+        <span class="pill neutral">亲密度 ${Math.round(Number(o.closeness || 0))} · ${close(Number(o.closeness || 0))}</span>
+      </div>
+      ${f ? "" : `<p class="hint" style="margin:0">互关好友名单里没找到这个名字：可能还没刷新名单、TA 改了昵称，或者已经不是互关了。点下面的“刷新好友列表”再看看；确认不是互关的话请移除。</p>`}
+      <div class="grid">
+        <div class="field"><label for="own-c-${i}">她怎么称呼 TA</label><input id="own-c-${i}" class="input own-call" maxlength="20" value="${esc(o.call || "")}" placeholder="比如：主人、哥哥、小廖"></div>
+        <div class="field"><label for="own-r-${i}">她和 TA 是什么关系</label><textarea id="own-r-${i}" class="input own-rel" rows="2" maxlength="200" placeholder="比如：TA 是把我带到这个世界的人，我最信任 TA，什么都想第一个告诉 TA">${esc(o.relation || "")}</textarea></div>
+      </div>
+      <div class="actions">
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="own-on" ${o.enabled !== 0 && o.enabled !== false ? "checked" : ""}>启用</label>
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="own-chat" ${o.chat !== 0 && o.chat !== false ? "checked" : ""}>她可以主动找 TA 聊天</label>
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="own-share" ${o.share !== 0 && o.share !== false ? "checked" : ""}>主动分享视频</label>
+        <button type="button" class="btn btn-sm btn-danger" data-act="own-del" data-i="${i}">移除</button>
+      </div>
+    </div>`;
+  }).join("");
+  const picker = all.length
+    ? (free.length
+      ? `<select id="own-pick" class="input" style="max-width:260px" aria-label="从互关好友里选一位">${free.map((f) => `<option value="${esc(f.nickname)}">${esc(f.nickname)}${f.douyin_id ? `（抖音号 ${esc(f.douyin_id)}）` : ""}</option>`).join("")}</select>
+         <button type="button" class="btn btn-sm btn-primary" data-act="own-add">设为主人</button>`
+      : `<span class="hint" style="margin:0">互关好友都已经是主人了</span>`)
+    : `<span class="hint" style="margin:0">${S.frLoading ? "正在从你的抖音主页读关注列表…" : "还没有互关好友名单，先点“刷新好友列表”"}</span>`;
+  return `<section class="card"><h2>${HEART}主人</h2>
+    <label class="toggle-row"><span>开启主人功能<span class="hint" style="display:block;margin:2px 0 0">只有和她互相关注的好友才能设为主人。主人的私信和别人不一样：随时都回（今天的私信额度用完了、不在活跃时段也回），想聊多久聊多久；她还会按自己的心情主动找主人聊天——想撒娇、开心、无聊的时候找得勤，犯困、闹小脾气的时候找得少，不用设次数。和主人有关的记忆不会忘，聊得越多越亲近。请只添加你自己的账号，或者同意被她主动联系的朋友。</span></span><input id="r-own" type="checkbox" ${r.owner_enabled !== false ? "checked" : ""}></label>
+    <div class="toggle-row"><label for="r-ownshare">每天最多主动分享视频（个）</label><input id="r-ownshare" type="number" min="0" class="input" style="max-width:120px" value="${r.owner_share_per_day ?? 2}"></div>
+    ${rows || `<p class="empty">还没有设置主人</p>`}
+    <div class="actions">
+      ${picker}
+      <button type="button" class="btn btn-sm" data-act="fr-fetch" ${S.frLoading ? "disabled" : ""}>${S.frLoading ? "正在读取…" : "刷新好友列表"}</button>
+    </div>
+    <p class="hint" style="margin:0">${fetch.at ? `好友列表上次读取：${esc(fetch.at)}，互关 ${fetch.count || 0} 人${fetch.error ? `（${esc(fetch.error)}）` : ""}。` : "好友列表从她抖音主页的“关注”里读，只列出互相关注的人。"}主人要先给她发过一条私信（她才能在私信列表里找到 TA）。她连着找了主人几次都没回音，会先不打扰、隔上大半天再问候。被问到是不是真人时，对主人也会如实说自己是 AI。</p></section>`;
 }
 
 /* @ 互关好友：下拉框只显示互关的好友，选中的人她才会 @ */
@@ -1002,14 +1286,23 @@ function renderDrafts() {
     const locked = d.status === "publishing" || d.status === "published" || d.status === "discarded";
     const media = (d.media_view || []).map((m, i) => `
       <div class="d-media">
-        ${m.kind === "video" ? `<div class="d-video">🎬<span>${esc(m.file)}</span></div>` : m.thumb ? `<img src="${m.thumb}" alt="图片 ${i + 1}">` : `<div class="d-video">⚠<span>文件不见了</span></div>`}
-        <span class="d-src">${{ card: "文字卡片", ai: "AI 生成", upload: "你上传的" }[m.source] || ""}</span>
+        ${!m.exists ? `<div class="d-video">⚠<span>文件不见了</span></div>`
+          : m.kind === "video" ? `<button type="button" class="d-open d-video" data-act="d-view" data-name="${esc(m.name)}" aria-label="播放视频 ${esc(m.file)}"><span class="d-play" aria-hidden="true">▶</span><span>${esc(m.file)}</span><span>点一下播放</span></button>`
+          : m.thumb ? `<button type="button" class="d-open" data-act="d-view" data-name="${esc(m.name)}" aria-label="放大看图片 ${i + 1}"><img src="${m.thumb}" alt="图片 ${i + 1}"><span class="d-zoom" aria-hidden="true">🔍 点开放大</span></button>`
+          : `<div class="d-video">⚠<span>图片打不开</span></div>`}
+        <span class="d-src">${{ card: "文字卡片", ai: "AI 生成", upload: "你上传的", voice: "配音视频", voicecard: "配音图片" }[m.source] || ""}</span>
         ${locked ? "" : `<div class="d-ops">
           <button type="button" class="btn btn-sm" data-act="d-move" data-name="${esc(m.name)}" data-dir="-1" ${i === 0 ? "disabled" : ""} aria-label="往前挪">‹</button>
           <button type="button" class="btn btn-sm" data-act="d-move" data-name="${esc(m.name)}" data-dir="1" ${i === d.media_view.length - 1 ? "disabled" : ""} aria-label="往后挪">›</button>
           <button type="button" class="btn btn-sm btn-danger" data-act="d-del" data-name="${esc(m.name)}" aria-label="删除">✕</button></div>`}
       </div>`).join("") || `<p class="empty">还没有图片或视频</p>`;
-    const cardsText = (d.cards || []).map((c) => [c.title, ...(c.lines || [])].join("\n")).join("\n\n");
+    // 一张卡片一段；只有一句话的卡片就写一行；有好几句但没有小标题的，第一行写“-”
+    const cardsText = (d.cards || []).map((c) => {
+      const lines = c.lines || [];
+      if (!c.title && lines.length === 1) return lines[0];
+      return [c.title || "-", ...lines].join("\n");
+    }).join("\n\n");
+    const form = d.form || "cards";
     editor = `
       <div class="actions" style="justify-content:space-between"><h2>${HEART}${d.status === "wish" && d.source === "auto" ? "她想发的作品" : "作品草稿"}</h2><span class="pill ${cls}">${label}</span></div>
       ${d.reason ? `<div class="me">${avatar(36)}<div class="bubble">${esc(d.reason)}</div></div>` : ""}
@@ -1017,19 +1310,41 @@ function renderDrafts() {
       <div class="field"><label for="d-title">标题（20 字以内最好）</label><input id="d-title" class="input" maxlength="30" value="${esc(d.title)}" ${locked ? "disabled" : ""}></div>
       <div class="field"><label for="d-text">正文</label><textarea id="d-text" class="input" rows="5" ${locked ? "disabled" : ""}>${esc(d.text)}</textarea></div>
       <div class="field"><label for="d-tags">话题（空格分隔，最多 5 个，不用写 #）</label><input id="d-tags" class="input" value="${esc((d.tags || []).join(" "))}" ${locked ? "disabled" : ""}></div>
-      <div class="field"><span class="label">图片 / 视频（按顺序发布；视频作品只能放 1 个视频）</span><div class="d-grid">${media}</div></div>
-      ${locked ? "" : `<div class="actions">
-        <button type="button" class="btn btn-sm" data-act="d-files">从电脑添加图片 / 视频</button>
+      <div class="field"><span class="label">图片 / 视频（按顺序发布；视频作品只能放 1 个视频）。点图片可以放大看，点视频可以播放</span><div class="d-grid">${media}</div></div>
+      ${(d.media_view || []).some((m) => m.exists) ? `<div class="actions">
+        <button type="button" class="btn btn-sm" data-act="d-view-all">▶ 从头预览全部</button>
+        ${(d.media_view || []).some((m) => m.audio_url) ? `<button type="button" class="btn btn-sm" data-act="d-voice-play">🔊 听她的配音</button>` : ""}
+      </div>` : ""}
+      ${locked ? `<p class="hint" style="margin:0">作品形式：${FORM_NAME[form]}</p>` : `
+      <div class="field"><span class="label">作品形式（换形式时，上一种形式自动生成的图和配音会去掉，你上传的不动）</span>
+        <div class="seg" role="radiogroup" aria-label="作品形式">
+          ${["voice", "cards", "upload"].map((f) => `<button type="button" class="chip" role="radio" aria-checked="${form === f}" aria-pressed="${form === f}" data-act="d-form" data-form="${f}">${FORM_NAME[f]}</button>`).join("")}
+        </div>
+        <p class="hint" style="margin:6px 0 0">${FORM_HINT[form]}</p></div>
+      ${form === "voice" ? `<div class="actions">
+        <button type="button" class="btn btn-sm btn-primary" data-act="d-voice" ${d.can_voice ? "" : "disabled"} title="${d.can_voice ? "" : "先到“规则与预算 → 她的声音”里填好 Key 和音色 ID"}">${d.has_voice ? "重新生成图片并配音" : "生成图片并配音"}</button>
+        ${d.can_voice ? "" : `<span class="hint" style="margin:0">还没设置她的声音，现在只有图片：到“规则与预算 → 她的声音”里填好 Key 和音色 ID 就能配音。</span>`}
+      </div>
+      <p class="hint" style="margin:0">${d.has_voice ? "已经配好音了：发布时发的是“配音视频”（一张图 + 她读文案的声音，画面不翻页）。" : "发布前点上面的按钮配音；不配音的话发出去的是这一张图。"}改了标题或正文，图会马上按新文案重画，配音需要重新生成；每次重新生成，桌宠会换一个动作。</p>
+      ${bgSection(d)}` : form === "cards" ? `<div class="actions">
         <button type="button" class="btn btn-sm" data-act="d-cards">重新生成文字卡片</button>
+        <button type="button" class="btn btn-sm" data-act="d-voice" ${d.can_voice ? "" : "disabled"} title="${d.can_voice ? "" : "先到“规则与预算 → 她的声音”里填好 Key 和音色 ID"}">${d.has_voice ? "重新配音" : "用她的声音配音"}</button>
+        <button type="button" class="btn btn-sm" data-act="d-files">从电脑添加图片 / 视频</button>
         ${d.can_ai_image ? `<input id="d-prompt" class="input" style="max-width:240px" placeholder="AI 配图的画面描述" value="${esc(d.image_prompt || "")}"><button type="button" class="btn btn-sm" data-act="d-ai">AI 生成一张配图</button>` : `<span class="hint" style="margin:0">想用 AI 生图？去“规则与预算 → 发作品”配置</span>`}
       </div>
+      <p class="hint" style="margin:0">“重新生成文字卡片”会按正文输入框里现在的全部内容重新分卡片（正文里每一句都会在卡片上）。${d.has_voice ? "这个草稿已经配好音了：发布时只发“配音视频”（文字卡片已经在视频里）；不想发视频就把配音视频删掉。改了标题或正文后配音会自动去掉，需要重新配。" : ""}</p>
       ${bgSection(d)}
-      <details class="d-cards-edit"><summary>编辑文字卡片的内容</summary>
-        <p class="hint">每张卡片一段，段与段之间空一行；每段第一行是小标题，后面每行一句（最多 4 句）。改完点“重新生成文字卡片”。</p>
-        <textarea id="d-cardtext" class="input" rows="6">${esc(cardsText)}</textarea></details>`}
+      <details class="d-cards-edit"><summary>想自己安排每张卡片写什么（可选）</summary>
+        <p class="hint">每张卡片一段，段与段之间空一行，最多 9 张，想写几张写几张。一段只有一行，就是一句话的卡片；一段有好几行时，第一行是小标题、后面每行一句（最多 8 句），不想要小标题就在第一行写一个“-”。字多了会自动缩小。改完点“重新生成文字卡片”。</p>
+        <textarea id="d-cardtext" class="input" rows="6">${esc(cardsText)}</textarea>
+        <div class="actions" style="margin-top:8px"><button type="button" class="btn btn-sm" data-act="d-cards-custom">按上面写的重画卡片</button></div></details>` : `<div class="actions">
+        <button type="button" class="btn btn-sm btn-primary" data-act="d-files">从电脑添加图片 / 视频</button>
+        ${d.can_ai_image ? `<input id="d-prompt" class="input" style="max-width:240px" placeholder="AI 配图的画面描述" value="${esc(d.image_prompt || "")}"><button type="button" class="btn btn-sm" data-act="d-ai">AI 生成一张配图</button>` : `<span class="hint" style="margin:0">想用 AI 生图？去“规则与预算 → 发作品”配置</span>`}
+      </div>`}`}
       <div class="decl"><input type="checkbox" checked disabled id="d-ai-decl"><label for="d-ai-decl">发布时自动勾选“内容由AI生成”声明（固定开启）</label></div>
       <div class="actions">
-        ${locked ? (d.status === "publishing" ? `<span class="pill brand">${d.publish_step ? `正在发布：${esc(d.publish_step)}…` : "排好队了：她做完手上这一小步就去发（一般 1 分钟内）"}</span>` : "") : `
+        ${locked ? (d.status === "publishing" ? `<span class="pill brand">${d.publish_step ? `正在发布：${esc(d.publish_step)}…` : "排好队了：她做完手上这一小步就去发（一般 1 分钟内）"}</span>`
+          : d.status === "discarded" ? `<span class="hint" style="margin:0">这个作品已经不发了，留着只是个记录。</span><button type="button" class="btn btn-danger" data-act="d-remove">删除这条记录</button>` : "") : `
         <button type="button" class="btn btn-primary" data-act="d-publish">确认发布</button>
         <button type="button" class="btn" data-act="d-save">保存草稿</button>
         <button type="button" class="btn btn-danger" data-act="d-discard">不发了</button>`}
@@ -1044,6 +1359,75 @@ function renderDrafts() {
     </div>`;
 }
 
+/* 预览：图片放大看、视频和配音直接播放。items: [{ type: "image"|"video"|"audio", url, label, name }]
+   ← → 换上一个 / 下一个，Esc 或点空白处关闭。文件由软件在本机开的小服务提供（只有这台电脑能访问）。 */
+function previewItems(d) {
+  const SRC = { card: "文字卡片", ai: "AI 生成的配图", upload: "你上传的", voice: "配音视频", voicecard: "配音图片" };
+  const out = [];
+  (d.media_view || []).forEach((m, i) => {
+    if (!m.exists) return;
+    out.push({ type: m.kind === "video" ? "video" : "image", url: m.url, thumb: m.thumb, name: m.name, i,
+               label: `${SRC[m.source] || (m.kind === "video" ? "视频" : "图片")} · 第 ${i + 1} 个` });
+    if (m.audio_url) out.push({ type: "audio", url: m.audio_url, name: m.audio, i, label: "她的配音（只听声音）" });
+  });
+  return out;
+}
+function lightbox(items, at = 0) {
+  if (!items.length) return;
+  let idx = Math.max(0, Math.min(at, items.length - 1));
+  const wrap = document.createElement("div");
+  wrap.className = "lightbox";
+  wrap.setAttribute("role", "dialog");
+  wrap.setAttribute("aria-modal", "true");
+  wrap.setAttribute("aria-label", "预览");
+  const stop = () => wrap.querySelectorAll("video, audio").forEach((x) => { try { x.pause(); } catch (e) { /* 已经停了 */ } });
+  const close = () => { stop(); document.removeEventListener("keydown", onKey); wrap.remove(); };
+  const draw = () => {
+    stop();
+    const it = items[idx];
+    const sys = `<button type="button" class="btn btn-sm" data-lb="sys">用电脑上的播放器打开</button>`;
+    let body;
+    if (!it.url && it.type !== "image") body = `<div class="lb-msg">软件里暂时播放不了这个文件。${sys}</div>`;
+    else if (it.type === "video") body = `<video controls autoplay playsinline src="${esc(it.url)}"></video>`;
+    else if (it.type === "audio") body = `<div class="lb-audio"><div class="lb-note" aria-hidden="true">🔊</div><audio controls autoplay src="${esc(it.url)}"></audio></div>`;
+    else body = `<img src="${esc(it.url || it.thumb)}" alt="${esc(it.label)}">`;
+    wrap.innerHTML = `
+      <div class="lb-top"><span>${esc(it.label)}${items.length > 1 ? `（${idx + 1} / ${items.length}）` : ""}</span>
+        <span class="actions">${it.type === "image" ? "" : sys}<button type="button" class="btn btn-sm" data-lb="close" aria-label="关闭预览">关闭 ✕</button></span></div>
+      <div class="lb-stage">
+        ${items.length > 1 ? `<button type="button" class="lb-nav" data-lb="prev" aria-label="上一个" ${idx === 0 ? "disabled" : ""}>‹</button>` : ""}
+        <div class="lb-body">${body}</div>
+        ${items.length > 1 ? `<button type="button" class="lb-nav" data-lb="next" aria-label="下一个" ${idx === items.length - 1 ? "disabled" : ""}>›</button>` : ""}
+      </div>`;
+    const media = wrap.querySelector("video, audio");
+    if (media) media.addEventListener("error", () => {
+      wrap.querySelector(".lb-body").innerHTML = `<div class="lb-msg">这个文件的格式软件里播放不了。${sys}</div>`;
+    });
+    const img = wrap.querySelector(".lb-body img");
+    if (img && it.url && it.thumb) img.addEventListener("error", () => { img.src = it.thumb; }, { once: true });
+    (wrap.querySelector('[data-lb="close"]') || wrap).focus();
+  };
+  const go = (step) => { const n = idx + step; if (n >= 0 && n < items.length) { idx = n; draw(); } };
+  const onKey = (e) => {
+    if (e.key === "Escape") close();
+    else if (e.key === "ArrowLeft") go(-1);
+    else if (e.key === "ArrowRight") go(1);
+  };
+  wrap.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-lb]");
+    if (b) {
+      const what = b.dataset.lb;
+      if (what === "close") close();
+      else if (what === "prev") go(-1);
+      else if (what === "next") go(1);
+      else if (what === "sys") call("open_draft_media", S.selDraft, items[idx].name).catch(() => {});
+    } else if (e.target === wrap || e.target.classList.contains("lb-stage") || e.target.classList.contains("lb-body")) close();
+  });
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(wrap);
+  draw();
+}
+
 /* 文字卡片的背景：内置粉色样式 / 背景图库里的图 / 上传新的；文字写在白卡片上还是直接写在图上 */
 function bgSection(d) {
   const cur = d.card_bg || d.bg_default || "none";   // 这个草稿实际用的背景
@@ -1051,10 +1435,10 @@ function bgSection(d) {
   const isDefault = (cur === "none" ? "" : cur) === (d.bg_default || "");
   const tiles = [`<button type="button" class="bg-tile builtin${cur === "none" ? " on" : ""}" data-act="d-bg" data-name="none" aria-pressed="${cur === "none"}"><span>内置粉色</span></button>`]
     .concat((d.backgrounds || []).map((b) => `
-      <div class="bg-wrap"><button type="button" class="bg-tile${cur === b.name ? " on" : ""}" data-act="d-bg" data-name="${esc(b.name)}" aria-pressed="${cur === b.name}" aria-label="用这张背景"><img src="${b.thumb}" alt=""></button>
+      <div class="bg-wrap"><button type="button" class="bg-tile${cur === b.name ? " on" : ""}" data-act="d-bg" data-name="${esc(b.name)}" aria-pressed="${cur === b.name}" aria-label="用这张背景：${esc(b.label || "")}" title="${esc(b.label || "")}"><img src="${b.thumb}" alt=""></button>
         <button type="button" class="bg-x" data-act="d-bg-del" data-name="${esc(b.name)}" aria-label="从背景图库删掉">✕</button></div>`)).join("");
   return `
-      <div class="field bg-field"><span class="label">文字卡片的背景（选好马上重画卡片）</span>
+      <div class="field bg-field"><span class="label">图片的背景（选好马上重画）</span>
         <div class="bg-tiles">${tiles}
           <button type="button" class="bg-tile add" data-act="d-bg-up"><span>＋ 上传背景图</span></button></div>
         ${cur !== "none" ? `<label class="toggle-row" style="min-height:40px"><span>文字写在半透明白卡片上（关掉就直接写在背景图上，自动加描边）</span><input type="checkbox" id="d-panel" ${panel ? "checked" : ""}></label>` : ""}
@@ -1065,6 +1449,14 @@ function bgSection(d) {
         </div>
       </div>`;
 }
+
+/* 作品的三种形式 */
+const FORM_NAME = { voice: "配音图片视频", cards: "图文卡片", upload: "我上传的图片 / 视频" };
+const FORM_HINT = {
+  voice: "标题和正文全部写在一张图上，图上站着桌宠（每次随机一个动作和表情），她用自己的声音把文案读出来，做成一个画面不动的视频。",
+  cards: "一张封面 + 几张文字卡片，当图文发；也可以点“用她的声音配音”做成一张张翻的视频。",
+  upload: "只发你从电脑上添加的图片或视频（视频作品只能放 1 个视频），标题、正文、话题照常填。",
+};
 
 function collectDraft() {
   const out = { title: $("#d-title").value.trim(), text: $("#d-text").value, tags: $("#d-tags").value };
@@ -1300,23 +1692,10 @@ function renderSettings() {
       <p style="margin:0">作者：<b>liaozhijin</b></p>
       <h3 class="oss-title">用到的开源组件</h3>
       <p style="margin:0;color:var(--muted)">感谢这些开源项目的作者和贡献者。</p>
-      <table class="oss-table"><thead><tr><th>名称</th><th>在软件里做什么</th></tr></thead><tbody>
-        ${OPEN_SOURCE.map(([n, d]) => `<tr><td>${esc(n)}</td><td>${esc(d)}</td></tr>`).join("")}
-      </tbody></table></section>`;
+      <div class="table-wrap"><table class="oss-table"><thead><tr><th>名称</th><th>在软件里做什么</th><th>许可证</th></tr></thead><tbody>
+        ${((S.about && S.about.oss) || []).map((o) => `<tr><td>${esc(o.name)}<br><small style="color:var(--muted);word-break:break-all">${esc(o.url)}</small></td><td>${esc(o.use)}</td><td>${esc(o.license)}</td></tr>`).join("")}
+      </tbody></table></div></section>`;
 }
-
-/* “关于”里列出的开源组件（只列软件运行时用到的；开发、打包、测试工具和参考项目见 README） */
-const OPEN_SOURCE = [
-  ["pywebview", "主界面窗口：把网页界面做成桌面窗口，并和程序互相调用"],
-  ["Playwright", "控制电脑上的 Edge / Chrome 打开抖音网页版：刷视频、点赞、收藏、评论、回私信、发作品"],
-  ["Requests", "请求大模型接口、AI 生图接口，下载抠图模型"],
-  ["Pillow", "画作品文字卡片、头像和背景图，处理桌宠图像和视频截图"],
-  ["NumPy", "桌宠手脚连接、身体轮廓补齐和抠图时的图像计算"],
-  ["ONNX Runtime", "上传自定义桌宠形象时，在本机运行抠图模型"],
-  ["anime-segmentation", "动漫人物抠图模型（第一次用到时才下载）"],
-  ["DIS / IS-Net", "抠图模型所基于的网络结构"],
-  ["ZCOOL KuaiLe（站酷快乐体）", "界面和作品卡片使用的字体"],
-];
 
 /* ---------- 页面切换和刷新 ---------- */
 async function showPage(page) {
@@ -1329,7 +1708,8 @@ async function showPage(page) {
   else if (page === "rules") { S.rules = await call("get_rules"); S.friends = await call("get_friends"); renderRules(); }
   else if (page === "drafts") { await loadDrafts(); renderDrafts(); }
   else if (page === "pet") { S.pet = await call("get_pet"); renderPet(); }
-  else if (page === "settings") renderSettings();
+  else if (page === "settings") { if (!S.about) S.about = await call("about"); renderSettings(); }
+  else if (page === "memory") { await loadMemory(); renderMemory(); }
   else if (page === "history") {
     if (!S.hist.data) S.hist.day = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
     await loadHistory(); renderHistory();
@@ -1370,7 +1750,12 @@ function keepFriendInputs() {
   const ch = friendChoices();
   S.friends.friends = S.friends.friends.map((f) => { const c = ch.find((x) => x.uid === f.uid); return c ? { ...f, enabled: c.enabled ? 1 : 0, tags: c.tags } : f; });
 }
-document.addEventListener("change", (e) => {
+document.addEventListener("change", async (e) => {
+  if (e.target.classList && e.target.classList.contains("mem-imp")) {
+    await call("memory_action", "importance", Number(e.target.dataset.id), Number(e.target.value));
+    await loadMemory(); renderMemory(); toast(Number(e.target.value) >= 5 ? "设成重要了，她不会忘" : "重要程度改好了");
+    return;
+  }
   if (e.target.classList && e.target.classList.contains("fr-check") && S.page === "rules") {
     S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs(); renderRules();
   }
@@ -1511,10 +1896,48 @@ const ACT = {
     r.topics = r.topics.includes(v) ? r.topics.filter((x) => x !== v) : [...r.topics, v];
     el.setAttribute("aria-pressed", String(r.topics.includes(v)));
   },
+  archetype: (el) => {
+    S.persona = { ...S.persona, ...collectPersona() };
+    S.persona.archetype = S.persona.archetype === el.dataset.v ? "" : el.dataset.v;
+    renderPersona();
+  },
+  "ar-add": () => { S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs(); S.rules.auto_replies.push({ keys: "", reply: "" }); renderRules(); },
+  "ar-del": (el) => { S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs(); S.rules.auto_replies.splice(Number(el.dataset.i), 1); renderRules(); },
+  "own-add": () => {
+    const pick = $("#own-pick");
+    if (!pick || !pick.value) { toast("先点“刷新好友列表”，再从互关好友里选一位", true); return; }
+    const name = pick.value;
+    S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs();
+    S.rules.owners.push({ name, call: "", relation: "", enabled: 1, chat: 1, share: 1, closeness: 0 });
+    renderRules(); toast(`把 ${name} 设为主人了，填好称呼后记得点右上角“保存”`);
+  },
+  "own-del": (el) => { S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs(); S.rules.owners.splice(Number(el.dataset.i), 1); renderRules(); },
+  "mem-tab": async (el) => { S.mem.tab = el.dataset.t; S.mem.person = ""; S.mem.q = ""; await loadMemory(); renderMemory(); },
+  "mem-search": async () => { S.mem.q = $("#mem-q").value.trim(); await loadMemory(); renderMemory(); },
+  "mem-clear": async () => { S.mem.q = ""; S.mem.person = ""; await loadMemory(); renderMemory(); },
+  "mem-person": async (el) => { S.mem = { tab: "events", q: "", person: el.dataset.name, data: null }; await showPage("memory"); },
+  "mem-del": async (el) => { await call("memory_action", "delete", Number(el.dataset.id)); await loadMemory(); renderMemory(); toast("这条记忆删掉了"); },
+  "mem-diary-del": async (el) => {
+    if (!(await dialog({ title: "删掉这篇日记？", body: "删掉以后她就不记得这一天写过什么了。", ok: "删除", cancel: "先留着" }))) return;
+    await call("memory_action", "delete_diary", Number(el.dataset.id)); await loadMemory(); renderMemory();
+  },
+  "mem-card": async (el) => { toast("正在整理印象…"); await call("memory_action", "refresh_card", el.dataset.name); await loadMemory(); renderMemory(); },
+  "mem-forget": async (el) => {
+    const name = el.dataset.name;
+    if (!(await dialog({ title: `忘掉 ${name}？`, body: "她对 TA 的印象卡、和 TA 的私信聊天记录、和 TA 有关的记忆都会删掉，恢复不了。以后 TA 再来私信，她会当成第一次认识。", ok: "忘掉", cancel: "先留着" }))) return;
+    await call("memory_action", "forget_person", name); await loadMemory(); renderMemory(); toast("已经忘掉 " + name);
+  },
+  "mem-note": async () => {
+    const v = $("#mem-note").value.trim();
+    if (!v) return toast("先写点内容", true);
+    await call("memory_action", "add_note", "", v); await loadMemory(); renderMemory(); toast("她记住了");
+  },
   "save-rules": async () => {
-    await call("save_rules", collectRules());
+    const res = await call("save_rules", collectRules());
     if (S.friends) await call("save_friends", friendChoices());
-    S.rules = await call("get_rules"); S.friends = await call("get_friends"); renderRules(); refresh(); toast("规则已保存");
+    S.rules = await call("get_rules"); S.friends = await call("get_friends"); renderRules(); refresh();
+    const no = (res && res.owners_refused) || [];
+    if (no.length) toast(`规则已保存；${no.join("、")} 不是互关好友，没有设为主人`, true); else toast("规则已保存");
   },
 
   "goto-draft": async (el) => { S.selDraft = Number(el.dataset.id); await showPage("drafts"); },
@@ -1557,10 +1980,89 @@ const ACT = {
   "d-now": async () => { await call("draft_now"); toast("她在构思了，写好会提醒你～"); setTimeout(async () => { if (S.page === "drafts") { await loadDrafts(); renderDrafts(); } }, 15000); },
   "d-save": async () => { await call("save_draft", S.selDraft, collectDraft()); await loadDrafts(); renderDrafts(); toast("草稿已保存"); },
   "d-cards": async (el) => {
-    el.disabled = true; el.textContent = "正在画卡片…";
-    await call("save_draft", S.selDraft, collectDraft()); await call("draft_cards", S.selDraft);
-    await loadDrafts(); renderDrafts(); toast("文字卡片重新画好啦");
+    // 按正文输入框里现在的全部内容重新分卡片
+    const data = collectDraft(); delete data.cards;
+    el.disabled = true; el.textContent = "正在按正文画卡片…";
+    try { await call("save_draft", S.selDraft, data); await call("draft_cards", S.selDraft, true); toast("按正文重新做好文字卡片啦"); } catch (e) { /* 已经提示 */ }
+    await loadDrafts(); renderDrafts();
   },
+  "d-cards-custom": async (el) => {
+    el.disabled = true; el.textContent = "正在画卡片…";
+    try { await call("save_draft", S.selDraft, collectDraft()); await call("draft_cards", S.selDraft, false); toast("按你写的重画好啦"); } catch (e) { /* 已经提示 */ }
+    await loadDrafts(); renderDrafts();
+  },
+  "d-voice": async (el) => {
+    await call("save_draft", S.selDraft, collectDraft());
+    el.disabled = true; el.textContent = "正在配音、合成视频，可能要半分钟…";
+    try { await call("draft_voice", S.selDraft); toast("配好音啦，点视频可以播放"); } catch (e) { /* 已经提示 */ }
+    await loadDrafts(); renderDrafts();
+  },
+  "d-form": async (el) => {
+    const form = el.dataset.form;
+    if (form === (S.draft || {}).form) return;
+    const made = ((S.draft || {}).media || []).some((m) => ["card", "voice", "voicecard"].includes(m.source));
+    if (made && !(await dialog({ title: `换成“${FORM_NAME[form]}”？`, body: "现在这种形式自动生成的图片和配音会去掉（你从电脑上添加的不动），再按新的形式重新做。", ok: "换", cancel: "不换" }))) return;
+    await call("save_draft", S.selDraft, collectDraft());
+    toast(form === "voice" ? "正在画图、配音，可能要半分钟…" : "正在换作品形式…");
+    try {
+      const r = await call("draft_set_form", S.selDraft, form);
+      toast(form === "voice" ? (r.voiced ? "图片和配音都做好啦" : "图片做好了（还没配音）") : form === "cards" ? "文字卡片做好啦" : "已换成只用你上传的图片 / 视频");
+    } catch (e) { /* 已经提示 */ }
+    await loadDrafts(); renderDrafts();
+  },
+  "d-voice-play": () => {
+    const items = previewItems(S.draft || {});
+    const at = items.findIndex((x) => x.type === "audio");
+    if (at < 0) return toast("这个作品还没有配音", true);
+    lightbox(items, at);
+  },
+  "d-view": (el) => {
+    const items = previewItems(S.draft || {});
+    lightbox(items, Math.max(0, items.findIndex((x) => x.name === el.dataset.name && x.type !== "audio")));
+  },
+  "d-view-all": () => lightbox(previewItems(S.draft || {}), 0),
+  "d-remove": async () => {
+    const ok = await dialog({ title: "删除这条作品记录？", body: "它的文案、文字卡片、AI 配图和配音都会一起删掉，恢复不了。你从电脑上添加的图片 / 视频原文件不会动。", ok: "删除", cancel: "先留着" });
+    if (!ok) return;
+    await call("delete_draft", S.selDraft); S.selDraft = null; await loadDrafts(); renderDrafts(); toast("已删除");
+  },
+  "sticker-sheet": async (el) => {
+    el.disabled = true;
+    try { const r = await call("sticker_preview"); $("#sticker-box").innerHTML = `<img src="${r.image}" alt="她的表情包预览" style="max-width:100%;border-radius:12px">`; } finally { el.disabled = false; }
+  },
+  "sticker-one": async (el) => {
+    el.disabled = true;
+    try { const r = await call("sticker_preview", $("#st-mood").value, $("#st-text").value.trim()); $("#sticker-box").innerHTML = `<img src="${r.image}" alt="表情包" style="width:240px;border-radius:12px">`; } finally { el.disabled = false; }
+  },
+  "voice-test": async (el) => {
+    el.disabled = true; el.textContent = "正在合成…";
+    try { const r = await call("voice_test", $("#v-say").value.trim(), collectVoice()); $("#voice-box").innerHTML = `<audio controls autoplay src="${r.audio}" style="width:100%"></audio>`; } catch (e) { /* 已经提示 */ }
+    el.disabled = false; el.textContent = "试听";
+  },
+  "voice-key": async () => {
+    const key = $("#v-key").value.trim();
+    if (!key) { toast("先把 Key 粘贴进来", true); return; }
+    S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs();
+    const r = await call("voice_save_key", key);
+    S.rules.voice_has_key = r.has_key; S.rules.voice_ready = r.has_key && !!S.rules.voice_name;
+    renderRules(); toast("Key 保存好了（已加密）");
+  },
+  "voice-key-clear": async () => {
+    S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs();
+    await call("voice_save_key", ""); S.rules.voice_has_key = false; S.rules.voice_ready = false;
+    renderRules(); toast("Key 清掉了");
+  },
+  "voice-list": async (el) => {
+    el.disabled = true;
+    try {
+      const r = await call("voice_list", el.dataset.kind, collectVoice());
+      $("#voice-list-box").innerHTML = r.voices.length
+        ? `<div class="voice-list">${r.voices.map((v) => `<button type="button" class="btn btn-sm" data-act="voice-pick" data-id="${esc(v.id)}" title="${esc(v.desc || "")}">${esc(v.name)}<span class="hint" style="margin:0 0 0 6px">${esc(v.id)}</span></button>`).join("")}</div><span class="hint">点一个就填到上面；填好后可以试听，再点右上角“保存”。</span>`
+        : `<span class="hint">${el.dataset.kind === "personal" ? "你的账号里还没有自己的音色：到 BreezeBlue 控制台里设计一个，或者先用官方音色。" : "没读到官方音色。"}</span>`;
+    } catch (e) { /* 已经提示 */ }
+    el.disabled = false;
+  },
+  "voice-pick": (el) => { $("#v-name").value = el.dataset.id; toast("填好了，可以点“试听”听听看"); },
   "d-ai": async (el) => {
     const prompt = $("#d-prompt").value.trim();
     await call("save_draft", S.selDraft, collectDraft());
@@ -1609,7 +2111,7 @@ const ACT = {
     await call("publish_draft", S.selDraft); toast("开始发布啦"); await loadDrafts(); renderDrafts();
   },
   "d-discard": async () => {
-    const ok = await dialog({ title: "不发这个作品了吗？", body: "她可能会有一点点失落哦。草稿会保留在列表里，标记为“不发了”。", ok: "不发了", cancel: "再想想" });
+    const ok = await dialog({ title: "不发这个作品了吗？", body: "她可能会有一点点失落哦。草稿会保留在列表里，标记为“不发了”；之后想清掉，可以点“删除这条记录”。", ok: "不发了", cancel: "再想想" });
     if (!ok) return;
     await call("discard_draft", S.selDraft); await loadDrafts(); renderDrafts();
   },

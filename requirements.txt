@@ -5,3 +5,7 @@ Pillow>=10.0
 numpy>=1.26
 # 桌宠换形象时的本机抠图（模型文件第一次用时再下载，约 176MB）
 onnxruntime>=1.17
+# 听视频里的声音（Whisper 语音转文字，本机运行；base 模型约 145MB，build.bat 打包时下载好、打进安装包）
+faster-whisper>=1.0
+# 给作品配音时把“声音 + 文字卡片”合成视频（自带 ffmpeg 程序，不用另外安装）
+imageio-ffmpeg>=0.5

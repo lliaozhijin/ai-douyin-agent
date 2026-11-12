@@ -5,7 +5,7 @@ import re
 
 URL_RE = re.compile(r"(https?://|www\.|\b[a-z0-9-]+\.(com|cn|net|top|xyz|cc|me)\b)", re.I)
 PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
-CONTACT_RE = re.compile(r"(微信|vx|v信|wx|QQ|qq|扣扣|电话|手机号|加我|私聊我|联系方式)", re.I)
+CONTACT_RE = re.compile(r"(微信|vx|v信|wx|QQ|qq|扣扣|电话|手机号|加我(?:好友|微信|v|V|qq|QQ|扣扣|一下|下)|私聊我|联系方式)", re.I)
 
 
 def keyword_hit(text: str, rules: dict) -> str | None:
@@ -49,3 +49,27 @@ def clean_reply(text: str) -> str:
     t = re.sub(r"\*\*|__|`+", "", t)
     t = re.sub(r"(?m)^\s*#+\s*", "", t)
     return t.strip()
+
+
+def auto_reply(text: str, rules: dict) -> str:
+    """关键字自动回复：对方的话里出现你设的关键字，就返回你写好的那句话（不走模型）；没命中返回空。
+
+    rules["auto_replies"] = [{"keys": "价格，多少钱", "reply": "……"}, ...]，一条里可以写多个关键字（逗号、顿号、空格分开）。"""
+    low = (text or "").lower()
+    if not low:
+        return ""
+    for item in rules.get("auto_replies") or []:
+        reply = str((item or {}).get("reply") or "").strip()
+        if not reply:
+            continue
+        keys = (item or {}).get("keys") or ""
+        if isinstance(keys, str):
+            keys = re.split(r"[,，、;；\s]+", keys)
+        if any(k and k.strip().lower() in low for k in keys):
+            return reply[:300]
+    return ""
+
+
+def sensitive_reply(topic: str) -> str:
+    """敏感话题开关开着时，直接告诉对方为什么不聊（不走模型）。"""
+    return f"这个话题涉及「{topic}」，我不方便聊哦～咱们聊点别的吧"

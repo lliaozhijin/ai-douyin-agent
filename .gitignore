@@ -5,3 +5,5 @@ build/
 dist/
 installer/Output/
 data/
+# 打包时下载的语音模型（体积大，不进仓库；build.bat 会自动下载）
+assets/models/
