@@ -76,11 +76,30 @@ MENTION_PICK_JS = r"""
 }
 """
 
+# 分享面板里点了好友以后，找面板里的“分享 / 发送”按钮：从好友那个元素一层层往外找，
+# 找文字正好是这几个词之一、看得见、又不包着好友自己的元素。在好友元素上执行，参数是这几个词。
+SHARE_SEND_JS = r"""
+(el, labels) => {
+  const sq = (t) => (t || '').replace(/\s+/g, '');
+  const want = labels.map(sq);
+  const vis = (x) => { const r = x.getBoundingClientRect(); return r.width > 8 && r.height > 8; };
+  for (let p = el.parentElement, i = 0; p && p !== document.body && i < 10; p = p.parentElement, i++) {
+    const hit = [...p.querySelectorAll('button, [role="button"], div, span')]
+      .find((x) => !x.contains(el) && vis(x) && want.includes(sq(x.textContent)) && x.children.length <= 2);
+    if (hit) return hit;
+  }
+  return null;
+}
+"""
+
 # 一次读出评论区所有评论：评论 id（三个地方都看，对不上就不认）、正文（表情图用它的文字代替）、
 # 是不是楼中楼、是不是她自己发的
 COMMENT_ROWS_JS = r"""
 (meUid) => {
-  const rows = [...document.querySelectorAll('[data-e2e="comment-item"]')];
+  // 评论区可能有两份（一份藏着）：只看看得见的那份，都看不见才全看
+  const all = [...document.querySelectorAll('[data-e2e="comment-item"]')];
+  const shown = all.filter((r) => r.getClientRects().length > 0);
+  const rows = shown.length ? shown : all;
   const idOf = (row) => {
     const ids = new Set();
     const a = row.getAttribute('data-comment-id'); if (a && /^\d+$/.test(a)) ids.add(a);
@@ -138,6 +157,8 @@ class FeedReadError(BrowserError):
 
 
 class Feed:
+    OPEN_TRIES = 3   # 打开推荐页：最多点几次左侧“推荐”
+
     def __init__(self, b: DouyinBrowser):
         self.b = b
 
@@ -159,22 +180,27 @@ class Feed:
                 return
             if "jingxuan" in (b.page.url or ""):
                 break
-        log.info("没进到推荐页（当前：%s），点左侧“推荐”", b.page.url)
-        link = b.find("nav_recommend", timeout=5000)
-        if link is not None and b.safe_click(link, "左侧“推荐”"):
-            b.pause(2, 4)
-            b.check_captcha()
-            if b.find("feed_active", timeout=20000) is not None:
-                b.pause(1.0, 2.0)
-                b.dismiss_tips()
-                return
-        # 已经在推荐页、只是视频一直转“加载中”（网络慢）：再等一会儿，中途刷新一次
-        if "recommend" in (b.page.url or "") or b.loading_visible():
-            log.info("推荐页的视频还在加载（%s），再等一会儿", b.page.url)
-            if b.wait_any("feed_active", timeout=40) is not None:
-                b.pause(1.0, 2.0)
-                b.dismiss_tips()
-                return
+        for attempt in range(self.OPEN_TRIES):
+            log.info("没进到推荐页（当前：%s），点左侧“推荐”%s", b.page.url, f"（第 {attempt + 1} 次）" if attempt else "")
+            link = b.find("nav_recommend", timeout=5000)
+            if link is not None and b.safe_click(link, "左侧“推荐”"):
+                b.pause(2, 4)
+                b.check_captcha()
+                if b.find("feed_active", timeout=20000) is not None:
+                    b.pause(1.0, 2.0)
+                    b.dismiss_tips()
+                    return
+            # 已经在推荐页、只是视频一直转“加载中”（网络慢）：再等一会儿。
+            # 不刷新页面：2026-11-20 实测，刷新 ?recommend=1 抖音直接跳到“精选”，刷新完再怎么等推荐视频也不会出来，
+            # 等满时间就报错了。跳走了就回到上面，再点一次左侧“推荐”
+            if "recommend" in (b.page.url or "") or b.loading_visible():
+                log.info("推荐页的视频还在加载（%s），再等一会儿", b.page.url)
+                if b.wait_any("feed_active", timeout=25, reload_once=False) is not None:
+                    b.pause(1.0, 2.0)
+                    b.dismiss_tips()
+                    return
+            if link is None:
+                break                          # 左边连“推荐”都没有：不是网络慢，再点也没用
         path = b.dump("feed_open_fail")
         raise BrowserError(f"没能打开“推荐”页（网络慢的话视频会一直“加载中”），当前停在 {b.page.url}"
                           f"（页面已保存到 {path}）。她会自动再试")
@@ -281,6 +307,32 @@ class Feed:
             log.info("评论区开了但评论还在加载，再等一会儿")
             self.b.wait_any("comment_list", timeout=30, reload_once=False)
             return True
+        if self.b.find("detail_container", timeout=300) is not None and self._scroll_to_comments():
+            return True
+        return False
+
+    def _scroll_to_comments(self) -> bool:
+        """单个视频的详情页上评论区没在右边（网页窗口窄的时候评论排在视频下面，滚到那儿才加载）：
+        页面还在转“加载中”就先等一会儿，再往下滚几屏找评论区。找到了返回 True。"""
+        for _ in range(10):                       # 页面还在加载：最多再等 10 秒
+            if not self.b.loading_visible():
+                break
+            cancel.sleep(1.0)
+        for _ in range(4):
+            try:
+                self.b.page.mouse.move(600, 500)
+                self.b.page.mouse.wheel(0, 900)
+            except Exception:  # noqa: BLE001
+                return False
+            self.b.pause(1.0, 1.6)
+            if self.b.find("comment_list", timeout=1500) is not None or self.b.find("comment_item", timeout=500):
+                log.info("评论区在视频下面：往下滚了一下就出来了")
+                return True
+            tab = self.b.find("detail_comment_tab", timeout=500)
+            if tab is not None and self.b.safe_click(tab, "“评论”页签"):
+                self.b.pause(1.0, 1.8)
+                if self.b.find("comment_list", timeout=6000) is not None:
+                    return True
         return False
 
     def _close_product_card(self) -> bool:
@@ -324,7 +376,7 @@ class Feed:
             c = self._parse_comment(item)
             if c:
                 out.append(c)
-        if not out:
+        if not out and not self._no_comments_yet():
             self._dump_comments_once("comments_empty", "评论区打开了，但没读到评论")
         self.close_comments()
         return out
@@ -408,7 +460,8 @@ class Feed:
             return []
 
     def comment_text(self, item) -> str:
-        """一条评论的正文：只取正文那一块，表情图换成它的文字（比如 [捂脸]），不混进名字、时间、点赞数。"""
+        """一条评论的正文：只取正文那一块，表情图换成它的文字（比如 [捂脸]），不混进名字、时间、点赞数。
+        只发了一张图 / 表情包的（图片没有文字说明）读成“[图片]”——以前读出来是空的，这种评论永远找不到。"""
         try:
             t = item.evaluate(r"""(row) => {
                 const own = (sel) => [...row.querySelectorAll(sel)].find((el) => el.closest('[data-e2e="comment-item"]') === row);
@@ -421,7 +474,8 @@ class Feed:
                 if (!box) return null;
                 let out = '';
                 const walk = (n) => { if (n.nodeType === 3) { out += n.textContent; return; }
-                  if (n.nodeType !== 1) return; if (n.tagName === 'IMG') { out += n.getAttribute('alt') || ''; return; }
+                  if (n.nodeType !== 1) return;
+                  if (n.tagName === 'IMG') { out += n.getAttribute('alt') || '[图片]'; return; }
                   for (const c of n.childNodes) walk(c); };
                 walk(box); return out.replace(/\s+/g, ' ').trim();
             }""")
@@ -429,19 +483,37 @@ class Feed:
             t = None
         return t if isinstance(t, str) else ""
 
-    def comment_author(self, item) -> str:
-        """这条评论自己的作者名（不含楼中楼里别人的名字）。"""
+    # 这条评论自己的作者名、以及它回复的是谁（“A ▸ B”里的 B）的主页链接。名字里的 emoji 抖音画成了图片，
+    # 用图片的 alt 拼回去（“吃白饭的鲸<img alt="🐳">”读成“吃白饭的鲸🐳”）；头像那个链接不算
+    COMMENT_PEOPLE_JS = r"""(row) => {
+        const out = [];
+        for (const a of row.querySelectorAll('a[href*="/user/"]')) {
+          if (a.closest('[data-e2e="comment-item"]') !== row) continue;
+          if (a.closest('.comment-item-avatar') || a.querySelector('[data-e2e="live-avatar"]')) continue;
+          let s = '';
+          const walk = (n) => { if (n.nodeType === 3) { s += n.textContent; return; }
+            if (n.nodeType !== 1) return;
+            if (n.tagName === 'IMG') { const alt = n.getAttribute('alt') || ''; if (!/头像$/.test(alt)) s += alt; return; }
+            for (const c of n.childNodes) walk(c); };
+          walk(a);
+          s = s.replace(/\s+/g, ' ').trim();
+          if (s) out.push({name: s, href: a.getAttribute('href') || ''});
+        }
+        return out;
+    }"""
+
+    def comment_people(self, item) -> list[dict]:
+        """[{name, href}]：第一个是这条评论的作者，后面的是它回复的人（楼中楼“A ▸ B”）。"""
         try:
-            t = item.evaluate(r"""(row) => {
-                for (const a of row.querySelectorAll('a[href*="/user/"]')) {
-                  if (a.closest('[data-e2e="comment-item"]') !== row) continue;
-                  const s = (a.textContent || '').trim(); if (s) return s;
-                }
-                return '';
-            }""")
+            got = item.evaluate(self.COMMENT_PEOPLE_JS)
         except Exception:  # noqa: BLE001
-            t = ""
-        return t if isinstance(t, str) else ""
+            got = None
+        return [x for x in got if isinstance(x, dict)] if isinstance(got, list) else []
+
+    def comment_author(self, item) -> str:
+        """这条评论自己的作者名（不含楼中楼里别人的名字；名字里的 emoji 也读出来）。"""
+        people = self.comment_people(item)
+        return str(people[0].get("name") or "") if people else ""
 
     @staticmethod
     def cid_selector(cid: str) -> str:
@@ -474,8 +546,10 @@ class Feed:
         except Exception:  # noqa: BLE001
             return ""
 
-    def reply_on_item(self, item, text: str, what: str = "", who: str = "") -> SendResult:
+    def reply_on_item(self, item, text: str, what: str = "", who: str = "", mentions=None) -> SendResult:
         """在评论区的某一条评论上点“回复”，在弹出的回复框里输入并发送，然后核实到底发没发出去。
+        mentions：回复里还要 @ 的人（主人在评论区让她“@ 一下谁”时）：先在回复框里一个个 @ 上，再写字；
+        @ 上了的人记在 last_mentioned。
 
         - 发之前：确认回复框写的是“回复 @who”，不是别人（认不出提示就照常发）；
         - 发之后：先记下原来已有的评论 id，发完反复查，出现一条新的、内容一样、是她自己发的评论，
@@ -505,6 +579,12 @@ class Feed:
             self._dump_comments_once("comment_reply_wrong_target", f"回复框对象不对（{label[:20]}）")
             return FAILED
         self.b.pause(0.4, 0.9)
+        self.last_mentioned = []
+        for name in [str(x).strip() for x in (mentions or []) if str(x).strip()][:5]:
+            if self._insert_mention(name):            # 在候选里点选了才是真正的 @，对方才会收到提醒
+                self.last_mentioned.append(name)
+                self.b.page.keyboard.type(" ")
+                self.b.pause(0.2, 0.4)
         self.b.type_slowly(text)
         self.b.pause(0.6, 1.2)
         self.b.page.keyboard.press("Enter")
@@ -686,6 +766,20 @@ class Feed:
             log.warning("点赞失败：%s", e)
             return False
 
+    def like_once(self):
+        """点赞，但已经点过赞的不再点（再点一下会变成取消）。返回 True 点上了 / "already" 之前就点过 / False 没点成。
+        按钮状态认不出来时照常点一下（和 like() 一样）。"""
+        btn = self.b.find("like_button", timeout=2500)
+        if btn is None:
+            return False
+        if _digg_state(btn) is True:
+            return "already"
+        if not self.b.safe_click(btn, "点赞按钮"):
+            return False
+        self.b.pause(0.8, 1.5)
+        self.b.check_captcha()
+        return _digg_state(btn) is not False
+
     def _collect_toast(self) -> bool:
         for w in _collect_toast_words():
             try:
@@ -725,6 +819,7 @@ class Feed:
         return True
 
     last_mention_ok = False  # 上一次评论里的 @ 有没有成功（选中了候选列表里的好友）
+    last_mentioned: list = []  # 上一次评论里 @ 上了的人
 
     def _open_comment_box(self):
         """找到可以打字的评论输入框。没点开时它只是一行“留下你的精彩评论吧”的占位文字，
@@ -772,8 +867,9 @@ class Feed:
         self.b.pause(1.5, 2.5)      # 缩略图出来以后图片还要传一小会儿，没传完就按发送会发不出去
         return ok
 
-    def comment(self, text: str, mention: str = "", image=None, require_mention: bool = False) -> SendResult:
-        """发一条评论。mention 是要 @ 的好友昵称：先输入 @ 和名字，在弹出的候选里点选（这样对方才会收到提醒）。
+    def comment(self, text: str, mention="", image=None, require_mention: bool = False) -> SendResult:
+        """发一条评论。mention 是要 @ 的好友昵称（也可以是几个昵称的列表）：先输入 @ 和名字，在弹出的候选里点选
+        （这样对方才会收到提醒）。几个人时 last_mentioned 里是 @ 上了的那几位。
 
         @ 没成功（候选里找不到这个人）就去掉 @，只发评论内容；结果记在 last_mention_ok。
         require_mention=True（这条评论就是为了回 @ 她的人）：@ 不上就不发了，返回 failed。
@@ -795,10 +891,19 @@ class Feed:
         if self.last_image_ok:
             self.b.safe_click(box, "评论输入框")       # 传完图片焦点可能跑了，点回输入框再打字
             self.b.pause(0.3, 0.6)
-        if mention:
-            self.last_mention_ok = self._insert_mention(mention)
-            if require_mention and not self.last_mention_ok:
-                log.warning("发评论：@%s 没 @ 上，这条不发了", mention)
+        names = [mention] if isinstance(mention, str) else [str(x) for x in (mention or [])]
+        names = [x.strip() for x in names if x and x.strip()][:5]
+        self.last_mentioned = []
+        for i, name in enumerate(names):
+            if i:
+                self.b.page.keyboard.type(" ")
+                self.b.pause(0.2, 0.4)
+            if self._insert_mention(name):
+                self.last_mentioned.append(name)
+        if names:
+            self.last_mention_ok = len(self.last_mentioned) == len(names)
+            if require_mention and names[0] not in self.last_mentioned:      # 第一个（要回复的那个人）必须 @ 上
+                log.warning("发评论：@%s 没 @ 上，这条不发了", names[0])
                 self.close_comments()
                 return FAILED
         self.b.type_slowly(text)
@@ -814,6 +919,78 @@ class Feed:
                 self._dump_comments_once("comment_send_fail", "按了发送，评论没出现在评论区")
         self.close_comments()
         return res
+
+    def _no_comments_yet(self) -> bool:
+        """这个视频本来就一条评论都没有（页面上写着“暂无评论”）：读不到评论是正常的，不用保存页面。"""
+        try:
+            tip = str(self.b.sel.get("comment_none_text") or "暂无评论")
+            return self.b.page.get_by_text(tip, exact=True).first.is_visible()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def share_to_friend(self, name: str) -> bool:
+        """把正在看的视频用抖音自己的“分享给朋友”发给一位好友：对方私信里收到的是视频卡片
+        （封面缩略图，点开直接播放），不是一串地址。
+
+        做法和人一样：鼠标移到视频右边的“分享”上（不行就点一下）→ 弹出的面板里找到这位好友（最近聊过的会直接
+        列出来，没有就在面板的搜索框里搜名字）→ 点 TA → 面板里有“分享 / 发送”按钮就点。
+        返回有没有走完这几步；视频卡片到底发出去没有，由调用的地方去私信里核对。
+        走不通时把页面保存下来（面板还开着），发给开发者就能校准。"""
+        page = self.b.page
+        btn = self.b.find("share_button", timeout=3000)
+        if btn is None:
+            log.warning("分享视频：没找到“分享”按钮")
+            return False
+        who = None
+        for how in ("hover", "click"):
+            try:
+                btn.hover(timeout=3000) if how == "hover" else btn.click(timeout=3000)
+            except Exception:  # noqa: BLE001
+                continue
+            self.b.pause(1.0, 1.6)
+            who = self._floating(name)
+            if who is None:
+                box = self.b.find("share_search", timeout=800)
+                if box is not None and self.b.safe_click(box, "分享面板的搜索框"):
+                    self.b.type_slowly(plain_name(name)[:12] or name[:12])
+                    self.b.pause(1.2, 2.0)
+                    who = self._floating(name)
+            if who is not None:
+                break
+        if who is None:
+            self._dump_comments_once("share_panel_fail", f"分享面板里没找到好友 {name}")
+            self._close_share()
+            return False
+        if not self.b.safe_click(who, f"分享面板里的 {name}"):
+            self._close_share()
+            return False
+        self.b.pause(0.8, 1.4)
+        try:
+            send = who.evaluate_handle(SHARE_SEND_JS, as_list(self.b.sel.get("share_send_texts"))).as_element()
+        except Exception:  # noqa: BLE001
+            send = None
+        if send is not None:
+            self.b.safe_click(send, "分享面板的发送按钮")
+            self.b.pause(1.0, 1.8)
+        self.b.check_captcha()
+        self._close_share()
+        return True
+
+    def _floating(self, text: str):
+        """弹出层里文字正好是 text 的元素（分享面板里的好友名）；没有返回 None。"""
+        try:
+            h = self.b.page.evaluate_handle(MENTION_PICK_JS, text)
+            return h.as_element() if h is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _close_share(self) -> None:
+        try:
+            self.b.page.keyboard.press("Escape")
+            self.b.page.mouse.move(5, 300)
+        except Exception:  # noqa: BLE001
+            pass
+        self.b.pause(0.4, 0.8)
 
     def _insert_mention(self, name: str) -> bool:
         """在评论框里 @ 一个好友：输入 @ 和名字，在弹出的候选里点选（点了才是真正的 @，对方才会收到提醒）。
@@ -922,6 +1099,24 @@ def thumb_data_url(jpeg: bytes, width: int = 220) -> str:
 
 def _collect_toast_words():
     return ("收藏成功", "已收藏", "已添加到收藏", "已加入收藏")
+
+
+def _digg_state(btn):
+    """点赞按钮的状态：True 已点赞，False 没点赞，None 认不出来（看 data-e2e-state / aria-pressed）。"""
+    try:
+        st = (btn.get_attribute("data-e2e-state", timeout=1000) or "").lower()
+        pressed = (btn.get_attribute("aria-pressed", timeout=300) or "").lower()
+    except Exception:  # noqa: BLE001
+        return None
+    if pressed in ("true", "false"):
+        return pressed == "true"
+    if not st:
+        return None
+    if any(w in st for w in ("no-digg", "not-digg", "undigg", "un-digg", "no-like")):
+        return False
+    if any(w in st for w in ("is-digg", "digged", "is-like", "liked")):
+        return True
+    return None
 
 
 def _collect_state(btn):

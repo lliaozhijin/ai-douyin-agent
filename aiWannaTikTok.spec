@@ -21,7 +21,9 @@ for pkg in ("webview", "playwright"):
 import importlib.util
 # 听视频声音（faster-whisper 和它的依赖）：装了就一起打包进去
 # 给作品配音合成视频（imageio-ffmpeg 自带 ffmpeg 程序）：装了就一起打包进去
-for pkg in ("onnxruntime", "faster_whisper", "ctranslate2", "av", "tokenizers", "huggingface_hub", "imageio_ffmpeg"):
+# “其他功能”下载视频 / 导出文案（yt-dlp 和解 YouTube 签名用的 yt-dlp-ejs 脚本）：装了就一起打包进去
+for pkg in ("onnxruntime", "faster_whisper", "ctranslate2", "av", "tokenizers", "huggingface_hub", "imageio_ffmpeg",
+            "yt_dlp", "yt_dlp_ejs"):
     if importlib.util.find_spec(pkg) is not None:
         d, b, h = collect_all(pkg)
         datas += d

@@ -119,6 +119,14 @@ def _window_size() -> tuple[tuple[int, int], tuple[int, int]]:
 
 
 def main() -> None:
+    if len(sys.argv) >= 5 and sys.argv[1] == "--probe-listen":
+        # 软件自己开的小进程：试着加载语音模型（见 agent/listen.py），试完就退出，不开窗口
+        from .agent.listen import probe_main
+        sys.exit(probe_main(sys.argv[2:5]))
+    if len(sys.argv) >= 4 and sys.argv[1] == "--probe-import":
+        # 软件自己开的小进程：试着导入一个 C++ 组件（见 native_probe.py），试完就退出
+        from .native_probe import probe_import_main
+        sys.exit(probe_import_main(sys.argv[2:4]))
     ensure_dirs()
     _setup_logging()
     log = logging.getLogger("main")

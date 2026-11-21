@@ -49,6 +49,7 @@ class Api:
         self._window = None   # 主窗口（选择文件用）
         self._ui_req = {"page": "", "seq": 0}
         self._jobs: dict[str, dict] = {}
+        self._tools = None    # “其他功能”的任务（第一次打开那一页时再准备）
 
     # ---------- 桌宠 / 其他线程要求界面切到某一页 ----------
     def request_page(self, page: str) -> None:
@@ -75,20 +76,32 @@ class Api:
             # 仪表盘“她刚刚在做什么”：一页 10 条，只展示最新的 10 页（更早的去“历史记录”看）
             "events": self._db.events_page(ev_page, 10, max_pages=10),
             "todo": self._db.messages("pending", 5),
+            # “其他功能”刚做完的任务（在别的页面时也能马上提示）
+            "tool_events": self._tools.pop_events() if self._tools is not None else [],
             "counts": self._db.message_counts(),
-            "rules_brief": {k: self._db.rules().get(k) for k in ("active_start", "active_end", "dm_reply_mode")},
+            "rules_brief": {k: self._db.rules().get(k) for k in ("active_start", "active_end")},
             "models_ready": self._models_ready(),
             "mood": self._mood_state(),
             "wishes": [{"id": d["id"], "title": d["title"], "reason": d["reason"], "seen": d["seen"]}
                        for d in self._db.drafts(include_done=False, limit=20) if d["status"] == "wish"],
             "pet": self._pet.status() if self._pet else {"running": False, "error": "", "visible": False},
             "ui_request": self._ui_req,
+            "doctor": self._agent.doctor.cards(limit=5) if hasattr(self._agent, "doctor") else [],
+            "growth": self._growth_brief(),
         }
+
+    def _growth_brief(self) -> dict:
+        try:
+            from .pet import growth
+            g = growth.status(self._db)
+            return {k: g[k] for k in ("level", "stage_name", "xp", "next_xp", "level_xp")}
+        except Exception:  # noqa: BLE001
+            return {}
 
     EVENT_GROUPS = {
         "interact": ["like", "collect", "comment", "at_friend", "comment_like", "comment_reply"],
-        "reply": ["reply_at", "reply_dm", "thread_reply", "owner_chat", "owner_share"],
-        "watch": ["skip"],
+        "reply": ["reply_at", "reply_dm", "thread_reply", "owner_chat", "owner_share", "owner_cmd"],
+        "watch": ["skip", "taste"],
         "publish": ["publish_wish", "published"],
         "system": ["pause", "info", "error"],
     }
@@ -103,7 +116,123 @@ class Api:
         data = self._db.events_page(page, 20, day=day, kinds=kinds)
         data["days"] = self._db.event_days()
         data["day"], data["group"] = day, group if kinds else ""
+        from .agent import digest
+        data["has_report"] = bool(day and digest.read(day))
         return data
+
+    # ---------- 刷视频日报 ----------
+    @_api
+    def report_get(self, day: str = ""):
+        """某一天的日报（Markdown）。还没写的（比如今天）现在写一份。"""
+        import re as _re
+        from .agent import digest
+        if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+            raise ValueError("日期不对")
+        md = digest.read(day)
+        if not md:
+            digest.write(self._db, day)
+            md = digest.read(day)
+        return {"day": day, "md": md, "list": digest.listing()}
+
+    @_api
+    def report_open(self, day: str):
+        from .paths import REPORTS_DIR
+        p = REPORTS_DIR / f"{day}.md"
+        if not p.exists():
+            raise ValueError("这天还没有日报")
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", str(p)])  # noqa: S603,S607
+        else:
+            _open_folder(REPORTS_DIR)
+        return True
+
+    # ---------- 自检提醒 ----------
+    @_api
+    def doctor_info(self):
+        d = self._agent.doctor
+        return {"cards": d.cards(include_closed=True, limit=30), "effect": d.effect()}
+
+    @_api
+    def doctor_feedback(self, cid: int, status: str):
+        self._agent.doctor.feedback(int(cid), str(status))
+        return True
+
+    @_api
+    def doctor_check(self):
+        new = self._agent.doctor.check({"running": self._agent.status().get("running"), "active": True,
+                                        "sizes": self._db.get_json("storage_sizes", {}) or {}})
+        return {"new": len(new)}
+
+    # ---------- 存储空间 ----------
+    def _storage_paths(self) -> dict:
+        from .paths import DEBUG_DIR, DRAFTS_DIR, LOG_DIR, MODELS_DIR, PROFILE_DIR, REPORTS_DIR
+        from .storage import CACHE_DIRS
+        paths = {"debug": DEBUG_DIR, "drafts": DRAFTS_DIR, "logs": LOG_DIR, "models": MODELS_DIR,
+                 "reports": REPORTS_DIR}
+        try:
+            paths["downloads"] = self._tool_jobs().settings()["dir_effective"]
+        except Exception:  # noqa: BLE001
+            pass
+        caches = [PROFILE_DIR / d for d in CACHE_DIRS if (PROFILE_DIR / d).exists()]
+        return paths, caches
+
+    @_api
+    def storage_info(self):
+        from .storage import _dir_size
+        paths, caches = self._storage_paths()
+        u = self._db.keeper.usage({k: v for k, v in paths.items()})
+        u["browser_cache"] = sum(_dir_size(c) for c in caches)
+        u["browser_running"] = bool(self._agent.browser and self._agent.browser.alive()) if self._agent.browser else False
+        return u
+
+    @_api
+    def storage_clean(self):
+        """现在整理：旧记录归档压缩、回收数据库空间、清旧的调试快照；浏览器没开着时清掉缓存。"""
+        from .paths import DEBUG_DIR, PROFILE_DIR
+        from .storage import Keeper
+        before = self.storage_info()["data"]
+        done = self._db.keeper.maintain()
+        done["debug_freed"] = Keeper.clean_debug(DEBUG_DIR)
+        running = bool(self._agent.browser and self._agent.browser.alive()) if self._agent.browser else False
+        done["cache_freed"] = 0 if running else Keeper.clean_browser_cache(PROFILE_DIR, limit=0, force=True)
+        done["cache_skipped"] = running
+        after = self.storage_info()["data"]
+        total = lambda u: u["db"] + u["wal"] + u.get("browser_cache", 0) + u.get("debug", 0)  # noqa: E731
+        done["saved"] = max(0, total(before) - total(after))
+        self._db.add_event("info", "整理了记忆仓库",
+                           f"省出 {done['saved'] / 1048576:.1f} MB" + ("（浏览器开着，缓存下次关掉时再清）" if running else ""))
+        return {"done": done, "usage": after}
+
+    # ---------- 桌宠成长 ----------
+    @_api
+    def growth_info(self):
+        from .pet import growth
+        return growth.status(self._db)
+
+    @_api
+    def growth_card(self):
+        """生成一张成长卡（PNG），返回预览（data URL）和文件位置。"""
+        from datetime import datetime as _dt
+        from pathlib import Path
+        from .paths import AVATAR_DIR, REPORTS_DIR, WEB_DIR
+        from .pet import growth
+        persona = self._db.persona()
+        av = AVATAR_DIR / persona["avatar"] if persona.get("avatar") else WEB_DIR / "assets" / "mascot.png"
+        out = growth.card(self._db, REPORTS_DIR / f"成长卡-{_dt.now().strftime('%Y%m%d-%H%M%S')}.png", Path(av))
+        data = base64.b64encode(out.read_bytes()).decode("ascii")
+        self._last_card = out
+        return {"path": str(out), "url": "data:image/png;base64," + data}
+
+    @_api
+    def growth_card_open(self):
+        p = getattr(self, "_last_card", None)
+        if not p or not p.exists():
+            raise ValueError("先生成一张成长卡")
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", str(p)])  # noqa: S603,S607
+        else:
+            _open_folder(p.parent)
+        return True
 
     def _mood_state(self) -> dict:
         m = self._brain.mood.current()
@@ -462,6 +591,22 @@ class Api:
         cur["auto_replies"] = [{"keys": str(a.get("keys") or "").strip()[:200], "reply": str(a.get("reply") or "").strip()[:300]}
                                for a in (cur.get("auto_replies") or []) if isinstance(a, dict)
                                and str(a.get("keys") or "").strip() and str(a.get("reply") or "").strip()][:50]
+        for k in ("watch_exclude", "watch_prefer"):
+            v = cur.get(k)
+            cur[k] = [str(w).strip()[:20] for w in (v if isinstance(v, list) else []) if str(w).strip()][:50]
+        import re as _re
+        for k, d in (("owner_quiet_start", "23:30"), ("owner_quiet_end", "08:00")):
+            if not _re.fullmatch(r"\d{1,2}:\d{2}", str(cur.get(k) or "")):
+                cur[k] = d
+        from .agent.commands import PERMS
+        allow = cur.get("owner_cmd_allow")
+        cur["owner_cmd_allow"] = [k for k in PERMS if isinstance(allow, list) and k in allow]
+        for k, d in (("owner_cmd_dm_per_day", 20), ("owner_cmd_comment_per_day", 10), ("owner_cmd_share_per_day", 20)):
+            try:
+                cur[k] = max(0, min(200, int(cur.get(k))))
+            except (TypeError, ValueError):
+                cur[k] = d
+        cur["owner_cmd_secret"] = str(cur.get("owner_cmd_secret") or "").strip()[:40]
         self._db.set_json("rules", cur)
         refused = []
         if isinstance((rules or {}).get("owners"), list):
@@ -548,6 +693,22 @@ class Api:
     @_api
     def get_memory(self, tab: str = "events", q: str = "", person: str = ""):
         from .agent.memory import FORGET_BELOW, HALF_LIFE_DAYS
+        if tab == "learned":
+            return self._agent.learner.listing((q or "").strip())
+        if tab == "mytaste":
+            return self._agent.my_taste.listing()
+        if tab == "faded":
+            items = self._agent.memory.archived_listing((q or "").strip())
+            total = self._db.query("SELECT COUNT(*) AS n, COALESCE(SUM(length(data)),0) AS b FROM memory_archive")[0]
+            return {"faded": items, "total": int(total["n"]), "bytes": int(total["b"]), "shown": len(items)}
+        if tab == "taste":
+            taste = self._agent.taste
+            out = []
+            for o in self._db.owners():
+                shares = self._db.query("SELECT * FROM owner_shares WHERE owner=? ORDER BY id DESC LIMIT 12", (o["name"],))
+                out.append({"name": o["name"], "call": o.get("call") or "", "taste": taste.overview(o["name"]),
+                            "profile": taste.profile(o["name"]), "shares": shares})
+            return {"owners": out}
         data = self._agent.memory.listing(tab, (q or "").strip(), (person or "").strip())
         data["half_life"] = HALF_LIFE_DAYS
         data["forget_below"] = FORGET_BELOW
@@ -567,6 +728,24 @@ class Api:
             mem.update_card(str(target), force=True)
         elif action == "delete_diary":
             mem.delete_diary(int(target))
+        elif action == "delete_knowledge":
+            self._agent.learner.delete(int(target))
+        elif action == "confirm_knowledge":
+            self._agent.learner.confirm(int(target))
+        elif action == "restore_faded":
+            if not mem.restore(int(target)):
+                raise ValueError("这条记忆找不到了")
+        elif action == "delete_faded":
+            mem.delete_archived(int(target))
+        elif action == "learn_now":
+            cost = self._agent.learner.consolidate(self._agent.brain.system, force=True)
+            return {"cost": round(cost, 4)}
+        elif action == "taste_think":
+            cost = self._agent.my_taste.refresh(self._agent.brain.system, force=True)
+            return {"cost": round(cost, 4)}
+        elif action == "reset_taste":
+            self._agent.taste.reset(str(target))
+            self._db.add_event("info", f"重新了解 {target} 的口味", "她对主人口味的了解清空了，以后重新慢慢学")
         elif action == "add_note":
             text = str(value or "").strip()
             if not text:
@@ -574,6 +753,89 @@ class Api:
             mem.remember("note", text, importance=5)
         else:
             raise ValueError(f"未知操作 {action}")
+        return True
+
+    # ---------- 其他功能：下载无水印视频、导出视频文案 ----------
+    def _tool_jobs(self):
+        if self._tools is None:
+            from .tools.jobs import ToolJobs
+            self._tools = ToolJobs(self._db, self._agent)
+        return self._tools
+
+    @_api
+    def tools_info(self):
+        from .agent.listen import Listener
+        from .tools import ytdl
+        t = self._tool_jobs()
+        from .tools.rewrite import RULES
+        return {"settings": t.settings(), "status": ytdl.status(), "asr": Listener().status(), "jobs": t.list(),
+                "rewrite_rules": RULES}
+
+    @_api
+    def tools_jobs(self):
+        """正在做的任务 + 刚做完的通知（取走一次就没了）。"""
+        t = self._tool_jobs()
+        return {"jobs": t.list(), "events": t.pop_events()}
+
+    @_api
+    def tools_start(self, kind: str, text: str, opts=None):
+        if kind not in ("video", "text"):
+            raise ValueError("未知的功能")
+        return self._tool_jobs().start(kind, str(text or ""), opts if isinstance(opts, dict) else {})
+
+    @_api
+    def tools_cancel(self, jid: str):
+        return self._tool_jobs().cancel(str(jid))
+
+    @_api
+    def tools_settings(self, data=None):
+        return self._tool_jobs().save_settings(data if isinstance(data, dict) else {})
+
+    @_api
+    def tools_setup(self, what: str):
+        if what not in ("deno", "ytdlp"):
+            raise ValueError("未知的组件")
+        return self._tool_jobs().start_setup(what)
+
+    @_api
+    def tools_pick(self, what: str = "dir"):
+        """选保存位置（文件夹）或者 cookies.txt。"""
+        import webview
+        if not self._window:
+            raise ValueError("窗口还没准备好")
+        if what == "dir":
+            got = self._window.create_file_dialog(webview.FOLDER_DIALOG) or []
+            key = "dir"
+        else:
+            got = self._window.create_file_dialog(webview.OPEN_DIALOG, file_types=("cookies 文件 (*.txt)",)) or []
+            key = "cookies"
+        if isinstance(got, str):
+            got = [got]
+        if not got:
+            return self._tool_jobs().settings()
+        return self._tool_jobs().save_settings({key: str(got[0])})
+
+    @_api
+    def tools_open(self, path: str = "", reveal: bool = True):
+        """打开下载 / 导出的文件（或者它所在的文件夹）。只打开这些任务产出的文件和保存文件夹，别的路径不打开。"""
+        from pathlib import Path
+        t = self._tool_jobs()
+        root = Path(t.settings()["dir_effective"])
+        if not path:
+            root.mkdir(parents=True, exist_ok=True)
+            _open_folder(root)
+            return True
+        p = Path(path)
+        try:                                         # 只打开保存文件夹里面的东西（任务做完不留记录了，按位置认）
+            inside = p.resolve().is_relative_to(root.resolve())
+        except (OSError, ValueError):
+            inside = False
+        if not inside or not p.exists():
+            raise ValueError("文件不在了（可能被移动或删除）")
+        if reveal and sys.platform == "win32" and p.is_file():
+            subprocess.Popen(["explorer", "/select,", str(p)])  # noqa: S603,S607
+        else:
+            _open_folder(p if p.is_dir() or not reveal else p.parent)
         return True
 
     # ---------- 互关好友 ----------
@@ -1221,8 +1483,12 @@ OSS_COMPONENTS = [
      "url": "https://github.com/huggingface/tokenizers"},
     {"name": "imageio-ffmpeg", "use": "听视频声音、给作品配音时调用 ffmpeg", "license": "BSD-2-Clause",
      "url": "https://github.com/imageio/imageio-ffmpeg"},
-    {"name": "FFmpeg（独立程序）", "use": "解出视频里的声音；把她读文案的声音和文字卡片合成视频", "license": "LGPL / GPL",
-     "url": "https://ffmpeg.org/"},
+    {"name": "FFmpeg（独立程序）", "use": "解出视频里的声音；把她读文案的声音和文字卡片合成视频；下载视频时合并画面和声音",
+     "license": "LGPL / GPL", "url": "https://ffmpeg.org/"},
+    {"name": "yt-dlp / yt-dlp-ejs", "use": "其他功能：下载 YouTube、B 站等网站的视频、读字幕", "license": "Unlicense",
+     "url": "https://github.com/yt-dlp/yt-dlp"},
+    {"name": "Deno（可选）", "use": "给 yt-dlp 跑 YouTube 的 JavaScript（点“安装 deno”时才下载）", "license": "MIT",
+     "url": "https://github.com/denoland/deno"},
     {"name": "Breeze TTS 2（BreezeBlue 的在线服务）", "use": "她的声音：语音合成（需要你自己的 Key，声音在对方服务器上生成）",
      "license": "在线服务按 BreezeBlue 的条款；商用需要付费订阅", "url": "https://breezeblue.ai/"},
     {"name": "SQLite", "use": "保存人设、记忆、记录（Python 自带）", "license": "Public Domain", "url": "https://www.sqlite.org/"},

@@ -26,6 +26,7 @@ const S = {
   st: null,
   msgFilter: "all",
   mem: { tab: "events", q: "", person: "", data: null },   // 记忆页
+  tools: null,               // 其他功能页：{settings, status, asr, jobs}
   about: null,
   msgs: [],
   counts: {},
@@ -62,12 +63,13 @@ const ICON = {
   pet: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="9" r="5"/><path d="M8 14l-2 7M16 14l2 7M9 21h6"/><circle cx="10.2" cy="8.5" r=".6" fill="currentColor"/><circle cx="13.8" cy="8.5" r=".6" fill="currentColor"/></svg>',
   history: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 7v5l3 2"/></svg>',
   logo: '<span class="logo-word">Rain</span>',
+  tools: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>',
   memory: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3V4z"/><path d="M5 17a3 3 0 0 1 3-3h11"/><path d="M9 8h6"/></svg>',
   check: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>',
 };
 const PAGES = [
   ["dashboard", "仪表盘"], ["history", "历史记录"], ["inbox", "消息中心"], ["memory", "记忆"], ["drafts", "作品"], ["persona", "人设"], ["pet", "桌宠"],
-  ["models", "模型与 API Key"], ["rules", "规则与预算"], ["settings", "设置"],
+  ["models", "模型与 API Key"], ["rules", "规则与预算"], ["tools", "其他功能"], ["settings", "设置"],
 ];
 
 /* 提示框：返回 Promise，点确认为 true，点取消、按 Esc 或点遮罩为 false */
@@ -193,7 +195,7 @@ function renderSide() {
 const EVENT_PILL = {
   like: ["brand", "点赞"], collect: ["brand", "收藏"], comment: ["brand", "点赞 + 评论"], reply_at: ["ok", "回复 @"], reply_dm: ["ok", "回复私信"],
   comment_like: ["brand", "赞评论"], comment_reply: ["ok", "回复评论"], thread_reply: ["ok", "接着聊"],
-  at_friend: ["brand", "@好友"], sticker: ["brand", "表情包"], owner_chat: ["ok", "找主人聊天"], owner_share: ["ok", "分享给主人"], publish_wish: ["warn", "想发作品"], published: ["ok", "发布作品"],
+  at_friend: ["brand", "@好友"], sticker: ["brand", "表情包"], owner_chat: ["ok", "找主人聊天"], owner_share: ["ok", "分享给主人"], owner_cmd: ["brand", "主人的命令"], taste: ["brand", "她的口味"], publish_wish: ["warn", "想发作品"], published: ["ok", "发布作品"],
   skip: ["neutral", "划走"], pause: ["bad", "暂停"], info: ["neutral", "提示"], error: ["bad", "出错"],
 };
 
@@ -259,7 +261,7 @@ function renderDashboard() {
   const tiles = st.usage.map((x) => {
     const inner = `
       <span class="k">${esc(x.label)}${DETAIL_KINDS[x.key] ? `<span class="more">详情 ›</span>` : ""}</span>
-      <div class="v"><b>${x.key === "cost" ? "¥" + Number(x.used).toFixed(2) : x.used}</b><span>/ ${x.key === "cost" ? "¥" + x.limit : x.limit}</span></div>
+      <div class="v"><b>${x.key === "cost" ? "¥" + Number(x.used).toFixed(2) : x.used}</b><span>/ ${x.unlimited ? "不限" : x.key === "cost" ? "¥" + x.limit : x.limit}</span></div>
       <div class="bar${x.key === "cost" ? " cost" : ""}"><i style="width:${x.pct}%"></i></div>`;
     return DETAIL_KINDS[x.key]
       ? `<button type="button" class="tile tile-btn" data-act="activity" data-k="${x.key}" title="点开看今天的详情">${inner}</button>`
@@ -272,18 +274,16 @@ function renderDashboard() {
   const feedPager = pager(ev.page, ev.pages, "ev-page") +
     `<button type="button" class="btn btn-sm btn-link" data-act="nav" data-page="history">${ev.total > ev.shown ? `更早的 ${ev.total - ev.shown} 条在历史记录里` : "按日期查看历史记录"} ›</button>`;
   const todo = st.todo.length ? st.todo.map((m) => `
-    <div class="todo-item"><span>${{ at: "@", reply: "评论" }[m.kind] || "私信"} ${esc(m.user_name)}：${esc((m.reason || "").slice(0, 30))}</span>
+    <div class="todo-item"><span>${{ at: "@", reply: "评论", work: "作品评论" }[m.kind] || "私信"} ${esc(m.user_name)}：${esc((m.reason || "").slice(0, 30))}</span>
     <button type="button" class="btn btn-sm" data-act="goto-msg" data-id="${m.id}">去看看</button></div>`).join("")
     : `<p class="empty">暂时没有需要你处理的事</p>`;
   const cur = a.current || {};
   const stateCls = { running: "ok", resting: "neutral", captcha: "bad", paused: "warn", error: "bad", login: "warn" }[a.state] || "neutral";
-  const rb = st.rules_brief;
-  const nextInbox = a.running
-    ? ` · 私信${rb.dm_reply_mode === "5min" ? "每 5 分钟回一次" : "秒回"} · ${a.next_at_s > 0 ? `${Math.ceil(a.next_at_s / 60)} 分钟后去看 @ 和评论回复` : "马上去看 @ 和评论回复"}`
-      + (a.notice_checked && a.notice_checked.at
-        ? `（上次 ${esc(String(a.notice_checked.at).slice(11, 16))} 看过：新 @ ${a.notice_checked.new_at} 条、新回复 ${a.notice_checked.new_reply} 条）`
-        : "")
-    : "";
+  const nc = a.notice_checked || {};
+  const nextInbox = !a.running ? ""
+    : a.draining ? " · 正在先把攒下的评论和私信回完，回完就开始刷视频"
+    : ` · 有人找她就回（私信、@ 她、回复她的评论、评论她的作品）`
+      + (nc.at ? `（上次 ${esc(String(nc.at).slice(11, 16))} 看互动消息：要回的 @ ${nc.new_at} 条、回复 ${nc.new_reply} 条、作品评论 ${nc.new_work || 0} 条）` : "");
 
   $("#main").innerHTML = `
     <header class="page-head">
@@ -303,9 +303,12 @@ function renderDashboard() {
         <span class="hi">${greet()}</span>
         <span>今天我已经刷了 ${u.videos?.used || 0} 个视频、点了 ${u.likes?.used || 0} 个赞、回复了 ${replies} 条消息！${st.todo.length ? `有 ${st.todo.length} 件事想请你帮忙看看哦` : "今天也要元气满满"}<span class="cute-only"> ♡</span></span>
         ${a.detail ? `<span style="font-size:13px;color:var(--muted)">${esc(a.detail)}</span>` : ""}
+        <span class="hello-links">${st.growth && st.growth.level ? `<button type="button" class="pill ok growth-chip" data-act="nav" data-page="pet" title="经验 ${st.growth.xp}，下一级 ${st.growth.next_xp}">Lv.${st.growth.level} ${esc(st.growth.stage_name)}</button>` : ""}
+          <button type="button" class="btn btn-sm btn-link" data-act="report-view" data-day="${esc(yesterday())}">昨天的刷视频日报 ›</button></span>
       </div>
       ${moodCard(st.mood)}
     </section>
+    ${doctorCards(st.doctor || [])}
     ${(st.wishes || []).length ? `<div class="alert wish-alert"><span>💌 您的小可爱想发作品：《${esc(st.wishes[0].title || "未命名")}》${st.wishes.length > 1 ? ` 等 ${st.wishes.length} 个` : ""}</span><button type="button" class="btn btn-sm btn-primary" data-act="goto-draft" data-id="${st.wishes[0].id}">去看看</button></div>` : ""}
     <section class="tiles" aria-label="今日用量">${tiles}</section>
     <div class="row">
@@ -320,6 +323,57 @@ function renderDashboard() {
         <section class="card"><h2>${HEART}需要你帮忙 · ${st.todo.length}</h2>${todo}</section>
       </div>
     </div>`;
+}
+
+function yesterday() {
+  return new Date(Date.now() - 86400000 - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+}
+
+/* 她的自检提醒卡：规则发现的问题 + 证据 + 建议，你可以说有用 / 没用 / 知道了 */
+function doctorCards(cards) {
+  if (!cards.length) return "";
+  return `<section class="card doctor" aria-label="她的自检"><h2>${HEART}她的自检 · ${cards.length}</h2>
+    ${cards.map((c) => `<div class="doc-card">
+      <div class="doc-title">${esc(c.title)}</div>
+      ${c.evidence ? `<pre class="doc-ev">${esc(c.evidence)}</pre>` : ""}
+      <p class="hint" style="margin:0">${esc(c.suggestion)}</p>
+      <div class="actions"><button type="button" class="btn btn-sm" data-act="doc-fb" data-id="${c.id}" data-s="helpful">有用</button>
+        <button type="button" class="btn btn-sm" data-act="doc-fb" data-id="${c.id}" data-s="useless">没用</button>
+        <button type="button" class="btn btn-sm btn-link" data-act="doc-fb" data-id="${c.id}" data-s="dismissed">知道了</button></div>
+    </div>`).join("")}
+    <p class="hint" style="margin:0"><button type="button" class="btn btn-sm btn-link" data-act="doc-history">看看最近的自检效果 ›</button></p>
+  </section>`;
+}
+
+/* 很简单的 Markdown 显示（日报用）：标题、加粗、列表、链接 */
+function mdToHtml(md) {
+  const inline = (t) => esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/(https?:\/\/[^\s<]+)/g, (u) => `<button type="button" class="btn-link link-btn" data-act="open-video" data-url="${u}">${u}</button>`);
+  const out = [];
+  let list = null;
+  for (const raw of (md || "").split("\n")) {
+    const line = raw.replace(/\s+$/, "");
+    const li = line.match(/^(\s*)(?:[-*]|\d+\.)\s+(.*)$/);
+    if (li) {
+      if (!list) { out.push("<ul class=\"md-list\">"); list = true; }
+      out.push(`<li class="${li[1].length ? "sub" : ""}">${inline(li[2])}</li>`);
+      continue;
+    }
+    if (list) { out.push("</ul>"); list = null; }
+    if (/^#\s/.test(line)) out.push(`<h2>${inline(line.slice(2))}</h2>`);
+    else if (/^##\s/.test(line)) out.push(`<h3 class="sub-h">${inline(line.slice(3))}</h3>`);
+    else if (line.trim()) out.push(`<p>${inline(line)}</p>`);
+  }
+  if (list) out.push("</ul>");
+  return `<div class="md">${out.join("")}</div>`;
+}
+
+async function showReport(day) {
+  const r = await call("report_get", day);
+  if (!r) return;
+  const html = r.md ? mdToHtml(r.md.replace(/^# .*\n+/, "")) : `<p class="empty">${esc(day)} 这天没有刷视频，也没有人找她，所以没有日报</p>`;
+  const ok = await dialog({ title: `刷视频日报 · ${day}`, html, ok: r.md ? "在文件夹里看" : "关闭", cancel: r.md ? "关闭" : "", wide: true });
+  if (ok && r.md) await call("report_open", day);
 }
 
 /* 一条操作记录（仪表盘和历史记录共用）；withDate 时时间前面带日期 */
@@ -452,12 +506,13 @@ function renderHistory() {
           <button type="button" class="btn btn-sm" data-act="h-shift" data-n="1" ${h.day && h.day < today ? "" : "disabled"} aria-label="后一天">后一天 ›</button>
           <button type="button" class="btn btn-sm${h.day === today ? " btn-primary" : ""}" data-act="h-day" data-day="${today}">今天</button>
           <button type="button" class="btn btn-sm${!h.day ? " btn-primary" : ""}" data-act="h-day" data-day="">全部日期</button>
+          ${h.day ? `<button type="button" class="btn btn-sm" data-act="report-view" data-day="${esc(h.day)}">看这天的日报</button>` : ""}
         </div>
         <label class="hist-kind"><span>类型</span>
           <select id="h-group" class="input">${HIST_GROUPS.map(([k, v]) => `<option value="${k}" ${h.group === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
       </div>
       ${chips ? `<div class="chips" aria-label="最近有记录的日期">${chips}</div>` : ""}
-      <p class="hint" style="margin:6px 0 0">${h.day ? esc(h.day) : "全部日期"} · ${HIST_GROUPS.find((g) => g[0] === h.group)[1]} · 共 ${d.total} 条</p>
+      <p class="hint" style="margin:6px 0 0">${h.day ? esc(h.day) : "全部日期"} · ${HIST_GROUPS.find((g) => g[0] === h.group)[1]} · 共 ${d.total} 条${d.archived ? "（这天的记录已经压缩归档，是解压出来给你看的）" : ""}${!h.day ? "；更早的记录压缩归档了，选一个日期就能看" : ""}</p>
       <ul class="feed">${list}</ul>
       <div class="pager-row">${pager(d.page, d.pages, "h-page")}</div>
     </section>`;
@@ -483,7 +538,7 @@ const MOOD_LABEL = { happy: "开心", excited: "兴奋", clingy: "想撒娇", gr
 /* ---------- 消息中心 ---------- */
 const MSG_STATUS = {
   replied: ["ok", "已自动回复"], manual: ["ok", "已手动处理"], pending: ["warn", "待你处理"],
-  skipped_sensitive: ["neutral", "跳过 · 敏感"], skipped_limit: ["neutral", "跳过 · 额度用完"], skipped_gone: ["neutral", "跳过 · 视频已删除"], skipped_old: ["neutral", "跳过 · 之前收到的"], uncertain: ["warn", "可能已发出"],
+  skipped_sensitive: ["neutral", "跳过 · 敏感"], skipped_limit: ["neutral", "跳过 · 额度用完"], skipped_gone: ["neutral", "跳过 · 视频已删除"], skipped_old: ["neutral", "以前的版本没回"], merged: ["ok", "已一起回复"], uncertain: ["warn", "可能已发出"],
   failed: ["bad", "发送失败"], blocked: ["neutral", "不回复此人"], skipped_scope: ["neutral", "跳过 · 没关注她"],
 };
 
@@ -514,7 +569,7 @@ async function loadMessages() {
   if (!S.selMsg && S.msgs.length) S.selMsg = S.msgs[0].id;
 }
 
-const KIND_TEXT = { at: "评论里 @ 了她", reply: "回复了她的评论", dm: "私信" };
+const KIND_TEXT = { at: "评论里 @ 了她", reply: "回复了她的评论", work: "评论了她的作品", dm: "私信" };
 
 /* 同一个人的消息合成一组，不管是私信还是评论区：左边每人只有一个框（显示最新的一条），
    右边按时间显示和 TA 的来回，每一条标着是私信、评论里 @ 她，还是回复她的评论 */
@@ -589,7 +644,7 @@ function renderInbox() {
       <p class="hint" style="margin:0">下面的操作针对选中的这一条（${esc(m.created_at.slice(5, 16))}，<span class="pill ${cls}">${label}</span>）；点上面某一条的时间可以换一条。</p>
       ${m.reason ? `<p style="margin:0;color:var(--warn-text)">${m.status === "replied" ? "" : "没有自动发出："}${esc(m.reason)}</p>` : ""}
       <dl class="meta">
-        <div><dt>类型</dt><dd>${{ at: "评论 @", reply: "回复她的评论" }[m.kind] || "私信"}</dd></div>
+        <div><dt>类型</dt><dd>${{ at: "评论 @", reply: "回复她的评论", work: "评论她的作品" }[m.kind] || "私信"}</dd></div>
         <div><dt>收到时间</dt><dd>${esc(m.created_at)}</dd></div>
         <div><dt>花费</dt><dd>¥${Number(m.cost || 0).toFixed(3)} · ${m.tokens || 0} token</dd></div>
       </dl>
@@ -614,7 +669,7 @@ function renderInbox() {
 }
 
 /* ---------- 记忆 ---------- */
-const MEM_KIND = { video: "看过的视频", dm: "私信", thread: "评论区", at: "被 @", post: "发作品", note: "你告诉她的" };
+const MEM_KIND = { video: "看过的视频", dm: "私信", thread: "评论区", at: "被 @", post: "发作品", note: "你告诉她的", self: "她自己" };
 const IMPORTANCE = [[1, "1 · 小事"], [2, "2"], [3, "3 · 一般"], [4, "4"], [5, "5 · 重要（永远不忘）"]];
 
 async function loadMemory() {
@@ -623,7 +678,7 @@ async function loadMemory() {
 
 function renderMemory() {
   const d = S.mem.data || {};
-  const tabs = [["events", "具体的事"], ["people", "私信好友"], ["diary", "日记"]]
+  const tabs = [["events", "具体的事"], ["people", "私信好友"], ["mytaste", "她的口味"], ["learned", "她学到的"], ["taste", "主人的口味"], ["faded", "淡忘的"], ["diary", "日记"]]
     .map(([k, l]) => `<button type="button" role="tab" aria-selected="${S.mem.tab === k}" data-act="mem-tab" data-t="${k}">${l}</button>`).join("");
   let body = "";
   if (S.mem.tab === "events") {
@@ -665,6 +720,94 @@ function renderMemory() {
       </section>`).join("");
     body = `<p class="hint" style="margin:0">只有和她私信聊过的人才有印象卡。评论区里的人不建卡：她只记那一串评论和那个视频的上下文，过几天就淡了。</p>
       ${cards || `<section class="card"><p class="empty">还没有私信好友</p></section>`}`;
+  } else if (S.mem.tab === "learned") {
+    const SRC = { video: "刷到的视频", comment: "评论区", dm: "私信" };
+    const rows = (d.knowledge || []).map((k) => `
+      <tr>
+        <td style="white-space:nowrap;color:var(--muted)">${esc((k.updated_at || "").slice(5, 10))}<br>${esc(k.topic || "")}</td>
+        <td>${esc(k.fact)}<br><small style="color:var(--muted)">从${esc(SRC[k.source] || k.source)}${k.ref && k.source !== "dm" ? `《${esc(k.ref)}》` : ""}学到的${k.uses ? ` · 用上过 ${k.uses} 次` : ""}</small></td>
+        <td style="white-space:nowrap">${k.status === "candidate"
+          ? `<span class="pill warn" title="又在别处见到 ${3 - Math.min(3, k.hits || 1)} 次（而且在两天以上见到）就算确认">候选 · 见到 ${k.hits || 1} 次</span>`
+          : `<span class="pill ${k.confidence >= 0.8 ? "ok" : "neutral"}">${k.confidence >= 0.8 ? "确认 · 很确定" : "确认 · 比较确定"}</span>`}</td>
+        <td style="white-space:nowrap">${k.status === "candidate" ? `<button type="button" class="btn btn-sm" data-act="know-ok" data-id="${k.id}">确认</button> ` : ""}<button type="button" class="btn btn-sm btn-danger" data-act="know-del" data-id="${k.id}">删除</button></td>
+      </tr>`).join("");
+    body = `
+      <section class="card"><h2>${HEART}她自己学到的东西</h2>
+        <p class="hint" style="margin:0">她每天刷视频、看评论区、和别人私信聊天的时候，会把觉得新鲜的东西记下来；攒够一批（或者隔一天）自己整理一次：
+          新东西记下，和以前学到的说的是一回事就合并，发现以前理解错了就改掉。刚学到的先当“候选”，在两天以上又见到同样的说法（一共 3 次）才算确认，你也可以直接确认或删掉；候选 30 天没再见到就忘掉。
+          聊天、评论的时候用得上就会自然地用（候选会说得保守一点）。不记具体某个人的隐私。
+          现在一共 ${d.total || 0} 条（其中候选 ${d.candidates || 0} 条），还有 ${d.waiting || 0} 条见闻等着整理。</p>
+        <div class="actions">
+          <label class="sr-only" for="mem-q">搜索学到的东西</label><input id="mem-q" class="input" style="max-width:260px" placeholder="搜一搜，比如 梗" value="${esc(S.mem.q)}">
+          <button type="button" class="btn btn-sm" data-act="mem-search">搜索</button>
+          ${S.mem.q ? `<button type="button" class="btn btn-sm" data-act="mem-clear">看全部</button>` : ""}
+          <button type="button" class="btn btn-sm" data-act="learn-now" ${d.waiting ? "" : "disabled"}>现在整理一次</button>
+        </div>
+        ${rows ? `<div class="table-wrap"><table class="oss-table mem-table"><thead><tr><th>哪天</th><th>学到的</th><th>把握</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="empty">还没有学到的东西。她刷一阵视频、聊几次天以后，这里会慢慢多起来</p>`}
+      </section>`;
+  } else if (S.mem.tab === "faded") {
+    const rows = (d.faded || []).map((m) => `
+      <tr>
+        <td style="white-space:nowrap;color:var(--muted)">${esc((m.day || "").slice(5))}<br>${esc(MEM_KIND[m.kind] || m.kind || "")}</td>
+        <td>${esc(m.summary || "")}${m.person ? `<br><small style="color:var(--muted)">和 ${esc(m.person)} 有关</small>` : ""}</td>
+        <td style="white-space:nowrap;color:var(--muted)">${esc((m.archived_at || "").slice(5, 10))} 淡忘</td>
+        <td style="white-space:nowrap"><button type="button" class="btn btn-sm" data-act="faded-back" data-id="${m.id}">想起来</button>
+          <button type="button" class="btn btn-sm btn-danger" data-act="faded-del" data-id="${m.id}">彻底删除</button></td>
+      </tr>`).join("");
+    body = `
+      <section class="card"><h2>${HEART}她淡忘了的事</h2>
+        <p class="hint" style="margin:0">记得不牢的事慢慢就淡忘了：她平时不会再主动想起，但没有丢——压缩以后留着（一共 ${d.total || 0} 条，只占 ${((d.bytes || 0) / 1024).toFixed(1)} KB）。
+          以后有人聊起相关的事，她会“突然想起来”；你也可以点“想起来”把某一条放回去。</p>
+        <div class="actions">
+          <label class="sr-only" for="mem-q">搜索淡忘的事</label><input id="mem-q" class="input" style="max-width:260px" placeholder="搜一搜" value="${esc(S.mem.q)}">
+          <button type="button" class="btn btn-sm" data-act="mem-search">搜索</button>
+          ${S.mem.q ? `<button type="button" class="btn btn-sm" data-act="mem-clear">看全部</button>` : ""}
+        </div>
+        ${rows ? `<div class="table-wrap"><table class="oss-table mem-table"><thead><tr><th>哪天</th><th>那件事</th><th>什么时候淡忘的</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="empty">还没有淡忘的事</p>`}
+      </section>`;
+  } else if (S.mem.tab === "mytaste") {
+    const pf = d.profile || {};
+    const LISTS = [["loves", "一直喜欢的", "ok"], ["rising", "最近迷上的", "ok"], ["tired", "有点看腻的", "warn"], ["curious", "听人说起、想去看看的", "neutral"]];
+    const lists = LISTS.filter(([k]) => (pf[k] || []).length).map(([k, l, c]) => `<div><dt>${l}</dt><dd>${(pf[k] || []).map((t) => `<span class="pill ${c}">${esc(t)}</span>`).join(" ")}</dd></div>`).join("");
+    const rows = (d.topics || []).map((t) => `
+      <tr>
+        <td>${esc(t.topic)}</td>
+        <td style="white-space:nowrap"><span class="pill ${t.score >= 1 ? "ok" : t.score < 0 ? "bad" : "neutral"}">${t.score}</span>${t.trend >= 0.6 ? ` <small style="color:var(--brand)">↑ 更喜欢了</small>` : t.trend <= -0.6 ? ` <small style="color:var(--muted)">↓ 淡了</small>` : ""}</td>
+        <td style="white-space:nowrap;color:var(--muted)">刷到 ${t.seen} 个 · 8 分以上 ${t.loved} 个 · 点赞 / 收藏 / 评论 ${t.acted} 个 · 聊到 ${t.talked} 次</td>
+        <td style="white-space:nowrap;color:var(--muted)">${esc((t.last_at || "").slice(5, 16))}</td>
+      </tr>`).join("");
+    body = `
+      <section class="card"><div class="actions" style="justify-content:space-between"><h2>${HEART}她最近的口味</h2>
+          <button type="button" class="btn btn-sm" data-act="taste-think">让她现在想一想</button></div>
+        <p class="hint" style="margin:0">不用你设置：人设里的兴趣（${esc((d.start || []).join("、") || "没写")}）只是她一开始的样子，之后爱看什么全跟着她自己的经历变——
+          刷到的视频给了几分、点没点赞、收没收藏、写没写评论，私信和评论区里别人聊起的、她自己说起的，都会让那一类的分数涨一点或掉一点；每一类每天还会自然淡 5%，好久没刷到、没聊到的慢慢就不那么喜欢了。
+          每天（或者攒够一批经历）她会回头看看自己，写一段“我最近的口味”，带进她说的每一句话里（刷视频、回私信、回评论、找主人聊天都是同一个她）；刷视频时看腻了的那一类少看一点，听人说起的那一类多看看。
+          现在有 ${d.waiting || 0} 件新经历还没想过。</p>
+        ${pf.line ? `<p style="margin:10px 0 0;font-size:1.05em">“${esc(pf.line)}”</p><small style="color:var(--muted)">${esc((pf.at || "").slice(5, 16))} 想的</small>` : `<p class="empty">她还没回头想过自己的口味：刷一阵视频、聊几次天以后会自己想</p>`}
+        ${lists ? `<dl class="meta">${lists}</dl>` : ""}
+      </section>
+      <section class="card"><h2>${HEART}每一类视频现在有多喜欢</h2>
+        ${rows ? `<div class="table-wrap"><table class="oss-table mem-table"><thead><tr><th>哪一类</th><th>喜欢程度</th><th>经历</th><th>最近一次</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="empty">还没有。她刷视频、聊天以后这里会慢慢多起来</p>`}
+      </section>`;
+  } else if (S.mem.tab === "taste") {
+    const ST = { sent: ["neutral", "等 TA 反应"], liked: ["ok", "TA 喜欢"], neutral: ["neutral", "一般"], disliked: ["bad", "TA 不喜欢"], ignored: ["neutral", "没反应"] };
+    const cards = (d.owners || []).map((o) => {
+      const chips = (o.taste || []).map((t) => `<span class="pill ${t.like >= 0.55 ? "ok" : t.like < 0.3 ? "bad" : "neutral"}" title="把握：${t.evidence} 次证据${t.said ? "，TA 自己说过" + t.said : ""}">${esc(t.topic)} ${Math.round(t.like * 100)}%</span>`).join(" ");
+      const shares = (o.shares || []).map((x) => {
+        const [c, l] = ST[x.status] || ["neutral", x.status];
+        return `<li>${esc((x.created_at || "").slice(5, 16))} · ${x.way === "dm" ? "私信分享" : "评论里 @"} 《${esc((x.title || "（无文案）").slice(0, 24))}》（${esc(x.topic || "")}） <span class="pill ${c}">${l}</span></li>`;
+      }).join("");
+      return `<section class="card">
+        <div class="actions" style="justify-content:space-between"><h2>${HEART}${esc(o.call || o.name)}${o.call ? `（${esc(o.name)}）` : ""}</h2>
+          <button type="button" class="btn btn-sm" data-act="taste-reset" data-name="${esc(o.name)}">重新了解</button></div>
+        <p style="margin:0">${o.profile ? esc(o.profile) : `<span style="color:var(--muted)">还不了解 TA 的口味：先少分享、多聊天，慢慢就知道了</span>`}</p>
+        ${chips ? `<div class="chips" style="margin-top:8px">${chips}</div>` : ""}
+        ${shares ? `<h3 class="sub-h">最近分享给 TA 的</h3><ul style="margin:0;padding-left:18px;line-height:1.9">${shares}</ul>` : ""}
+      </section>`;
+    }).join("");
+    body = `<p class="hint" style="margin:0">她不会什么视频都分享给主人、都 @ 主人：主人在聊天里说过喜欢 / 不喜欢看什么，分享以后 TA 是喜欢、一般、不喜欢还是没反应，她都记着，
+      越了解越只挑 TA 真想看的（百分比是她觉得主人会喜欢这类视频的把握）。同一类视频一天最多分享一次。</p>
+      ${cards || `<section class="card"><p class="empty">还没有设主人（在“规则与预算 → 主人”里设置）</p></section>`}`;
   } else {
     const LV = { day: "日记", week: "周记", month: "月记" };
     const items = (d.diary || []).map((x) => `
@@ -677,7 +820,7 @@ function renderMemory() {
       ${items || `<section class="card"><p class="empty">还没有日记。过完一天（或者当天活跃时段结束后）她会自己写</p></section>`}`;
   }
   $("#main").innerHTML = `
-    <header class="page-head"><div><h1>记忆</h1><p>她记得什么、对谁有什么印象、每天写了什么日记。你可以删掉某条记忆、调整它有多重要，或者让她忘掉某个人</p></div></header>
+    <header class="page-head"><div><h1>记忆</h1><p>她记得什么、对谁有什么印象、自己学到了什么、了解到主人爱看什么、每天写了什么日记。你可以删掉某条记忆、调整它有多重要，或者让她忘掉某个人</p></div></header>
     <div class="tabs" role="tablist" aria-label="记忆分类">${tabs}</div>
     ${body}`;
   const q = $("#mem-q"); if (q) q.addEventListener("keydown", (e) => { if (e.key === "Enter") ACT["mem-search"](); });
@@ -754,7 +897,7 @@ function renderPersona() {
               <select id="p-mbti" class="input">${MBTI.map((m) => `<option value="${m}" ${(p.mbti || "") === m ? "selected" : ""}>${m || "不选"}</option>`).join("")}</select></div>
           </div>
           <div class="grid">${traits}</div>
-          <div class="field"><span class="label">她感兴趣的内容（刷到这些更愿意停下来看）</span><div class="chips">${chips}</div>
+          <div class="field"><span class="label">她一开始感兴趣的内容（之后她的口味会跟着每天刷到的、聊到的自己慢慢变，在“记忆 → 她的口味”里看）</span><div class="chips">${chips}</div>
             <div class="actions"><input id="new-interest" class="input" style="max-width:220px" placeholder="自定义兴趣"><button type="button" class="btn btn-sm" data-act="add-interest">+ 添加</button></div></div>
           <div class="grid">
             <div class="field"><label for="p-catch">口头禅</label><input id="p-catch" class="input" value="${esc(p.catchphrases)}"></div>
@@ -929,7 +1072,7 @@ function collectProvider() {
 /* ---------- 规则 ---------- */
 const LIMITS = [["videos", "看视频（个）"], ["likes", "点赞（次）"], ["collects", "收藏视频（个）"], ["comments", "发评论（条）"],
   ["comment_likes", "赞别人的评论（次）"], ["comment_replies", "回复别人的评论（条）"], ["cost", "模型花费（元）"]];
-// “回复 @”和“回复私信”的每日上限放在“回复规则”里，和回复速度一起设置
+// 回复找她的人（@、评论回复、作品评论、私信）不设上限：有人找她就回
 
 function renderRules() {
   const r = S.rules;
@@ -962,34 +1105,15 @@ function renderRules() {
           <label class="toggle-row"><span>刷到广告直接划走（不看、不点赞、不评论，也不花模型的钱）</span><input id="r-ads" type="checkbox" ${r.skip_ads !== false ? "checked" : ""}></label>
           <label class="toggle-row"><span>刷到特别喜欢、想以后再看的视频时收藏（她自己决定收不收）</span><input id="r-col" type="checkbox" ${r.collect_enabled !== false ? "checked" : ""}></label>
           <label class="toggle-row"><span>刷视频时给喜欢的评论点赞、回复别人的评论</span><input id="r-cm" type="checkbox" ${r.engage_comments !== false ? "checked" : ""}></label>
-          <h3 class="sub-h">评论区里 @ 她（让她看视频、分析内容）</h3>
-          <label class="toggle-row"><span>有人 @ 她时自动回复</span><input id="r-at" type="checkbox" ${r.auto_reply_at ? "checked" : ""}></label>
-          <div class="toggle-row"><label for="r-atint">多久去看一次（分钟）</label><input id="r-atint" type="number" min="1" class="input" style="max-width:120px" value="${r.at_interval ?? 10}"></div>
-          <div class="toggle-row"><label for="r-atmax">每天最多回复（条）</label><input id="r-atmax" type="number" min="0" class="input" style="max-width:120px" value="${r.limits.replies_at}"></div>
-          <p class="hint">回复 @ 要先看那个视频、截画面给模型看，比较费 token；间隔长一点、上限低一点更省钱。</p>
-          <h3 class="sub-h">私信</h3>
-          <label class="toggle-row"><span>收到私信时自动回复</span><input id="r-dm" type="checkbox" ${r.auto_reply_dm ? "checked" : ""}></label>
-          <div class="toggle-row"><label for="r-dmmode">回复速度</label>
-            <select id="r-dmmode" class="input" style="max-width:260px">
-              <option value="instant" ${(r.dm_reply_mode || "instant") === "instant" ? "selected" : ""}>秒回（大约 1 分钟内）</option>
-              <option value="5min" ${r.dm_reply_mode === "5min" ? "selected" : ""}>每 5 分钟回一次</option>
-            </select></div>
-          <div class="toggle-row"><label for="r-dmmax">每天最多回复（条）</label><input id="r-dmmax" type="number" min="0" class="input" style="max-width:120px" value="${r.limits.replies_dm}"></div>
-          <div class="toggle-row"><label for="r-scope">私信回复谁</label>
-            <select id="r-scope" class="input" style="max-width:260px">
-              <option value="all" ${r.dm_scope !== "followers" ? "selected" : ""}>回复所有人</option>
-              <option value="followers" ${r.dm_scope === "followers" ? "selected" : ""}>只回复关注了她的人</option>
-            </select></div>
-          <p class="hint">“只回复关注了她的人”：她会去对方主页看关注按钮（显示“回关”或“互相关注”就说明对方关注了她）；没关注的不回，确认不了的放进“待你处理”。</p>
-          <div class="toggle-row"><label for="r-watch">别人分享的视频最多完整看（分钟）</label><input id="r-watch" type="number" min="0.5" step="0.5" class="input" style="max-width:120px" value="${r.share_watch_minutes ?? 3}"></div>
-          <div class="toggle-row"><label for="r-sframes">看分享视频时截几帧给模型看</label><input id="r-sframes" type="number" min="0" max="12" class="input" style="max-width:120px" value="${r.share_frames ?? 6}"></div>
-          <p class="hint">私信里有人分享视频让她分析时，她会先把视频从头看到尾再回复；更长的视频，超过的部分快进着看。截的帧越多越准，也越费 token。</p>
-          <h3 class="sub-h">有人回复她的评论（接着聊）</h3>
-          <label class="toggle-row"><span>有人回复她的评论时，接着回复</span><input id="r-th" type="checkbox" ${r.auto_reply_thread !== false ? "checked" : ""}></label>
-          <div class="toggle-row"><label for="r-thmax">同一条评论下，她最多回复几次</label><input id="r-thmax" type="number" min="1" max="20" class="input" style="max-width:120px" value="${r.thread_max_replies ?? 3}"></div>
-          <div class="toggle-row"><label for="r-thday">每天最多接着聊（条）</label><input id="r-thday" type="number" min="0" class="input" style="max-width:120px" value="${r.limits.thread_replies ?? 20}"></div>
-          <p class="hint">回到上限时，最后一句她会自然地收个尾（比如“聊得好开心～”），之后这串对话就不再回了。评论区里她不记人，只记这一串评论和这个视频的上下文。</p>
-          <div class="toggle-row"><label for="r-per">同一个人每天最多回复</label><input id="r-per" type="number" min="1" class="input" style="max-width:120px" value="${r.per_user_daily}"></div>
+          <div class="field"><label for="r-wex">不想让她看的关键词（逗号分隔）<span class="hint" style="display:block;margin:2px 0 0">视频标题、作者、话题里出现这些词就直接划走：不看、不互动，也不花模型的钱。</span></label><input id="r-wex" class="input" placeholder="比如：赌博, 恐怖" value="${esc((r.watch_exclude || []).join(", "))}"></div>
+          <div class="field"><label for="r-wpr">想让她多看的关键词（逗号分隔）<span class="hint" style="display:block;margin:2px 0 0">出现这些词时她会更感兴趣一点（兴趣 +1），但还是她自己决定互不互动。</span></label><input id="r-wpr" class="input" placeholder="比如：猫, 做饭, 旅行" value="${esc((r.watch_prefer || []).join(", "))}"></div>
+          <h3 class="sub-h">有人找她的时候</h3>
+          <p class="hint" style="margin:0">评论区里 @ 她的、回复她评论的、在她作品下评论的，还有私信：不设开关、不设上限，有人找她，她都会去看、看懂、回复。
+            每次点“开始刷视频”、每天活跃时段开始的时候，她先把攒下的评论和私信全部回完，再去刷视频；之前收到还没回的也会回。
+            回复时会把前后的聊天记录、那一串评论、TA 以前和她聊过的事连起来看，不会只看一句话就回。</p>
+          <div class="toggle-row"><label for="r-watch">别人分享给她的视频，最多完整看（分钟）</label><input id="r-watch" type="number" min="0.5" step="0.5" class="input" style="max-width:120px" value="${r.share_watch_minutes ?? 3}"></div>
+          <div class="toggle-row"><label for="r-sframes">看分享的视频时截几帧给模型看</label><input id="r-sframes" type="number" min="0" max="12" class="input" style="max-width:120px" value="${r.share_frames ?? 6}"></div>
+          <p class="hint">更长的视频，超过的部分快进着看。截的帧越多越准，也越费 token。</p>
         </section>
         ${friendsSection(r)}
         ${ownersSection(r)}
@@ -1027,11 +1151,8 @@ function collectRules() {
   return {
     limits: {
       ...Object.fromEntries(LIMITS.map(([k]) => [k, Number($("#l-" + k).value) || 0])),
-      replies_at: Number($("#r-atmax").value) || 0, replies_dm: Number($("#r-dmmax").value) || 0,
-      thread_replies: Number($("#r-thday").value) || 0, at_friends: Number($("#r-atfday").value) || 0,
-      publishes: Number($("#r-pubday").value) || 0,
+      at_friends: Number($("#r-atfday").value) || 0, publishes: Number($("#r-pubday").value) || 0,
     },
-    auto_reply_thread: $("#r-th").checked, thread_max_replies: Math.max(1, num("#r-thmax") || 3),
     at_friends_enabled: $("#r-atf").checked, at_friend_per_day: Math.max(1, num("#r-atfper") || 1),
     publish_enabled: $("#r-pub").checked, publish_start: $("#r-pubs").value || "11:00", publish_end: $("#r-pube").value || "21:00",
     image_gen_provider: $("#r-igp").value, image_gen_model: $("#r-igm").value.trim(), image_gen_size: $("#r-igs").value.trim(),
@@ -1039,23 +1160,29 @@ function collectRules() {
     active_start: $("#r-start").value || "09:00", active_end: $("#r-end").value || "23:00",
     dwell_min: num("#r-dmin"), dwell_max: Math.max(num("#r-dmax"), num("#r-dmin")),
     rest_every: num("#r-every"), rest_min: num("#r-rmin"), rest_max: Math.max(num("#r-rmax"), num("#r-rmin")),
-    at_interval: Math.max(1, num("#r-atint") || 10), dm_reply_mode: $("#r-dmmode").value,
     interest_threshold: num("#r-thr"), frames_per_video: num("#r-frames"),
-    auto_reply_at: $("#r-at").checked, auto_reply_dm: $("#r-dm").checked, engage_comments: $("#r-cm").checked, collect_enabled: $("#r-col").checked, skip_ads: $("#r-ads").checked, listen_enabled: $("#r-listen").checked, listen_model: $("#r-lmodel").value, dm_scope: $("#r-scope").value,
+    engage_comments: $("#r-cm").checked, collect_enabled: $("#r-col").checked, skip_ads: $("#r-ads").checked, listen_enabled: $("#r-listen").checked, listen_model: $("#r-lmodel").value,
     share_watch_minutes: Math.max(0.5, Number($("#r-watch").value) || 3), share_frames: Math.max(0, Math.min(12, num("#r-sframes"))),
-    per_user_daily: num("#r-per"), topics: r.topics,
+    topics: r.topics,
     keywords: $("#r-kw").value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean),
     on_hit: (document.querySelector('input[name="hit"]:checked') || {}).value || "pending",
     sensitive_guard: $("#r-sg").checked,
     auto_replies: $$(".ar-row").map((row) => ({ keys: row.querySelector(".ar-keys").value.trim(), reply: row.querySelector(".ar-reply").value.trim() })),
-    owner_enabled: $("#r-own").checked, owner_share_per_day: Math.max(0, num("#r-ownshare") || 0),
+    watch_exclude: $("#r-wex").value.split(/[,，、\n]/).map((x) => x.trim()).filter(Boolean),
+    watch_prefer: $("#r-wpr").value.split(/[,，、\n]/).map((x) => x.trim()).filter(Boolean),
+    owner_quiet_start: $("#r-qs").value || "23:30", owner_quiet_end: $("#r-qe").value || "08:00",
+    owner_enabled: $("#r-own").checked, owner_share_per_day: Math.max(0, num("#r-ownshare") || 0), owner_at_per_day: Math.max(0, num("#r-ownat") || 0),
+    owner_cmd_allow: $$(".cmd-allow").filter((x) => x.checked).map((x) => x.value),
+    owner_cmd_dm_per_day: Math.max(0, num("#r-cmddm") || 0), owner_cmd_comment_per_day: Math.max(0, num("#r-cmdcm") || 0),
+    owner_cmd_share_per_day: Math.max(0, num("#r-cmdsh") || 0), owner_cmd_secret: $("#r-cmdkey").value.trim(),
     douyin_emoji: $("#r-dyemoji").checked, sticker_dm: $("#r-stdm").checked, sticker_comment: $("#r-stcm").checked,
     sticker_per_day: Math.max(0, num("#r-stday") || 0),
     ...collectVoice(),
     owners: $$(".own-row").map((row) => ({
       name: row.dataset.name || "", call: row.querySelector(".own-call").value.trim(),
       relation: row.querySelector(".own-rel").value.trim(), enabled: row.querySelector(".own-on").checked,
-      chat: row.querySelector(".own-chat").checked, share: row.querySelector(".own-share").checked,
+      chat: row.querySelector(".own-chat").checked, share: row.querySelector(".own-share").checked, at: row.querySelector(".own-at").checked,
+      cmd: row.querySelector(".own-cmd").checked,
       closeness: Number(row.dataset.close || 0),
     })),
   };
@@ -1178,6 +1305,8 @@ function ownersSection(r) {
         <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="own-on" ${o.enabled !== 0 && o.enabled !== false ? "checked" : ""}>启用</label>
         <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="own-chat" ${o.chat !== 0 && o.chat !== false ? "checked" : ""}>她可以主动找 TA 聊天</label>
         <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="own-share" ${o.share !== 0 && o.share !== false ? "checked" : ""}>主动分享视频</label>
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="own-at" ${o.at !== 0 && o.at !== false ? "checked" : ""}>评论里 @ TA 来看</label>
+        <label style="display:flex;gap:6px;align-items:center" title="TA 可以在私信里让她去做事：私信别人、在评论区 @ 人、搜视频分享给谁、发作品……"><input type="checkbox" class="own-cmd" ${o.cmd ? "checked" : ""}>可以给她下命令</label>
         <button type="button" class="btn btn-sm btn-danger" data-act="own-del" data-i="${i}">移除</button>
       </div>
     </div>`;
@@ -1189,14 +1318,42 @@ function ownersSection(r) {
       : `<span class="hint" style="margin:0">互关好友都已经是主人了</span>`)
     : `<span class="hint" style="margin:0">${S.frLoading ? "正在从你的抖音主页读关注列表…" : "还没有互关好友名单，先点“刷新好友列表”"}</span>`;
   return `<section class="card"><h2>${HEART}主人</h2>
-    <label class="toggle-row"><span>开启主人功能<span class="hint" style="display:block;margin:2px 0 0">只有和她互相关注的好友才能设为主人。主人的私信和别人不一样：随时都回（今天的私信额度用完了、不在活跃时段也回），想聊多久聊多久；她还会按自己的心情主动找主人聊天——想撒娇、开心、无聊的时候找得勤，犯困、闹小脾气的时候找得少，不用设次数。和主人有关的记忆不会忘，聊得越多越亲近。请只添加你自己的账号，或者同意被她主动联系的朋友。</span></span><input id="r-own" type="checkbox" ${r.owner_enabled !== false ? "checked" : ""}></label>
-    <div class="toggle-row"><label for="r-ownshare">每天最多主动分享视频（个）</label><input id="r-ownshare" type="number" min="0" class="input" style="max-width:120px" value="${r.owner_share_per_day ?? 2}"></div>
+    <label class="toggle-row"><span>开启主人功能<span class="hint" style="display:block;margin:2px 0 0">只有和她互相关注的好友才能设为主人。主人的私信和别人不一样：不在活跃时段也回，想聊多久聊多久；她还会按自己的心情主动找主人聊天——想撒娇、开心、无聊的时候找得勤，犯困、闹小脾气的时候找得少，不用设次数。和主人有关的记忆不会忘，聊得越多越亲近。请只添加你自己的账号，或者同意被她主动联系的朋友。</span></span><input id="r-own" type="checkbox" ${r.owner_enabled !== false ? "checked" : ""}></label>
+    <div class="toggle-row"><label for="r-ownshare">每天最多主动分享视频（个）<span class="hint" style="display:block;margin:2px 0 0">用抖音的“分享给朋友”把整个视频发过去：主人私信里收到的是视频卡片，点开直接播放。这是上限：她不会什么都分享，只挑她了解到的、主人真想看的（“记忆 → 主人的口味”里能看到她了解到了什么）。</span></label><input id="r-ownshare" type="number" min="0" class="input" style="max-width:120px" value="${r.owner_share_per_day ?? 2}"></div>
+    <div class="toggle-row"><label for="r-ownat">每天最多在评论里 @ 主人（次）<span class="hint" style="display:block;margin:2px 0 0">她给喜欢的视频写评论时，照她对主人口味的了解觉得 TA 也会喜欢，才 @ TA 来看；同一类视频一天最多 @ 一次。</span></label><input id="r-ownat" type="number" min="0" class="input" style="max-width:120px" value="${r.owner_at_per_day ?? 2}"></div>
+    <div class="grid">
+      <div class="field"><span class="label" id="r-qs-lab">勿扰开始（这段时间她不主动找主人）</span>${timeField("r-qs", r.owner_quiet_start || "23:30")}</div>
+      <div class="field"><span class="label" id="r-qe-lab">勿扰结束</span>${timeField("r-qe", r.owner_quiet_end || "08:00")}</div>
+    </div>
+    <p class="hint" style="margin:0">勿扰时段里主人找她，她照样回；只是她不会主动发消息、分享视频打扰你。开始和结束设成一样就是不设勿扰。每天第一次找主人聊天时，她会顺口说说昨天刷到了什么（来自日报）。</p>
+    ${cmdSection(r)}
     ${rows || `<p class="empty">还没有设置主人</p>`}
     <div class="actions">
       ${picker}
       <button type="button" class="btn btn-sm" data-act="fr-fetch" ${S.frLoading ? "disabled" : ""}>${S.frLoading ? "正在读取…" : "刷新好友列表"}</button>
     </div>
     <p class="hint" style="margin:0">${fetch.at ? `好友列表上次读取：${esc(fetch.at)}，互关 ${fetch.count || 0} 人${fetch.error ? `（${esc(fetch.error)}）` : ""}。` : "好友列表从她抖音主页的“关注”里读，只列出互相关注的人。"}主人要先给她发过一条私信（她才能在私信列表里找到 TA）。她连着找了主人几次都没回音，会先不打扰、隔上大半天再问候。被问到是不是真人时，对主人也会如实说自己是 AI。</p></section>`;
+}
+
+/* 主人的命令：勾了“可以给她下命令”的主人，在私信里让她去做事 */
+const CMD_PERMS = [["dm", "私信别人"], ["comment", "发评论（可以 @ 互关好友）"], ["share", "把视频分享给别人"],
+  ["search", "搜视频、看视频"], ["like", "点赞、收藏"], ["publish", "写作品、发布作品（先把草稿发给主人看，主人回“发”才发）"]];
+function cmdSection(r) {
+  const allow = Array.isArray(r.owner_cmd_allow) ? r.owner_cmd_allow : CMD_PERMS.map(([k]) => k);
+  return `<div class="cmd-box" style="border-top:1px dashed var(--line,#f3c6d6);margin-top:10px;padding-top:10px">
+    <h3 style="margin:0 0 4px;font-size:15px">主人的命令</h3>
+    <p class="hint" style="margin:0 0 8px">在下面的主人那一栏勾上“可以给她下命令”，TA 就能在私信里让她去做事，比如“去私信小明说周末一起吃饭”“搜个猫咪视频发给小红”“在这个视频下面 @ 小明”“发个关于秋天的作品”。她会自己想好怎么做、一步步做完，再回来告诉 TA 做成了什么、哪里没做成。
+      为了不被冒充：她会核对聊天对方的主页 id 和互关好友名单里的主人是不是同一个人（昵称可以重名，主页 id 不会）。只联系私信里聊过的人、互关好友和主人，一次最多 5 个人；发给别人的话都会先过安全检查，不冒充主人、不骚扰、不打广告。</p>
+    <div class="fr-grid" style="display:flex;flex-wrap:wrap;gap:6px 16px;margin-bottom:8px">${CMD_PERMS.map(([k, l]) => `
+      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" class="cmd-allow" value="${k}" ${allow.includes(k) ? "checked" : ""}>${l}</label>`).join("")}</div>
+    <div class="grid">
+      <div class="field"><label for="r-cmddm">每天最多替主人私信别人（次）</label><input id="r-cmddm" type="number" min="0" class="input" value="${r.owner_cmd_dm_per_day ?? 20}"></div>
+      <div class="field"><label for="r-cmdcm">每天最多替主人发评论（条）</label><input id="r-cmdcm" type="number" min="0" class="input" value="${r.owner_cmd_comment_per_day ?? 10}"></div>
+      <div class="field"><label for="r-cmdsh">每天最多替主人分享视频（次）</label><input id="r-cmdsh" type="number" min="0" class="input" value="${r.owner_cmd_share_per_day ?? 20}"></div>
+      <div class="field"><label for="r-cmdkey">命令口令（选填）</label><input id="r-cmdkey" class="input" maxlength="40" autocomplete="off" value="${esc(r.owner_cmd_secret || "")}" placeholder="读不到主页 id 时，消息里带上它才算数"></div>
+    </div>
+    <p class="hint" style="margin:0">发作品一定先把草稿（图和文字）发给主人看，主人回了“发”才发布，发布时照样勾“内容由AI生成”；说“改一下……”她就改了再给你看，说“不发了”就不发。让她去问别人事情时，对方回了她会转告主人。她做的每件事都记在“历史记录 → 回复”里。</p>
+  </div>`;
 }
 
 /* @ 互关好友：下拉框只显示互关的好友，选中的人她才会 @ */
@@ -1453,7 +1610,7 @@ function bgSection(d) {
 /* 作品的三种形式 */
 const FORM_NAME = { voice: "配音图片视频", cards: "图文卡片", upload: "我上传的图片 / 视频" };
 const FORM_HINT = {
-  voice: "标题和正文全部写在一张图上，图上站着桌宠（每次随机一个动作和表情），她用自己的声音把文案读出来，做成一个画面不动的视频。",
+  voice: "标题和正文全部写在一张图上，图上站着桌宠（每次随机一个动作和表情），她用自己的声音把正文读出来（不读标题），做成一个画面不动的视频。",
   cards: "一张封面 + 几张文字卡片，当图文发；也可以点“用她的声音配音”做成一张张翻的视频。",
   upload: "只发你从电脑上添加的图片或视频（视频作品只能放 1 个视频），标题、正文、话题照常填。",
 };
@@ -1519,6 +1676,7 @@ function renderPet() {
             <button type="button" class="btn btn-sm" data-act="pet-do" data-id="4">睡觉</button>
           </div>
         </section>
+        ${growthSection(S.growth)}
         <section class="card"><h2>${HEART}形象</h2>
           <div class="rig-pick" role="radiogroup" aria-label="选择形象">
             ${["default", "custom"].filter((k) => k !== "custom" || P.has_custom).map((k) => `
@@ -1617,6 +1775,26 @@ function bindCalib() {
   });
 }
 
+/* 成长：经验只从她真正做过的事里算 */
+function growthSection(g) {
+  if (!g || !g.level) return "";
+  const pct = Math.round((g.level_xp / 100) * 100);
+  const T = g.totals || {};
+  const tot = [["videos", "看过视频"], ["likes", "点赞"], ["comments", "评论"], ["collects", "收藏"], ["replies_dm", "回私信"], ["publishes", "发作品"]]
+    .map(([k, l]) => `<span class="pill neutral">${l} ${T[k] || 0}</span>`).join("");
+  const stages = (g.stages || []).map((st, i) => `<li class="${i < g.stage ? "done" : i === g.stage ? "now" : ""}"><b>${esc(st.name)}</b><small>${st.need} 经验</small></li>`).join("");
+  return `<section class="card growth"><h2>${HEART}她的成长</h2>
+    <div class="growth-head"><span class="growth-lv">Lv.${g.level}</span><div style="flex:1;min-width:0">
+      <b>${esc(g.stage_name)}</b><span class="hint" style="margin:0 0 0 8px">${esc(g.stage_desc || "")}</span>
+      <div class="xp-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${g.level_xp}" aria-label="这一级的经验"><span style="width:${pct}%"></span></div>
+      <small class="hint" style="margin:0">一共 ${g.xp} 经验 · 这一级 ${g.level_xp}/100${g.stage_next ? ` · 离下一个阶段还差 ${g.stage_next - g.xp}` : " · 已经是最高阶段啦"}</small></div></div>
+    <ol class="stage-list">${stages}</ol>
+    <div class="chips" style="gap:6px">${tot}<span class="pill neutral">活跃 ${g.active_days} 天</span><span class="pill neutral">确认学到 ${g.knowledge} 条</span><span class="pill neutral">找主人 ${g.owner_touches} 次</span></div>
+    <p class="hint" style="margin:0">经验只从她真的做过的事里算：看视频、互动、回消息、学到并确认的东西、和主人聊天……同一天最多算 300 经验。升级的时候桌宠会开心地转圈圈。</p>
+    <div class="actions"><button type="button" class="btn btn-sm btn-primary" data-act="growth-card">生成成长卡</button></div>
+  </section>`;
+}
+
 function onPetFile(e) {
   const f = e.target.files && e.target.files[0];
   if (!f) return;
@@ -1678,6 +1856,7 @@ function renderSettings() {
     <section class="card"><h2>${HEART}数据</h2>
       <p style="margin:0">人设、看过的视频、消息记录都保存在安装目录的 data 文件夹（SQLite 数据库 app.db），整个文件夹复制走就是完整备份。卸载软件时不会删除它。</p>
       <div class="actions"><button type="button" class="btn" data-act="open-data">打开数据文件夹</button></div></section>
+    ${storageCard(S.storage)}
     <section class="card"><h2>${HEART}调试工具</h2>
       <p style="margin:0">如果某个动作在抖音上失效（比如找不到私信入口），先在弹出的浏览器里打开对应页面，再点下面的按钮，把 data\\debug 里新生成的截图和 HTML 发给开发者校准。页面定位写在 data\\selectors.json 里，也可以直接修改。</p>
       <div class="actions"><button type="button" class="btn" data-act="dump">保存当前页面结构</button></div></section>
@@ -1697,6 +1876,34 @@ function renderSettings() {
       </tbody></table></div></section>`;
 }
 
+function mb(n) { n = Number(n || 0); return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(0, n / 1024).toFixed(n ? 1 : 0)} KB`; }
+
+/* 存储空间：数据库占多少、归档压缩了多少、各个文件夹多大 */
+function storageCard(u) {
+  if (!u) return `<section class="card"><h2>${HEART}存储空间</h2><p class="empty">正在统计…</p></section>`;
+  const a = u.archive || {};
+  const R = u.rows || {};
+  const last = u.last || {};
+  const arcN = Object.values(last.archived || {}).reduce((x, y) => x + Number(y || 0), 0);
+  const item = (label, v, note) => `<div class="stat"><small>${label}</small><b>${mb(v)}</b>${note ? `<small class="hint" style="margin:0">${note}</small>` : ""}</div>`;
+  return `<section class="card storage"><h2>${HEART}存储空间</h2>
+    <p class="hint" style="margin:0">她会一直刷下去，记录越攒越多，所以软件会自动整理：最近的记录照常放着（查得快）；一个多月前的看视频、操作记录按天打包压缩归档（压缩前先用这些记录训练一本“字典”，同类记录压得更小），要看的时候再解压；淡忘的记忆也压缩收起来；数据库删掉的空间会还给磁盘。每 6 小时自动整理一次。</p>
+    <div class="stat-grid">
+      ${item("数据库", (u.db || 0) + (u.wal || 0), u.free ? `其中 ${mb(u.free)} 空着、等着回收` : "")}
+      ${item("归档前的原始大小", a.raw, `${a.rows || 0} 条记录，${a.blocks || 0} 包`)}
+      ${item("压缩后只占", a.stored, a.ratio ? `压缩到原来的 1/${a.ratio}` : "还没有需要归档的旧记录")}
+      ${item("浏览器缓存", u.browser_cache, u.browser_running ? "浏览器开着，关掉后才能清" : "打开浏览器前会自动清到 300MB 以内")}
+      ${item("调试快照", u.debug, "只留 14 天")}
+      ${item("日报和成长卡", u.reports)}
+      ${item("下载的视频", u.downloads)}
+      ${item("本地模型", u.models)}
+    </div>
+    <p class="hint" style="margin:0">现在有：看过的视频 ${R.videos || 0} 条、操作记录 ${R.events || 0} 条、记忆 ${R.memories || 0} 条（淡忘收起的 ${R.memory_archive || 0} 条）、学到的 ${R.knowledge || 0} 条、私信记录 ${R.dm_history || 0} 条。${last.at ? `上次整理：${esc(last.at)}${arcN ? `，归档了 ${arcN} 条` : ""}。` : ""}</p>
+    <div class="actions"><button type="button" class="btn btn-primary" data-act="storage-clean">现在整理</button>
+      <button type="button" class="btn btn-sm" data-act="storage-load">重新统计</button></div>
+  </section>`;
+}
+
 /* ---------- 页面切换和刷新 ---------- */
 async function showPage(page) {
   S.page = page;
@@ -1707,9 +1914,10 @@ async function showPage(page) {
   else if (page === "models") { const d = await call("get_providers"); S.providers = d.providers; S.tasks = d.tasks; renderModels(); }
   else if (page === "rules") { S.rules = await call("get_rules"); S.friends = await call("get_friends"); renderRules(); }
   else if (page === "drafts") { await loadDrafts(); renderDrafts(); }
-  else if (page === "pet") { S.pet = await call("get_pet"); renderPet(); }
-  else if (page === "settings") { if (!S.about) S.about = await call("about"); renderSettings(); }
+  else if (page === "pet") { S.pet = await call("get_pet"); S.growth = await call("growth_info"); renderPet(); }
+  else if (page === "settings") { if (!S.about) S.about = await call("about"); renderSettings(); S.storage = await call("storage_info"); renderSettings(); }
   else if (page === "memory") { await loadMemory(); renderMemory(); }
+  else if (page === "tools") { S.tools = await call("tools_info"); renderTools(); pollTools(); }
   else if (page === "history") {
     if (!S.hist.data) S.hist.day = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
     await loadHistory(); renderHistory();
@@ -1731,11 +1939,146 @@ async function refresh() {
   if (S.uiSeq === null) S.uiSeq = req.seq;
   else if (req.seq !== S.uiSeq) { S.uiSeq = req.seq; if (req.page) { if (req.page === "drafts") S.selDraft = null; await showPage(req.page); } }
   handleWishes(S.st.wishes);
+  toolEvents(S.st.tool_events);
   renderSide();
   const typing = document.activeElement && ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName);
   if (S.page === "dashboard") renderDashboard();
   else if (S.page === "inbox" && !typing) { await loadMessages(); renderInbox(); }
   else if (S.page === "drafts" && !typing && S.draft && S.draft.status === "publishing") { await loadDrafts(); renderDrafts(); }
+}
+
+/* ---------- 其他功能：下载无水印视频、导出视频文案 ---------- */
+const JOB_STATUS = { queued: ["neutral", "排队中"], running: ["warn", "进行中"] };
+
+/* 只显示排队中、正在做的任务：做完了进度条就消失（不留记录） */
+function jobRows(kinds) {
+  const jobs = ((S.tools && S.tools.jobs) || []).filter((j) => kinds.includes(j.kind) && JOB_STATUS[j.status]);
+  if (!jobs.length) return "";
+  return `<ul class="job-list">${jobs.map((j) => {
+    const [cls, label] = JOB_STATUS[j.status];
+    return `<li class="job">
+      <div class="job-head"><span class="pill ${cls}">${label}</span>${j.site_name ? `<span class="pill neutral">${esc(j.site_name)}</span>` : ""}
+        <span class="job-title" title="${esc(j.url)}">${esc(j.title || j.url)}</span>
+        <button type="button" class="btn btn-sm" data-act="tool-cancel" data-id="${j.id}">取消</button></div>
+      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(j.progress * 100)}" aria-label="${esc(j.stage)}"><i style="width:${Math.max(3, Math.round(j.progress * 100))}%"></i></div>
+      <p class="hint" style="margin:0">${esc(j.stage)}</p>
+    </li>`;
+  }).join("")}</ul>`;
+}
+
+/* 刚做完的任务：成功给个小提示；失败弹窗说原因（这是唯一会弹窗的情况） */
+const TOOL_KIND = { video: "下载视频", text: "导出视频文案", setup: "" };
+async function toolEvents(evts) {
+  for (const ev of evts || []) {
+    const what = ev.kind === "setup" ? ev.title : TOOL_KIND[ev.kind] || "任务";
+    if (ev.status === "done" && ev.warning) {          // 做完了，但有一部分没成功（比如改写失败）：也说清楚
+      await dialog({ title: `${what}完成了，但有一部分没成功`, html: `<p style="margin:0 0 8px"><b>${esc(ev.title || "")}</b></p>
+        <p style="margin:0;white-space:pre-wrap">${esc(ev.warning)}</p>`, ok: "知道了", cancel: "" });
+    } else if (ev.status === "done") {
+      toast(ev.kind === "setup" ? (ev.note || `${what}：完成`) : `${what}完成：${ev.files && ev.files[0] ? ev.files[0] : ev.title}`);
+    } else if (ev.status === "failed") {
+      await dialog({ title: `${what}没成功`, html: `<p style="margin:0 0 8px"><b>${esc(ev.title || "")}</b></p>
+        ${ev.url && ev.url !== ev.title ? `<p class="hint" style="margin:0 0 8px;word-break:break-all">${esc(ev.url)}</p>` : ""}
+        <p style="margin:0;white-space:pre-wrap">${esc(ev.error || "不知道为什么没成功")}</p>`, ok: "知道了", cancel: "" });
+    }
+  }
+}
+
+function renderTools() {
+  const t = S.tools || { settings: {}, status: {}, asr: {}, jobs: [] };
+  const st = t.status || {}, cfg = t.settings || {}, asr = t.asr || {};
+  const yt = st.ytdlp ? `下载组件 yt-dlp ${esc(st.ytdlp)}${st.updated ? "（已更新）" : ""}` : "没有下载组件 yt-dlp";
+  const js = st.js ? `JavaScript 运行环境：${esc(st.js)}` : "没有 JavaScript 运行环境（下载 YouTube 要用）";
+  $("#main").innerHTML = `
+    <header class="page-head"><div><h1>其他功能</h1><p>粘贴视频网站的地址：把视频下载到电脑上（不带水印、原画质），或者把视频里说的话导出成文本文件。抖音、YouTube、B 站、TikTok、快手、微博……都可以</p></div>
+      <button type="button" class="btn" data-act="tool-open" data-path="">打开保存文件夹</button></header>
+    <div class="row">
+      <div class="col grow-1">
+        <section class="card"><h2>${HEART}下载无水印视频</h2>
+          <p class="hint" style="margin:0">在抖音 App 里点“分享 → 复制链接”，或者复制浏览器地址栏里的网址，整段粘贴进来就行（一次可以贴好几个，一行一个）。
+            <b>不用她去操作，也不用登录</b>：抖音先读作品分享页（和网上的“抖音解析”工具一样），要原画质时在后台单独开一个看不见的浏览器读网页里的作品数据（和“抖音视频下载器”插件一样），图文作品下载原图；
+            YouTube、B 站等其他网站和 en.loader.to 这类网站一样，可以选画质，或者只要声音（MP3 / M4A）。</p>
+          <label class="sr-only" for="tool-video-url">视频地址</label>
+          <textarea id="tool-video-url" class="input" rows="3" placeholder="比如：7.43 复制打开抖音，看看【xx的作品】… https://v.douyin.com/xxxx/  或  https://www.youtube.com/watch?v=…"></textarea>
+          <div class="field"><label for="tool-format">下载成什么格式</label><select id="tool-format" class="input" style="max-width:260px">${[["best", "最高画质 MP4"], ["1080", "1080p MP4"], ["720", "720p MP4"], ["480", "480p MP4"], ["mp3", "只要声音 MP3"], ["m4a", "只要声音 M4A"]].map(([k, l]) => `<option value="${k}" ${(cfg.format || "best") === k ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <label class="toggle-row"><span>抖音尽量下原画质（2K / 4K 这些档位只在网页数据里有：在后台单独开一个看不见的浏览器读，会慢几秒；不勾选就只读分享页，最高 1080p）</span><input id="tool-dybest" type="checkbox" ${cfg.douyin_best !== false ? "checked" : ""}></label>
+          <label class="toggle-row"><span>同样的画质里优先 H.264（老电脑、老播放器更容易打开；不勾选就是纯按画质最高）</span><input id="tool-h264" type="checkbox" ${cfg.prefer_h264 ? "checked" : ""}></label>
+          <div class="actions"><button type="button" class="btn btn-primary" data-act="tool-start" data-kind="video">开始下载</button></div>
+          ${jobRows(["video"])}
+        </section>
+        <section class="card"><h2>${HEART}导出视频文案</h2>
+          <p class="hint" style="margin:0">把视频里说的话导出成 .txt 文本（带标题、作者、地址、简介），可以同时导出 .srt 字幕。有平台字幕的（YouTube、B 站的 CC / AI 字幕）直接用字幕，最准；
+            没有字幕的，下载声音后在本机语音转文字（Whisper，不上传、不花钱，视频越长越久）。</p>
+          <label class="sr-only" for="tool-text-url">视频地址</label>
+          <textarea id="tool-text-url" class="input" rows="3" placeholder="粘贴视频的分享链接或网址，一次可以贴好几个"></textarea>
+          <div class="grid">
+            <div class="field"><label for="tool-lang">视频的语言</label><select id="tool-lang" class="input">${[["auto", "自动识别"], ["zh", "中文"], ["en", "英文"]].map(([k, l]) => `<option value="${k}" ${cfg.lang === k ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+            <div class="field"><label for="tool-asr">语音转文字用的模型</label><select id="tool-asr" class="input">${[["tiny", "tiny：最快"], ["base", "base：推荐"], ["small", "small：最准、最慢"]].map(([k, l]) => `<option value="${k}" ${(cfg.asr_model || "base") === k ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          </div>
+          <label class="toggle-row"><span>同时导出 .srt 字幕文件（带时间）</span><input id="tool-srt" type="checkbox" ${cfg.srt !== false ? "checked" : ""}></label>
+          <label class="toggle-row"><span>用大模型加标点、分段、改错别字（会花一点模型的钱；不改写内容）</span><input id="tool-polish" type="checkbox" ${cfg.polish ? "checked" : ""}></label>
+          <label class="toggle-row"><span><b>用大模型改写成适合发短视频的文案</b>（用“模型与 API Key”里写作用的模型，会花一点模型的钱）：知识点和原文完全一致、字数差不多只是更精简、换成原创的说法、开头抓人结尾引导评论，另给 3 个标题和 5 个话题。导出的文本里原文和改写都有</span><input id="tool-rewrite" type="checkbox" ${cfg.rewrite ? "checked" : ""}></label>
+          <div class="field" ${cfg.rewrite ? "" : "hidden"} id="tool-rewrite-box"><label for="tool-rewrite-extra">改写时的补充要求（可以不填，比如“面向新手宝妈”“语气更活泼”）</label>
+            <input id="tool-rewrite-extra" class="input" maxlength="300" value="${esc(cfg.rewrite_extra || "")}" placeholder="不填就按默认的改写规则"></div>
+          <div class="actions" style="margin:0"><button type="button" class="btn btn-sm btn-link" data-act="tool-rules">看看改写规则</button></div>
+          ${asr.installed === false ? `<p class="hint" style="margin:0;color:var(--bad-text)">没装语音转文字的组件 faster-whisper：没有字幕的视频导不出文字（重新运行 build.bat 安装）</p>` : ""}
+          <div class="actions"><button type="button" class="btn btn-primary" data-act="tool-start" data-kind="text">开始导出</button></div>
+          ${jobRows(["text"])}
+        </section>
+      </div>
+      <div class="col grow-1">
+        <section class="card"><h2>${HEART}保存位置和网络</h2>
+          <div class="field"><span class="label">保存到</span><div class="actions" style="margin:0"><code style="word-break:break-all">${esc(cfg.dir_effective || "")}</code>
+            <button type="button" class="btn btn-sm" data-act="tool-pick" data-what="dir">换一个文件夹</button></div>
+            <p class="hint" style="margin:0">视频放在“视频”子文件夹，文案放在“文案”子文件夹。</p></div>
+          <div class="field"><label for="tool-proxy">代理（访问 YouTube 等需要时填，比如 http://127.0.0.1:7890；抖音不用填）</label>
+            <input id="tool-proxy" class="input" value="${esc(cfg.proxy || "")}" placeholder="不用代理就留空"></div>
+          <div class="field"><span class="label">cookies.txt（可选：YouTube 要求登录确认、B 站要下 1080P 以上时用）</span>
+            <div class="actions" style="margin:0"><code style="word-break:break-all">${esc(cfg.cookies || "没有")}</code>
+            <button type="button" class="btn btn-sm" data-act="tool-pick" data-what="cookies">选择文件</button>
+            ${cfg.cookies ? `<button type="button" class="btn btn-sm" data-act="tool-nocookies">不用了</button>` : ""}</div>
+            <p class="hint" style="margin:0">用浏览器扩展（比如 Get cookies.txt LOCALLY）从你自己登录的网站导出。只在你的电脑上用，不会上传。</p></div>
+          <div class="actions"><button type="button" class="btn btn-sm" data-act="tool-save">保存</button></div>
+        </section>
+        <section class="card"><h2>${HEART}下载组件</h2>
+          <ul style="margin:0;padding-left:18px;line-height:1.9">
+            <li>${yt}</li><li>${js}</li><li>${st.ffmpeg ? "合并画面和声音：ffmpeg（软件自带）" : "没有 ffmpeg：画面和声音分开的视频合不起来"}</li>
+            <li>语音转文字：${asr.installed ? `Whisper（已有模型：${esc((asr.models || []).join("、") || "第一次用时下载")}）` : "没装"}</li></ul>
+          <p class="hint" style="margin:0">网站一改版，下载组件就可能失效：遇到下载不了，先点“更新下载组件”（下载官方最新版，重启软件后生效）。
+            下载 YouTube 需要 JavaScript 运行环境（yt-dlp 官方的要求），电脑上没有 deno / node 的话点“安装 deno”，只下载这一个程序放在软件的 data 文件夹里。</p>
+          <div class="actions">
+            <button type="button" class="btn btn-sm" data-act="tool-setup" data-what="ytdlp">更新下载组件</button>
+            ${st.js ? "" : `<button type="button" class="btn btn-sm" data-act="tool-setup" data-what="deno">安装 deno</button>`}
+          </div>
+          ${jobRows(["setup"])}
+        </section>
+        <section class="card" style="background:var(--tint)"><h2>用之前请注意</h2>
+          <p class="hint" style="margin:0">只下载你自己的作品、或者已经得到作者允许的内容，用于个人学习、备份；转载、二次发布请先取得作者授权，并遵守各个平台的用户协议和法律法规。</p></section>
+      </div>
+    </div>`;
+}
+
+function toolOpts() {
+  return { format: $("#tool-format")?.value, douyin_best: $("#tool-dybest")?.checked, prefer_h264: $("#tool-h264")?.checked, lang: $("#tool-lang")?.value, asr_model: $("#tool-asr")?.value, srt: $("#tool-srt")?.checked, polish: $("#tool-polish")?.checked, rewrite: $("#tool-rewrite")?.checked, rewrite_extra: ($("#tool-rewrite-extra")?.value || "").trim() };
+}
+
+async function pollTools() {
+  if (S.page !== "tools" || S.toolPoll) return;
+  S.toolPoll = true;
+  try {
+    while (S.page === "tools") {
+      const r = await call("tools_jobs");
+      if (!r) break;
+      const jobs = r.jobs || [];
+      const before = JSON.stringify((S.tools && S.tools.jobs) || []);
+      S.tools.jobs = jobs;
+      const typing = document.activeElement && ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName);
+      if (JSON.stringify(jobs) !== before && !typing) renderTools();
+      toolEvents(r.events);
+      if (!jobs.length) break;
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  } finally { S.toolPoll = false; }
 }
 
 /* 好友下拉框：勾选状态和“喜欢看什么” */
@@ -1755,6 +2098,10 @@ document.addEventListener("change", async (e) => {
     await call("memory_action", "importance", Number(e.target.dataset.id), Number(e.target.value));
     await loadMemory(); renderMemory(); toast(Number(e.target.value) >= 5 ? "设成重要了，她不会忘" : "重要程度改好了");
     return;
+  }
+  if (e.target.id === "tool-rewrite") {                 // 勾了“改写”才显示“补充要求”
+    const box = $("#tool-rewrite-box");
+    if (box) box.hidden = !e.target.checked;
   }
   if (e.target.classList && e.target.classList.contains("fr-check") && S.page === "rules") {
     S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs(); renderRules();
@@ -1908,7 +2255,7 @@ const ACT = {
     if (!pick || !pick.value) { toast("先点“刷新好友列表”，再从互关好友里选一位", true); return; }
     const name = pick.value;
     S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs();
-    S.rules.owners.push({ name, call: "", relation: "", enabled: 1, chat: 1, share: 1, closeness: 0 });
+    S.rules.owners.push({ name, call: "", relation: "", enabled: 1, chat: 1, share: 1, at: 1, closeness: 0 });
     renderRules(); toast(`把 ${name} 设为主人了，填好称呼后记得点右上角“保存”`);
   },
   "own-del": (el) => { S.rules = { ...S.rules, ...collectRules() }; keepFriendInputs(); S.rules.owners.splice(Number(el.dataset.i), 1); renderRules(); },
@@ -1916,6 +2263,78 @@ const ACT = {
   "mem-search": async () => { S.mem.q = $("#mem-q").value.trim(); await loadMemory(); renderMemory(); },
   "mem-clear": async () => { S.mem.q = ""; S.mem.person = ""; await loadMemory(); renderMemory(); },
   "mem-person": async (el) => { S.mem = { tab: "events", q: "", person: el.dataset.name, data: null }; await showPage("memory"); },
+  "know-ok": async (el) => { await call("memory_action", "confirm_knowledge", Number(el.dataset.id)); await loadMemory(); renderMemory(); toast("确认了"); },
+  "faded-back": async (el) => { await call("memory_action", "restore_faded", Number(el.dataset.id)); await loadMemory(); renderMemory(); toast("她想起来了"); },
+  "faded-del": async (el) => {
+    const ok = await dialog({ title: "彻底删除这条记忆？", html: "<p>删除以后就再也想不起来了。</p>", ok: "删除", cancel: "算了" });
+    if (!ok) return;
+    await call("memory_action", "delete_faded", Number(el.dataset.id)); await loadMemory(); renderMemory(); toast("删掉了");
+  },
+  "report-view": async (el) => { await showReport(el.dataset.day); },
+  "doc-fb": async (el) => { await call("doctor_feedback", Number(el.dataset.id), el.dataset.s); await refresh(); toast(el.dataset.s === "dismissed" ? "好的" : "谢谢反馈"); },
+  "doc-history": async () => {
+    const d = await call("doctor_info");
+    if (!d) return;
+    const eff = (k, label) => { const e = d.effect[k]; return `<li>${label}：提醒了 ${e.cards} 次，你说有用 ${e.helpful} 次、没用 ${e.useless} 次${e.rate !== null ? `（有用的占 ${e.rate}%）` : ""}</li>`; };
+    const ST = { open: "待你看", helpful: "有用", useless: "没用", dismissed: "知道了" };
+    const list = d.cards.map((c) => `<li>${esc(c.day.slice(5))} ${esc(c.title)} <span class="pill neutral">${ST[c.status] || c.status}</span></li>`).join("");
+    await dialog({ title: "她的自检", html: `<p class="hint">自检只用固定的规则看最近 24 小时的记录（不调用模型）：反复发不出去、通知面板打不开、模型老出错、花费用得太快、卡住了、待你处理太多、占的空间太大……同一条规则一天最多提醒一次。</p>
+      <ul>${eff("d7", "最近 7 天")}${eff("d30", "最近 30 天")}</ul>${list ? `<h3 class="sub-h">最近的提醒</h3><ul>${list}</ul>` : ""}`, ok: "关闭", cancel: "", wide: true });
+  },
+  "storage-clean": async (el) => {
+    el.disabled = true; toast("正在整理，可能要几秒钟…");
+    const r = await call("storage_clean");
+    if (r) { S.storage = r.usage; renderSettings(); toast(`整理好了，省出 ${(r.done.saved / 1048576).toFixed(1)} MB${r.done.cache_skipped ? "（浏览器开着，缓存没清）" : ""}`); }
+    el.disabled = false;
+  },
+  "storage-load": async () => { S.storage = await call("storage_info"); renderSettings(); },
+  "growth-card": async () => {
+    const r = await call("growth_card");
+    if (!r) return;
+    const ok = await dialog({ title: "她的成长卡", html: `<img src="${r.url}" alt="成长卡" style="width:100%;border-radius:16px">`, ok: "在文件夹里看", cancel: "关闭", wide: true });
+    if (ok) await call("growth_card_open");
+  },
+  "know-del": async (el) => { await call("memory_action", "delete_knowledge", Number(el.dataset.id)); await loadMemory(); renderMemory(); toast("这条删掉了"); },
+  "learn-now": async (el) => {
+    el.disabled = true; toast("她在整理学到的东西…");
+    const r = await call("memory_action", "learn_now");
+    await loadMemory(); renderMemory();
+    if (r) toast(`整理好了${r.cost ? `，花了 ¥${r.cost}` : ""}`);
+  },
+  "taste-think": async (el) => {
+    el.disabled = true; toast("她在想自己最近爱看什么…");
+    const r = await call("memory_action", "taste_think");
+    await loadMemory(); renderMemory();
+    if (r) toast(`想好了${r.cost ? `，花了 ¥${r.cost}` : ""}`);
+  },
+  "taste-reset": async (el) => {
+    const ok = await dialog({ title: "重新了解主人的口味？", html: `<p>她对 ${esc(el.dataset.name)} 口味的了解会清空，以后重新慢慢学。</p>`, ok: "清空", cancel: "算了" });
+    if (!ok) return;
+    await call("memory_action", "reset_taste", el.dataset.name); await loadMemory(); renderMemory(); toast("清空了，她会重新慢慢了解");
+  },
+  "tool-start": async (el) => {
+    const box = $(el.dataset.kind === "video" ? "#tool-video-url" : "#tool-text-url");
+    const text = box.value.trim();
+    if (!text) { toast("先粘贴视频地址"); box.focus(); return; }
+    const opts = toolOpts();
+    await call("tools_settings", opts);
+    const jobs = await call("tools_start", el.dataset.kind, text, opts);
+    if (!jobs) return;
+    box.value = "";
+    toast(jobs.length > 1 ? `开始了 ${jobs.length} 个任务` : "开始了");
+    S.tools = await call("tools_info"); renderTools(); pollTools();
+  },
+  "tool-rules": async () => {
+    const rules = (S.tools && S.tools.rewrite_rules) || "";
+    await dialog({ title: "改写规则", html: `<div class="md" style="white-space:pre-wrap;line-height:1.75">${esc(rules)}</div>
+      <p class="hint" style="margin:8px 0 0">改完以后软件还会自己检查一遍：字数不到原文的 70% 或者比原文还长、有连着 13 个字以上和原文一模一样的地方，就把问题告诉大模型重改一次；检查结果会写在导出的文本里。</p>`, ok: "知道了", cancel: "", wide: true });
+  },
+  "tool-cancel": async (el) => { await call("tools_cancel", el.dataset.id); const r = await call("tools_jobs"); if (r) { S.tools.jobs = r.jobs; renderTools(); toolEvents(r.events); } },
+  "tool-open": async (el) => { await call("tools_open", el.dataset.path || "", true); },
+  "tool-pick": async (el) => { const s = await call("tools_pick", el.dataset.what); if (s) { S.tools.settings = s; renderTools(); } },
+  "tool-nocookies": async () => { S.tools.settings = await call("tools_settings", { cookies: "" }); renderTools(); },
+  "tool-save": async () => { const s = await call("tools_settings", { ...toolOpts(), proxy: $("#tool-proxy").value.trim() }); if (s) { S.tools.settings = s; renderTools(); toast("保存好了"); } },
+  "tool-setup": async (el) => { await call("tools_setup", el.dataset.what); S.tools = await call("tools_info"); renderTools(); pollTools(); },
   "mem-del": async (el) => { await call("memory_action", "delete", Number(el.dataset.id)); await loadMemory(); renderMemory(); toast("这条记忆删掉了"); },
   "mem-diary-del": async (el) => {
     if (!(await dialog({ title: "删掉这篇日记？", body: "删掉以后她就不记得这一天写过什么了。", ok: "删除", cancel: "先留着" }))) return;

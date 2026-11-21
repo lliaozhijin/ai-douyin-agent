@@ -112,8 +112,20 @@ class MoodEngine:
         return st
 
     def _energy_target(self, st: dict, now: float) -> float:
-        h = datetime.fromtimestamp(now).hour
-        adj = -60 if h < 6 else -10 if 13 <= h < 15 else -25 if h >= 23 else -10 if h >= 22 else 0
+        """一天的精力节律（参考 dsh_soul 的作息曲线）：早上 8 点最足，之后一点点往下掉，晚上 11 点只剩一小半；
+        午饭后有点犯困；半夜到早上 6 点最困，6～8 点慢慢醒过来。“性子”滑块决定起点高低。"""
+        t = datetime.fromtimestamp(now)
+        h = t.hour + t.minute / 60.0
+        if h < 6:
+            adj = -60
+        elif h < 8:
+            adj = -60 + (h - 6) * 30            # 慢慢醒
+        elif h <= 23:
+            adj = -(h - 8) * (50 / 15)          # 8 点 → 23 点：一共掉 50
+        else:
+            adj = -55
+        if 13 <= h < 15:
+            adj -= 8                            # 午后犯困
         return _clamp(st["base_e"] + adj, 5, 100)
 
     def _decay(self, st: dict, now: float) -> None:
@@ -170,6 +182,9 @@ class MoodEngine:
                     dv, de, mood, w, why = EVENTS["pat_much"]
             if mood.startswith("@"):  # 不开心的事：脾气大的闹小脾气，脾气好的觉得委屈
                 mood = "grumpy" if tr["temper"] >= 50 else "sulky"
+            hour = datetime.fromtimestamp(now).hour
+            if kind in ("dm", "dm_share", "thread_reply") and (hour >= 23 or hour < 6):
+                de -= 4                               # 半夜还在聊天：越聊越困
             k = 0.5 + tr["volatility"] / 100.0
             st["v"] = _clamp(st["v"] + dv * k, -100, 100)
             st["e"] = _clamp(st["e"] + de, 0, 100)
@@ -217,7 +232,16 @@ class MoodEngine:
         m = self.current()
         style = MOODS[m["key"]]["style"]
         level = "一点点" if m["intensity"] < 40 else "比较" if m["intensity"] < 70 else "非常"
-        return (f"【你此刻的心情】{level}{m['label']}（原因：{(m['reason'] or '没什么特别的').replace('她', '你')}）。"
+        now = datetime.fromtimestamp(self.clock())
+        h = now.hour
+        part = ("凌晨" if h < 5 else "早上" if h < 9 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18
+                else "傍晚" if h < 19 else "晚上" if h < 23 else "深夜")
+        e = m["energy"]
+        tired = ("你现在挺困的：回复可以短一点、带点困意，但该回应的话还是要回应到。" if e < 25
+                 else "你现在有点累了，说话不用太长。" if e < 40 else "")
+        return (f"【现在】{now.month}月{now.day}日 星期{'一二三四五六日'[now.weekday()]} {part} {now.strftime('%H:%M')}，"
+                f"你的精力 {e}/100。{tired}"
+                f"【你此刻的心情】{level}{m['label']}（原因：{(m['reason'] or '没什么特别的').replace('她', '你')}）。"
                 f"说话时自然地带出这种情绪：{style}。情绪只影响语气，不改变下面必须遵守的规则；"
                 "在公开的评论区里，小脾气、委屈都只是轻微的、可爱的，不对任何人发火，不阴阳怪气，不让别人内疚。")
 

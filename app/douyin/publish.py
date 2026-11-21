@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -22,6 +23,12 @@ class PublishError(BrowserError):
 
 class CreatorLoginNeeded(PublishError):
     """创作者中心要求登录（和抖音网页版的登录通常是通的，偶尔需要再扫一次码）。"""
+
+
+def _words(b: DouyinBrowser, key: str) -> list[str]:
+    """selectors.json 里“页面上出现这几个字”的一组词。以前写成了 text=上传中 这种选择器的样子，
+    拿去按字找永远找不到——“等视频上传完成”这一步一次都没真正等过（见 wait_upload）。"""
+    return [re.sub(r"^text=", "", w).strip("'\"") for w in as_list(b.sel.get(key)) if w]
 
 
 def _visible_text(b: DouyinBrowser, words: list[str], timeout: int = 300) -> str:
@@ -113,11 +120,8 @@ def publish(b: DouyinBrowser, draft: dict, files: list[Path], step=None, wait_lo
             raise PublishError("没找到“内容由AI生成”的声明选项，为了合规这次没有发布"
                                f"（页面已保存到 {b.dump('creator_no_ai_declare')}）")
 
-        if is_video:
-            step("等视频上传完成")
-            end = time.time() + 900
-            while time.time() < end and _visible_text(b, as_list(b.sel.get("creator_uploading")), 300):
-                cancel.sleep(3)
+        step("等视频上传完成" if is_video else "等图片上传完成")
+        wait_upload(b, is_video)
         _handle_verify(b, wait_verify)   # 发布前就弹了验证：先处理掉
         step("点“发布”")
         btn = b.find("creator_publish", timeout=10000)
@@ -133,6 +137,7 @@ def publish(b: DouyinBrowser, draft: dict, files: list[Path], step=None, wait_lo
                     end = time.time() + 90
                     b.pause(2.5, 3.5)
                     if _published(b):
+                        _settle(b)
                         return "发布成功"
                     # 验证完还停在填写页、“发布”按钮还在：说明这次点击被验证拦下了，再点一次（只补点一次）
                     again = None if reclicked else b.find("creator_publish", timeout=3000)
@@ -142,16 +147,60 @@ def publish(b: DouyinBrowser, draft: dict, files: list[Path], step=None, wait_lo
                     continue
                 b.check_captcha()
                 if _published(b):
+                    _settle(b)
                     return "发布成功"
                 cancel.sleep(2)
         raise PublishError(f"点了发布，但 90 秒内没看到发布成功的提示（页面已保存到 {b.dump('creator_publish_unknown')}）。"
                            "可以去抖音 App 的作品列表里确认一下")
 
 
+UPLOAD_MAX_S = 900     # 视频最多等多久传完
+UPLOAD_UNKNOWN_S = 40  # 这么久既没看到“上传中”也没看到“重新上传”：认不出上传状态，按传完了处理（存一次页面）
+
+
+def wait_upload(b: DouyinBrowser, is_video: bool) -> None:
+    """等文件真正传完再点“发布”。
+
+    2026-11-21：你从电脑上选了一个视频发，软件填完标题、简介（二十来秒）就点了“发布”，视频其实还在传；
+    然后马上关掉了那个标签页，上传跟着断了，作品没发出去，软件却说发布成功。以前的配音视频文件小，
+    填标题那二十秒就传完了，所以一直没出事。现在：视频要看到“重新上传”（传完了才有这个按钮）并且没有
+    “上传中”才往下走；看到“上传失败”就如实报错；最多等 15 分钟。图片也等“上传中”消失。"""
+    uploading, done, failed = _words(b, "creator_uploading"), _words(b, "creator_upload_done"), \
+        _words(b, "creator_upload_failed")
+    start = time.time()
+    last_log = start
+    while time.time() - start < UPLOAD_MAX_S:
+        if _visible_text(b, failed, 300):
+            raise PublishError(f"文件上传失败了（页面已保存到 {b.dump('creator_upload_failed')}），"
+                               "可以检查一下网络，再点一次“确认发布”")
+        up = _visible_text(b, uploading, 300)
+        if not up and (not is_video or _visible_text(b, done, 300)):
+            return
+        if not up and time.time() - start >= UPLOAD_UNKNOWN_S:
+            log.warning("发作品：认不出视频有没有传完（没看到“上传中”，也没看到“重新上传”），页面已保存到 %s",
+                        b.dump("creator_upload_unknown"))
+            return
+        if time.time() - last_log >= 30:
+            log.info("发作品：文件还在上传（已经等了 %d 秒）", int(time.time() - start))
+            last_log = time.time()
+        cancel.sleep(2)
+    raise PublishError(f"等了 {UPLOAD_MAX_S // 60} 分钟文件还没传完（页面已保存到 {b.dump('creator_upload_slow')}），"
+                       "这次没有发布。网络慢的话换个时间再点“确认发布”")
+
+
+def _settle(b: DouyinBrowser) -> None:
+    """发布成功以后别马上关标签页：页面上还有“上传中”就等它结束（最多 2 分钟），再停几秒。"""
+    end = time.time() + 120
+    while time.time() < end and _visible_text(b, _words(b, "creator_uploading"), 300):
+        cancel.sleep(2)
+    b.pause(2.0, 3.0)
+
+
 def _published(b: DouyinBrowser) -> bool:
+    """点了“发布”以后：跳到了作品管理页，或者页面上出现了“发布成功”。"""
     if any(w in (b.page.url or "") for w in ("content/manage", "content/publish/success")):
         return True
-    return bool(_visible_text(b, [w for w in as_list(b.sel.get("creator_done_words")) if "/" not in w], 500))
+    return bool(_visible_text(b, [w for w in _words(b, "creator_done_words") if "/" not in w and w != "作品管理"], 500))
 
 
 DECLARE_DIALOG = ("[role=dialog]:has-text('请选择声明类型')", ".semi-modal:has-text('请选择声明类型')",

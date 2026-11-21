@@ -36,11 +36,8 @@ DEFAULT_RULES = {
         "likes": 40,
         "collects": 10,            # 收藏视频（只收藏特别喜欢、想以后再看的）
         "comments": 20,
-        "replies_at": 30,
-        "replies_dm": 30,
         "comment_likes": 30,       # 给别人的评论点赞
         "comment_replies": 10,     # 回复别人的评论
-        "thread_replies": 20,      # 有人回复她的评论时，接着聊
         "at_friends": 5,           # @ 互关好友来看视频
         "publishes": 1,            # 每天最多发几个作品（每个都要你确认）
         "cost": 10.0,
@@ -52,22 +49,16 @@ DEFAULT_RULES = {
     "rest_every": 15,
     "rest_min": 10,
     "rest_max": 30,
-    "inbox_interval": 10,          # 旧版本的设置（@ 和私信一起检查），已拆成下面两项
-    "at_interval": 10,             # 分钟：多久去看一次评论区里 @ 她的（要看视频，费 token）
-    "dm_reply_mode": "instant",    # instant 秒回（大约 1 分钟内）/ 5min 每 5 分钟回一次
-    "auto_reply_at": True,
-    "auto_reply_dm": True,
+    # 评论区里 @ 她的、回复她评论的、评论她作品的，还有私信：不设开关、不设上限，有人找她就回
+    # （以前版本的 auto_reply_at / auto_reply_dm / auto_reply_thread / at_interval / dm_reply_mode / dm_scope /
+    #  per_user_daily / thread_max_replies 和回复的每日上限都不再使用）
     "card_bg_default": "",         # 文字卡片默认背景：空 = 内置粉色样式；否则是“背景图库”里的文件名
     "card_panel_default": True,    # 默认把文字写在半透明白卡片上
     "collect_enabled": True,       # 刷到特别喜欢、想以后再看的视频时收藏
     "skip_ads": True,              # 刷到广告直接划走（不看、不点赞、不评论，也不花模型的钱）
     "engage_comments": True,       # 看到喜欢的评论时，给别人的评论点赞 / 回复
-    "dm_scope": "all",             # all 回复所有人 / followers 只回复关注了她的人
     "share_watch_minutes": 3,      # 私信里别人分享的视频：最多完整看几分钟（更长的后面快进着看）
     "share_frames": 6,             # 看分享视频时在整段视频里截几帧给模型看
-    # 有人回复她的评论：接着回，同一串对话里她最多回几次
-    "auto_reply_thread": True,
-    "thread_max_replies": 3,
     # 刷到好朋友可能喜欢的视频时，@ 互关好友（只 @ 你在下拉框里选了的好友）
     "at_friends_enabled": True,
     "at_friend_per_day": 1,        # 同一个好友每天最多被 @ 几次
@@ -79,7 +70,6 @@ DEFAULT_RULES = {
     "image_gen_model": "",
     "image_gen_size": "1024x1024",
     "image_gen_price": 0,          # 元 / 张，用来算花费
-    "per_user_daily": 3,
     "topics": list(DEFAULT_TOPICS.keys()),
     "topic_keywords": DEFAULT_TOPICS,
     "keywords": ["加微信", "私聊发你", "内部消息", "稳赚"],
@@ -96,6 +86,19 @@ DEFAULT_RULES = {
     # 只有互关好友可以设为主人。主动找主人聊天不设次数：什么时候找、隔多久再找，看她当时的心情
     "owner_enabled": True,
     "owner_share_per_day": 2,      # 每天最多主动给主人分享几个视频
+    "owner_at_per_day": 2,         # 每天最多在评论里 @ 主人几次（刷到 TA 会喜欢的视频时）
+    "owner_quiet_start": "23:30",  # 主人的勿扰时段：这段时间她不主动找主人（TA 发来的照样回）；开始 = 结束表示不设
+    "owner_quiet_end": "08:00",
+    # 主人的命令：勾了“可以给她下命令”的主人，在私信里让她去做事（私信谁说什么、在评论区 @ 谁、搜视频发给谁、发个作品……），
+    # 她自己规划、一步步做完再回报。下面是允许她替主人做的事，和每天的上限（防止刷屏）
+    "owner_cmd_allow": ["dm", "comment", "share", "search", "like", "publish"],
+    "owner_cmd_dm_per_day": 20,       # 按主人的要求，每天最多给别人发几次私信
+    "owner_cmd_comment_per_day": 10,  # 每天最多发几条评论
+    "owner_cmd_share_per_day": 20,    # 每天最多分享几次视频
+    "owner_cmd_secret": "",           # 命令口令（可不填）：读不到聊天对方的主页 id、没法核对是不是主人本人时，消息里带上口令才算数
+    # 刷视频：你设的“不想看”的关键词（文案、作者、热评里出现就直接划走，不花模型的钱）和“想多看”的关键词
+    "watch_exclude": [],
+    "watch_prefer": [],
     "frames_per_video": 4,
     # 抖音自带的小表情（[比心] 这样的）：让她说话时偶尔带一个
     "douyin_emoji": True,

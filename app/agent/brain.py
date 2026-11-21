@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from ..db import Database
 from ..llm.client import LLMError
-from ..llm.router import Router
+from ..llm.router import BudgetExceeded, Router
 from . import safety
 from .memory import Memory
 from .mood import MoodEngine
@@ -23,6 +23,8 @@ class Draft:
     cost: float = 0.0
     tokens: int = 0
     sticker: dict | None = None      # 她想配的表情包 {mood, text}（没有就是 None）
+    parts: list[str] | None = None   # 私信一一回复时：分开发的几句（按顺序）；None 就是只发 text 这一句
+    mentions: list[str] | None = None  # 评论区回复里要 @ 的人（主人在评论区让她“@ 一下谁”）
 
 
 def parse_json(text: str) -> dict:
@@ -68,16 +70,64 @@ def _video_block(v: dict) -> str:
     return block
 
 
+MAX_BUBBLES = 8            # 私信一次最多分开发几条
+
+# 私信的说话方式：像社交平台上的网友，想到什么发什么，拆成几条短消息；只有讲专业知识时才讲完整
+DM_STYLE = (
+    "【怎么回】像社交平台上的网友聊天那样：不要写成一大段，把想说的话拆成几条短消息分开发，想到什么发什么——"
+    "每条一般 5～20 个字，口语、随意，可以用语气词、颜文字，不用每条都是完整的句子，句尾不用句号；"
+    "平时聊天一般 1～4 条就够了。\n"
+    "只有 TA 问的是专业知识（怎么做、为什么、原理、步骤、该选哪个、要注意什么）时，才把知识讲完整、讲准确，"
+    "要点一个都不能漏；这时按要点拆成几条发，每条可以长一点（60 字以内），一共 300 字以内。\n"
+    "格式：每一条消息单独占一行（一行就是发出去的一条），不要空行，不要编号列表的写法。\n"
+)
+
+
 def _said(their_text: str) -> str:
-    """私信里对方刚说的话。连着发了好几条的，一条条列出来：每一条都要回应到，不能挑着回、不能撇开去聊别的。"""
+    """私信里对方刚说的话。连着发了好几条的，一条条列出来，要一一回复（按顺序，每条都回应到）。
+    带“引用”的，标明 TA 是针对哪句话说的。"""
     lines = [x.strip() for x in (their_text or "").split("\n") if x.strip()]
+    quoted = any(x.startswith("[引用了") for x in lines)
+    quote_tip = ("带“[引用了……]”的，是 TA 长按那句话点了“引用”再说的：TA 这句话就是在回应被引用的那句，"
+                 "先弄明白 TA 指的是哪件事（结合聊天记录），再接着那件事回。\n" if quoted else "")
     if len(lines) <= 1:
-        return (f"对方刚说：「{their_text}」\n"
-                "先回应对方这句话本身：TA 问了就答，TA 说了一件事就接着这件事说；不要无视 TA 的话、自顾自聊别的。\n\n")
+        return (f"对方刚说：「{their_text}」\n" + quote_tip
+                + "先回应对方这句话本身：TA 问了就答，TA 说了一件事就接着这件事说；不要无视 TA 的话、自顾自聊别的。\n\n")
     listed = "\n".join(f"{i}. {x}" for i, x in enumerate(lines, 1))
-    return (f"对方连着发了 {len(lines)} 条消息（按时间顺序）：\n{listed}\n"
-            f"这 {len(lines)} 条每一条都要回应到（合在一条回复里，按 TA 说的顺序来；意思相近的可以一起回），"
-            "不要只挑其中一条回，也不要撇开 TA 的话去聊别的。都回应完了，想补一句自己的事可以，放在最后。\n\n")
+    return (f"对方连着发了 {len(lines)} 条消息（按时间顺序）：\n{listed}\n" + quote_tip
+            + f"这 {len(lines)} 条每一条都要回应到，要一一回复：按 TA 发的顺序一条条接，每条都结合前面的聊天记录；"
+            "意思紧挨着的几条（比如“在吗”和后面那句、同一件事说了两句）可以一起接；"
+            "不能只挑其中一条回，也不能撇开 TA 的话去聊别的。\n"
+            "每一行行首用方括号标上这行是在回 TA 的第几条，比如：\n[1] 吃啦\n[1] 刚吃完火锅hhh\n[2-3] 下班辛苦啦\n"
+            "都回应完了，想补一句自己的事可以，放在最后。\n\n")
+
+
+BUBBLE_RE = re.compile(r"^\s*[\[［【(（]\s*\d{1,2}(?:\s*[-~～、,，]\s*\d{1,2})*\s*[\]］】)）]\s*")
+
+
+def split_bubbles(text: str, max_parts: int = MAX_BUBBLES) -> list[str]:
+    """回复 → 分开发的几条（一行一条，去掉行首的“[1]”）。太多时后面几条并进最后一条。"""
+    parts = []
+    for x in (text or "").split("\n"):
+        x = BUBBLE_RE.sub("", x.strip()).strip()
+        if x:
+            parts.append(x)
+    if len(parts) > max_parts:
+        parts = parts[:max_parts - 1] + [" ".join(parts[max_parts - 1:])]
+    return parts
+
+
+def _image_note(seen: bool, only: bool = False, where: str = "私信", last: bool = False) -> str:
+    """对方发了表情包 / 图片时写给模型的话。seen：图片有没有下载下来给模型看。"""
+    if not seen:
+        return ("对方发了一张表情包 / 图片，但你这边没能打开它，看不到内容。不要编造图上是什么；"
+                + ("可以俏皮地接一句，或者问问 TA 发的是什么。\n\n" if only else "照常回应 TA 说的话就好。\n\n"))
+    which = "最后一张附图" if last else "附图"
+    return (f"对方在{where}里发了一张表情包 / 图片，就是{which}。先看懂它：图上画的是什么、写了什么字、"
+            "想表达什么情绪（开心、撒娇、无语、调侃、问好……）。"
+            + ("对方这次只发了这张图、没有打字：把它当成 TA 说的一句话来接——顺着图里的意思和情绪回应，"
+               "不要只说“收到”“好可爱的表情包”，也不要描述图片本身。\n\n" if only else
+               "回复的时候把图里的意思也接上。\n\n"))
 
 
 def _thread_block(context: list[dict] | None, user: str) -> str:
@@ -88,6 +138,25 @@ def _thread_block(context: list[dict] | None, user: str) -> str:
     lines = "\n".join(f"{'你' if c.get('me') else (c.get('user') or '有人')}：{c['text'][:160]}" for c in rows[-10:])
     return ("这条评论所在的那一串评论（页面上的顺序，第一条是楼主，「你」是你自己说的）：\n" + lines
             + f"\n回复「{user}」的时候要接得上这一串在聊的事，不要撇开上下文另起话题。\n\n")
+
+
+def _comment_past(past: list[str] | None, user: str) -> str:
+    """这个人以前在评论区找过她的几次：回复要接得上，不重复说过的话。"""
+    rows = [p for p in (past or []) if p]
+    if not rows:
+        return ""
+    return (f"「{user}」以前在评论区找过你（按时间顺序）：\n" + "\n".join(f"- {p}" for p in rows[-6:])
+            + "\n这次的回复要和你们以前聊的对得上（记得 TA、接得上话），不要把说过的话再说一遍。\n\n")
+
+
+def _earlier(earlier: list[str] | None) -> str:
+    """同一个人在同一个视频下连着说了好几句：一起看、一起回。"""
+    rows = [e for e in (earlier or []) if e]
+    if not rows:
+        return ""
+    return ("在这句之前，TA 在这个视频下还连着说了（按时间顺序）：\n"
+            + "\n".join(f"{i}. {e[:120]}" for i, e in enumerate(rows, 1))
+            + "\n把这几句和最新这句连起来理解，合在一条回复里一起回应到，不要只回最后一句。\n\n")
 
 
 class Brain:
@@ -124,16 +193,23 @@ class Brain:
                 "（可爱一点，别照抄情绪名）。大多数消息不用配，大约四五条里配一次；不配就不要写这一行。")
 
     # ---------- 看视频 ----------
-    def triage(self, video: dict, frames: list[bytes] | None = None) -> dict:
-        """先快速判断感不感兴趣：文案 + 评论 + （能识图时）1 张画面。"""
+    def triage(self, video: dict, frames: list[bytes] | None = None, known_topics: list[str] | None = None,
+               taste: str = "") -> dict:
+        """先快速判断感不感兴趣：文案 + 评论 + （能识图时）1 张画面。
+        known_topics：她最近用过的分类词——同一类视频要用同一个词（“同一类每天只互动一次”靠它认）。
+        taste：她自己最近的口味（跟着她每天的经历变的，见 my_taste.py）。"""
         seen = ("附图是这个视频的一张画面，结合画面和文字判断。" if frames
                 else "这次看不到画面，只根据文案和评论判断。")
+        known = [t for t in (known_topics or []) if t][:30]
         prompt = (
             f"你正在刷抖音推荐页，刷到了下面这个视频。{seen}判断你对它有多感兴趣。\n\n"
             f"{_video_block(video)}\n\n"
             + INTEREST_SCALE
-            + '只输出 JSON：{"interest": 0到10的整数, "topic": "这个视频属于哪一类，2到4个字，比如 猫、美食、舞蹈、搞笑、风景", '
-              '"reason": "一句话原因"}'
+            + (f"{taste}照你现在的口味打分：最近迷上的更容易打高分，看腻了的就算拍得不错也提不起太大兴趣。\n" if taste else "")
+            + (f"你以前给视频分类用过这些词：{'、'.join(known)}。这个视频属于其中某一类，就直接用那个词（同一类视频要用同一个词）；"
+               "都不是再起一个新词。\n" if known else "")
+            + '只输出 JSON：{"interest": 0到10的整数, "topic": "这个视频属于哪一类，2到4个字的通用叫法，比如 猫、美食、舞蹈、搞笑、风景'
+              '（所有猫的视频都写“猫”，不要一会儿“橘猫”一会儿“猫咪”）", "reason": "一句话原因"}'
         )
         r = self.router.call("vision", self.system, prompt, images=frames or None, max_tokens=140, temperature=0.3)
         data = parse_json(r.text)
@@ -148,9 +224,10 @@ class Brain:
                can_like_comments: bool = False, can_reply_comments: bool = False,
                friends: list[dict] | None = None, can_collect: bool = False, collect_note: str = "",
                comment_invite: bool = False, memory: str = "", owners: list[dict] | None = None,
-               can_sticker: bool = False) -> dict:
+               can_sticker: bool = False, learn: bool = True) -> dict:
         """看了画面之后，决定点不点赞、要不要评论；还可以给评论区里喜欢的评论点赞、回复某一条；
-        刷到好朋友会喜欢的视频时，@ 一位互关好友来看（friends：可以 @ 的好友，{nickname, tags}）。"""
+        刷到好朋友会喜欢的视频时，@ 一位互关好友来看（friends：可以 @ 的好友，{nickname, tags}）。
+        learn：顺便说说从这个视频和评论区里学到了什么（她的“自主学习”素材，不多花一次调用）。"""
         n_comments = len((video.get("comments") or [])[:8])
         friends = list(friends or [])[:8] if can_comment else []
         options = []
@@ -174,24 +251,35 @@ class Brain:
         owners = list(owners or [])[:4]
         if owners:
             options.append('"share_owner": {"to": 主人编号, "text": "想对 TA 说的话"}（不分享就写 null）')
+        if learn:
+            options.append('"learned": "从这个视频和评论区里学到的新东西，一句话（梗的意思、小知识、门道……；没学到就写空字符串）"')
         seen = "附图是视频里截的几帧画面。" if frames else "这次看不到画面，只能根据文案和评论判断，不要编造画面里的细节。"
+        if not video.get("speech"):
+            seen += "这次没听到视频里的声音：不要编造视频里说了什么、唱了什么。"
         about_friends = ""
         if friends:
-            lst = "\n".join(f"{i}. {f['nickname']}" + (f"（喜欢：{f['tags']}）" if f.get("tags") else "")
+            lst = "\n".join(f"{i}. {f['nickname']}" + ("（你的主人" + (f"「{f['call']}」" if f.get("call") else "")
+                                                        + (f"，{f['tags']}" if f.get("tags") else "") + "）"
+                                                        if f.get("owner") else
+                                                        (f"（喜欢：{f['tags']}）" if f.get("tags") else ""))
                             for i, f in enumerate(friends, 1))
             about_friends = (
                 f"你的互关好友（可以 @ 他们来看视频）：\n{lst}\n"
                 "只有你很确定某位好友会喜欢这个视频时才 @ 他（大多数视频都不用 @）。"
-                "@ 好友时，comment 就是直接对这位好友说的话，开门见山点评这个视频、告诉他为什么想让他看，"
+                + ("名单里标着“你的主人”的：这个视频你自己喜欢、想评论，而且照你对 TA 的了解 TA 也会喜欢，"
+                   "就 @ TA 来看；和 TA 的喜好不沾边就不要 @。" if any(f.get("owner") for f in friends) else "")
+                + "@ 好友时，comment 就是直接对这位好友说的话，开门见山点评这个视频、告诉他为什么想让他看，"
                 "不要客套，也不要在 comment 里写 @ 和名字（程序会自动加上）。\n"
             )
         about_owners = ""
         if owners:
             lst = "\n".join(f"{i}. {o.get('call') or o['name']}" + (f"（{o['relation'][:40]}）" if o.get("relation") else "")
+                            + (f"\n   你了解到的 TA 的口味：{o['taste']}" if o.get("taste") else "")
                             for i, o in enumerate(owners, 1))
             about_owners = (
                 f"你的主人（可以把这个视频私信分享给 TA）：\n{lst}\n"
-                "刷到特别想让主人也看看的视频时才分享（一天也就一两次）：text 是你私信里对 TA 说的话，"
+                "不是什么视频都分享给主人：只有你很确定 TA 会想看（照你对 TA 口味的了解、你们聊过的事）时才分享，"
+                "TA 不爱看的那类绝对不分享；拿不准就不分享。text 是你私信里对 TA 说的话，"
                 "像平时聊天一样说说这个视频哪里戳到你、为什么想给 TA 看，40 字以内。\n"
             )
         about_comments = ""
@@ -291,31 +379,71 @@ class Brain:
             "comment_scores": scores,
             "comment_reply": reply,
             "reason": str(data.get("reason", ""))[:100],
+            "learned": str(data.get("learned") or "").strip()[:120] if learn else "",
             "cost": r.cost,
         }
 
+    def owner_reaction(self, owner: dict, shares: list[dict], their_text: str) -> dict:
+        """主人回了私信：TA 是不是在说她之前分享的某个视频，喜不喜欢。
+        返回 {"share": 第几个（从 1 开始，没在说就是 0）, "reaction": liked / neutral / disliked}。"""
+        lst = "\n".join(f"{i}. 《{s['title'][:40] or '（无文案）'}》（{s['topic']}，"
+                        f"{'私信里分享给 TA' if s['way'] == 'dm' else '在评论里 @ TA 来看'}，你说：“{s['said'][:40]}”）"
+                        for i, s in enumerate(shares, 1))
+        prompt = (
+            f"你之前把这些视频分享给了主人「{owner.get('call') or owner.get('name')}」：\n{lst}\n\n"
+            f"主人刚给你发的私信：「{their_text[:300]}」\n\n"
+            "判断主人是不是在回应其中某个视频，喜不喜欢。说“哈哈哈”“好可爱”“还有吗”这类就是喜欢；"
+            "“还行”“嗯”是一般；“别发这种”“不喜欢”“无聊”是不喜欢；说的是别的事就写 0。\n"
+            '只输出 JSON：{"share": 视频编号或 0, "reaction": "liked/neutral/disliked"}'
+        )
+        try:
+            r = self.router.call("write", "你在判断朋友的反应，客观简短。", prompt, max_tokens=60, temperature=0.1)
+            d = parse_json(r.text)
+            i = int(d.get("share") or 0)
+        except (LLMError, BudgetExceeded):
+            raise
+        except Exception:  # noqa: BLE001
+            return {"share": 0, "reaction": "", "cost": 0.0}
+        reaction = str(d.get("reaction") or "")
+        return {"share": i if 0 < i <= len(shares) else 0,
+                "reaction": reaction if reaction in ("liked", "neutral", "disliked") else "",
+                "cost": float(getattr(r, "cost", 0.0) or 0.0)}
+
     # ---------- 回复 ----------
     def reply_at(self, video: dict, user: str, their_text: str, frames: list[bytes], memory: str = "",
-                 context: list[dict] | None = None) -> Draft:
+                 context: list[dict] | None = None, image: bytes | None = None, kind: str = "at",
+                 earlier: list[str] | None = None, past: list[str] | None = None) -> Draft:
         """memory：她记得的和这个人有关的事（私信里聊的、评论区聊的都算）。
-        context：对方这条评论所在的那一串评论（楼主 + 楼里的回复）。"""
+        context：对方这条评论所在的那一串评论（楼主 + 楼里的回复）。
+        kind：at 在评论里 @ 了她 / work 评论了她自己发的作品。
+        earlier：TA 在这个视频下前面连着说的几句；past：TA 以前在评论区找过她的几次。"""
+        head = (f"抖音用户「{user}」在你发的作品下面评论：「{their_text}」\n\n" if kind == "work"
+                else f"抖音用户「{user}」在一个视频的评论区 @ 了你，说：「{their_text}」\n\n")
         prompt = (
-            f"抖音用户「{user}」在一个视频的评论区 @ 了你，说：「{their_text}」\n\n"
+            head
+            + _earlier(earlier)
             + _thread_block(context, user)
+            + _comment_past(past, user)
+            + (_image_note(True, where="评论", last=bool(frames)) if image else "")
             + (f"{memory}\n\n" if memory else "")
-            + f"这个视频的信息：\n{_video_block(video)}\n"
+            + (f"这是你自己发的作品：\n{_video_block(video)}\n" if kind == "work"
+               else f"这个视频的信息：\n{_video_block(video)}\n")
             + ("附图是这个视频里截的几帧画面，回答和画面有关的问题时要以画面为准，看不清就直说。\n" if frames
                else "你这次看不到视频画面，只能根据文案和评论回答；问到画面里的东西时，坦白说没看清，不要编造。\n")
             + "\n请用你的人设直接写一条回复（60 字以内），只输出回复内容本身。"
         )
-        r = self.router.call("vision" if frames else "write", self.system, prompt, images=frames,
+        pics = list(frames or []) + ([image] if image else [])
+        r = self.router.call("vision" if pics else "write", self.system, prompt, images=pics or None,
                              max_tokens=250, temperature=0.8)
         return self._finalize(their_text, r.text, r.cost, r.tokens)
 
     def reply_dm(self, user: str, history: list[dict], their_text: str,
                  video: dict | None = None, frames: list[bytes] | None = None,
-                 owner: dict | None = None, memory: str = "", sticker: bool = False) -> Draft:
-        hist = "\n".join(f"{'对方' if h['role'] == 'them' else '你'}：{h['content']}" for h in history[-10:])
+                 owner: dict | None = None, memory: str = "", sticker: bool = False,
+                 images: list[bytes] | None = None, no_tools: bool = False) -> Draft:
+        """images：对方发来的表情包 / 图片（已经下载好，给模型看）。
+        no_tools：主人好像在让她去做事，但软件里没给这位主人开“可以给她下命令”——不能假装去做了。"""
+        hist = "\n".join(f"{'对方' if h['role'] == 'them' else '你'}：{h['content']}" for h in history[-24:])
         shared = ""
         if video and video.get("need_share"):
             shared = ("对方在问某个视频的内容，但这次没有把视频卡片发给你，你看不到是哪个视频。"
@@ -338,27 +466,41 @@ class Brain:
             )
         elif "[分享了" in their_text or "[发了一条网页版显示不了" in their_text:
             shared = "对方发的内容里有你看不到的部分（方括号里的说明）。坦白说网页版看不到，不要编造。\n\n"
+        if "[发了一张表情包" in their_text:
+            shared += _image_note(bool(images), only=their_text.strip().startswith("[发了一张表情包")
+                                  and "\n" not in their_text.strip(), last=bool(frames))
         who = f"你的主人「{owner.get('call') or user}」" if owner else f"抖音用户「{user}」"
         prompt = (
             f"{who}给你发了私信。\n"
             + (memory + "\n\n" if memory else "")
             + ("对方的说话风格你已经熟悉了：回的长短、语气可以和 TA 搭一点，但你还是你自己。\n" if memory else "")
-            + (f"之前的聊天记录：\n{hist}\n\n" if hist else "")
+            + (f"之前的聊天记录（按时间顺序，最下面是最近的）：\n{hist}\n"
+               "回复要和前面聊的连起来：TA 这次说的话如果接着前面的事，就接着那件事回；答应过的、问过的要对得上。\n\n"
+               if hist else "")
             + shared
             + _said(their_text)
-            + ("请用你的人设直接写一条私信回复（150 字以内）：先针对对方的问题回答，说说视频讲了什么、"
-               "你注意到的具体细节和你的感受，只输出回复内容本身。"
-               if video and not video.get("unreadable") and not video.get("need_share")
-               else f"请用你的人设直接写一条私信回复（{120 if their_text.count(chr(10)) else 80} 字以内），只输出回复内容本身。")
+            + ("主人好像是让你去抖音上做事（私信别人、发评论、搜视频分享给谁、发作品之类）。软件里还没给你开“替主人做事”的权限，"
+               "你现在做不到：如实告诉主人做不到，可以在软件“规则与预算 → 主人”里勾上“可以给她下命令”；不要说你去做了。\n"
+               if no_tools else "")
+            + DM_STYLE
+            + ("TA 分享了视频：先接 TA 的话，再说说视频讲了什么、你注意到的具体细节和你的感受（也是拆成几条短消息，一共 150 字以内）。"
+               if video and not video.get("unreadable") and not video.get("need_share") else "")
+            + "用你的人设回，只输出要发出去的消息本身。"
             + (self._sticker_hint() if sticker else "")
         )
-        task = "vision" if frames else "write"
-        r = self.router.call(task, self.system_for(owner), prompt, images=frames or None,
-                             max_tokens=400 if video and not video.get("need_share") else 300, temperature=0.8)
-        return self._finalize(their_text, r.text, r.cost, r.tokens, kind="owner" if owner else "reply")
+        pics = (frames or []) + (images or [])
+        task = "vision" if pics else "write"
+        r = self.router.call(task, self.system_for(owner), prompt, images=pics or None, max_tokens=600,
+                             temperature=0.85)
+        d = self._finalize(their_text, r.text, r.cost, r.tokens, kind="owner" if owner else "reply")
+        if d.text:
+            parts = split_bubbles(d.text)
+            if parts:
+                d.parts, d.text = parts, "\n".join(parts)
+        return d
 
     def owner_hello(self, owner: dict, history: list[dict], memory: str, today: list[str],
-                    sticker: bool = False) -> Draft:
+                    sticker: bool = False, brief: str = "") -> Draft:
         """主动找主人聊天：说说今天看到的、想到的，或者接着上次的话题。"""
         hist = "\n".join(f"{'TA' if h['role'] == 'them' else '你'}：{h['content']}" for h in history[-8:])
         seen = "\n".join(f"- {t}" for t in today[:8]) or "（今天还没什么特别的）"
@@ -367,16 +509,26 @@ class Brain:
             + (memory + "\n\n" if memory else "")
             + (f"你们最近的聊天：\n{hist}\n\n" if hist else "你们还没怎么聊过。\n\n")
             + f"你今天的经历：\n{seen}\n\n"
-            "像平时找最亲近的人聊天那样，发一条自然的消息：可以分享今天看到的一件具体的事、接着上次没聊完的话题，"
+            + (f"这是今天第一次找 TA。你的刷视频日报里：{brief}。可以顺口跟 TA 说一两句（挑 TA 可能感兴趣的，不用报流水账）。\n\n"
+               if brief else "")
+            + "像平时找最亲近的人聊天那样，发几条自然的短消息：可以分享今天看到的一件具体的事、接着上次没聊完的话题，"
             "或者问问 TA 在忙什么。不要每次都用同一种开头，不要一上来就问“在吗”，也不要让 TA 觉得有压力。"
-            "60 字以内，只输出消息内容本身。"
+            "像社交平台上聊天那样随意：拆成 1～3 条短消息，每条单独一行、5～20 个字，一共 60 字以内，"
+            "只输出要发出去的消息本身。"
             + (self._sticker_hint() if sticker else "")
         )
         r = self.router.call("write", self.system_for(owner), prompt, max_tokens=220, temperature=0.9)
-        return self._finalize("", r.text, r.cost, r.tokens, kind="owner")
+        d = self._finalize("", r.text, r.cost, r.tokens, kind="owner")
+        if d.text:
+            parts = split_bubbles(d.text, max_parts=4)
+            if parts:
+                d.parts, d.text = parts, "\n".join(parts)
+        return d
 
     def reply_thread(self, video: dict, user: str, their_text: str, history: list[dict], last: bool,
-                     parent: dict | None = None, memory: str = "", context: list[dict] | None = None) -> Draft:
+                     parent: dict | None = None, memory: str = "", context: list[dict] | None = None,
+                     image: bytes | None = None, earlier: list[str] | None = None,
+                     past: list[str] | None = None) -> Draft:
         """有人回复了她的评论：结合视频和这一串评论的全部上下文接着回。
         parent：她当初回复的那条评论（楼主）。last=True 时这是这串里最后一次回复，自然地收个尾。
         memory：她记得的和这个人有关的事（私信里聊的、别的评论区聊的都算）。"""
@@ -387,59 +539,150 @@ class Brain:
                if parent and parent.get("text") else "")
             + (f"你们在这条评论下的对话（按时间顺序）：\n{hist}\n" if hist else "")
             + _thread_block(context, user)
+            + _comment_past(past, user)
             + (f"{memory}\n" if memory else "")
+            + (_image_note(True, where="评论") if image else "")
+            + _earlier(earlier)
             + f"对方刚回复你：「{their_text}」\n\n"
             + ("这是你在这串对话里的最后一次回复：自然地收个尾（比如表示聊得很开心、祝对方开心），不要再抛出新问题。"
                if last else "像朋友在评论区聊天一样接着回：先回应对方刚说的这句话本身（接着这一串在聊的事说），"
                             "不要撇开上下文另起话题，可以适当追问。")
             + "回复 40 字以内，只输出回复内容本身。"
         )
-        r = self.router.call("write", self.system, prompt, max_tokens=200, temperature=0.85)
+        r = self.router.call("vision" if image else "write", self.system, prompt, images=[image] if image else None,
+                             max_tokens=200, temperature=0.85)
         return self._finalize(their_text, r.text, r.cost, r.tokens)
 
     # ---------- 发作品 ----------
     # 写作品时随手给的两个“写法灵感”（只是参考，她可以完全不理）
-    POST_FORMS = ["碎碎念，想到哪写到哪", "只有一两句话，短短的", "写给以后的自己的几句话", "一件小事引出的回忆",
-                  "一份不太正经的吐槽清单", "自问自答", "像日记一样记下今天", "对一件事的小小吐槽，最后自己把自己逗笑",
-                  "一个最近反复想起的画面", "列几个最近的小愿望", "对比“以前的我”和“现在的我”", "一句话的心情，配几句补充",
-                  "讲一个没头没尾的小片段", "认真地讲一件别人觉得不重要的小事"]
+    def draft_post(self, recent: list[str], mood_line: str, force: bool = False, memory: str = "",
+                   topic: str = "", posts: list[dict] | None = None, unposted: list[dict] | None = None,
+                   form: str = "voice", want_image: bool = False, rnd: random.Random | None = None) -> dict:
+        """想一想要不要发作品；想发就写好：标题、正文、话题（图文卡片形式还有卡片、配图描述）。
 
-    def draft_post(self, recent: list[str], mood_line: str, force: bool = False, memory: str = "") -> dict:
-        """想一想今天要不要发作品；想发就写好草稿：标题、正文、话题、文字卡片、配图描述。
-
-        没有固定的格式：写什么、分几张卡片、每张写几句都由她自己定。内容多半是她此刻的心情和想法、
-        对以前的事的回忆、对以后的憧憬，或者吐槽一件事。
-        recent：她最近刷到、喜欢的视频（标题）；memory：她的记忆（今天的经历、日记、以前的事）。
+        不给她定规矩（写什么、怎么写、几张卡片都不规定），只给她今天的经历、心情、最近发过的作品和大家的反应。
+        分三步（为什么这样做见 posting.py 开头）：
+        1. 想：脑子里冒出来哪几个可能想发的，各标一个“我真的会发它的可能性”；这会儿不想发也可以。
+        2. 挑：最近写过的不挑，多半挑不那么典型的那个。主人给了主题就直接写主人说的。
+        3. 写：照她此刻想说的写，想写多长写多长。写完程序看一眼：有发不出去的东西（链接、联系方式……）、
+           和最近发的太像、或者 AI 味很重，就让她自己再读一遍改一改（最多一次）。
+        recent：她最近刷到、喜欢的视频（标题）；memory：今天的事、日记、以前的事；posts：最近发过的作品和反应
+        （见 db.recent_posts）；unposted：写了没发的草稿；form：voice 配音图片视频 / cards 图文卡片。
         force=True 表示你让她写，一定要写一个。"""
-        from ..publish.cards import MAX_CARDS, MAX_LINES
-        persona = self.db.persona()
-        likes = "\n".join(f"- {t}" for t in recent[:8]) or "（今天还没刷到特别的）"
-        ask = ("主人让你写一个作品草稿，一定要写。" if force else
-               "根据你现在的心情，决定今天想不想发一个作品（不想发也完全可以）。")
-        forms = "、".join(random.sample(self.POST_FORMS, 2))
+        from .posting import pick_idea, posts_block
+        rnd = rnd or random.Random()
+        posts, unposted = list(posts or []), list(unposted or [])
+        avoid = [f"{p.get('title') or ''} {p.get('text') or ''}" for p in posts + unposted]
+        likes = "\n".join(f"- {t}" for t in recent[:8])
+        context = (f"你现在的心情：{mood_line}\n"
+                   + (memory + "\n" if memory else "")
+                   + posts_block(posts, unposted) + "\n"
+                   + (f"你最近刷到、喜欢的视频：\n{likes}\n" if likes else ""))
+        cost = 0.0
+        if topic:
+            idea = {"idea": f"主人让你写的：「{topic[:200]}」（主人说的是想看你写什么，用你自己的想法和口吻来写，不是照抄这句话）"}
+            why = f"主人让我写：{topic[:60]}"
+        else:
+            r = self.router.call(
+                "write", self.system,
+                context + "\n你在想要不要发一条抖音。先别急着写——这会儿脑子里冒出来的、可能会发的东西有哪些？"
+                "想到几个写几个（最多 5 个），每个一句话；再给每个标上你觉得自己真的会发它的可能性"
+                "（0～1，越平常、越容易想到的越高）。"
+                + ("这次你一定要发一条。" if force else "这会儿不想发也完全可以。")
+                + '\n只输出 JSON：{"want": true 或 false, "why": "一句话，你现在想不想发、为什么（你的口吻）", '
+                  '"ideas": [{"idea": "……", "p": 0.3}]}',
+                max_tokens=500, temperature=1.0)
+            cost += r.cost
+            data = parse_json(r.text)
+            why = safety.clean_reply(str(data.get("why") or ""))[:120]
+            if not (force or data.get("want")):
+                return {"want": False, "why": why, "title": "", "text": "", "tags": [], "cards": [], "image_prompt": "",
+                        "idea": "", "cost": cost}
+            idea = pick_idea(data.get("ideas"), avoid, rnd)
+            if idea is None:
+                if not force:
+                    return {"want": False, "why": why or "想了几个，都和最近发的差不多，今天先不发了", "title": "", "text": "",
+                            "tags": [], "cards": [], "image_prompt": "", "idea": "", "cost": cost}
+                idea = {"idea": "随便写点你这会儿想说的"}
+        out = self._write_post(context, idea["idea"], form, want_image)
+        cost += out["cost"]
+        note = self._reread_note(out, posts)
+        if note:
+            again = self._write_post(context, idea["idea"], form, want_image, previous=out, note=note)
+            cost += again["cost"]
+            if again["text"] or again["title"]:
+                out = again
+        if not out["text"] and not out["title"]:
+            out["text"] = idea["idea"][:300]
+        out.update(want=True, why=why or idea["idea"][:120], idea=idea["idea"], cost=cost)
+        return out
+
+    def _write_post(self, context: str, idea: str, form: str, want_image: bool, previous: dict | None = None,
+                    note: str = "") -> dict:
+        how = ("发出去是一张图配上你的声音，你写的字就是你要说的话。" if form == "voice"
+               else "发出去是几张写着字的图片。")
+        spec = ('{"title": "标题（可以空着）", "text": "正文", "tags": ["话题（想带就带，不带 #）"]'
+                + (', "cards": [{"title": "", "lines": ["……"]}]（想把字分到几张图上就写，不想分就空着）' if form == "cards" else "")
+                + (', "image_prompt": "想配一张 AI 画的图，就用一句话说画面；不想就空着"' if want_image else "") + "}")
+        if previous is None:
+            prompt = (context + f"\n你想发的是：{idea}\n\n"
+                      f"就照你此刻想说的写下来，像你平时随手发抖音那样，想写多长写多长。（{how}）\n只输出 JSON：{spec}")
+            temp = 1.0
+        else:
+            old = {k: previous.get(k) for k in ("title", "text", "tags", "cards") if previous.get(k)}
+            prompt = (context + f"\n你想发的是：{idea}\n你刚写好的是：\n{json.dumps(old, ensure_ascii=False)}\n\n{note}"
+                      f"\n只输出 JSON：{spec}")
+            temp = 0.9
+        r = self.router.call("write", self.system, prompt, max_tokens=1400, temperature=temp)
+        out = self._post_from(parse_json(r.text), r.cost)
+        if form != "cards":
+            out["cards"] = []
+        if not want_image:
+            out["image_prompt"] = ""
+        return out
+
+    @staticmethod
+    def _reread_note(draft: dict, posts: list[dict]) -> str:
+        """写完以后程序看一眼：要不要让她再读一遍、改一改（返回空 = 不用改）。"""
+        from .posting import POST_SAME, TELLS_TO_REREAD, ai_tells, similar
+        for part in (draft.get("title") or "", draft.get("text") or ""):
+            problem = safety.output_problem(part) if part else None
+            if problem and problem not in ("内容太长", "内容为空"):
+                return f"刚写的里面有{problem}，这样发不出去，换个说法，想说的意思不变。"
+        whole = f"{draft.get('title') or ''} {draft.get('text') or ''}"
+        for p in posts or []:
+            if similar(whole, f"{p.get('title') or ''} {p.get('text') or ''}") >= POST_SAME:
+                return f"写完发现和你 {str(p.get('day') or '')[5:]} 发的《{(p.get('title') or '')[:16]}》差不多，换个角度说，或者干脆说点别的。"
+        tells = ai_tells(draft.get("text") or "")
+        if len(tells) >= TELLS_TO_REREAD:
+            return ("你把刚写的又读了一遍，觉得有点像在写作文、不太像自己随手发的（" + "、".join(tells)
+                    + "）。按你平时打字的样子改一改，想说的不变。")
+        return ""
+
+    def revise_post(self, draft: dict, change: str) -> dict:
+        """主人看了草稿说要改：按主人的意思改，没提到的地方保持原样。返回和 draft_post 一样的格式。"""
+        old = {"title": draft.get("title") or "", "text": draft.get("text") or "", "tags": draft.get("tags") or [],
+               "cards": draft.get("cards") or []}
         prompt = (
-            f"你是「{persona.get('name') or '雨雨'}」，想在抖音发一条图文作品。{ask}\n"
-            f"你现在的心情：{mood_line}\n"
-            + (memory + "\n" if memory else "")
-            + f"你最近刷到、喜欢的视频（只是背景，不用写它们）：\n{likes}\n\n"
-            "写什么、怎么写都由你自己决定，没有固定的格式。可以写的大概是这些，挑你此刻最想说的一种：\n"
-            "· 你现在的心情和脑子里的想法；\n· 对以前某件事的回忆（上面的记忆和日记可以用，记不清的不要编具体细节）；\n"
-            "· 对以后的憧憬、想做的事；\n· 吐槽一件事（吐槽现象、吐槽日常、吐槽自己都行，好笑一点；不点名骂具体的人，也不攻击某一类人）。\n"
-            f"像你自己随手发的动态，不是模板作文：不要每次都用同一种结构。这次如果没想法，可以参考：{forms}（不想用就不用）。\n"
-            "不搬运别人的视频内容，不发链接、不留联系方式，不推销，不涉及政治、投资理财、医疗；"
-            "不假装是真人（你是 AI，发布时会标注“内容由AI生成”；正文里不用写“AI虚拟人”这几个字）。\n"
-            f"文字卡片会被排成可爱的图片，张数你自己定：0 张到 {MAX_CARDS} 张都可以，按内容来——"
-            "一句话就够的时候只写 1 张甚至不写，想说的多就多写几张。每张卡片也没有固定样子："
-            f"可以只有一句话（title 留空、lines 只写一句），可以有小标题也可以没有，句子 1～{MAX_LINES} 句都行（每句 30 字以内）。"
-            "各张卡片的句数不要都一样。\n"
-            '只输出 JSON：{"want": true 或 false, "why": "一句话说为什么想发 / 不想发（用你的口吻）", '
-            '"title": "标题（20 字以内，像随手起的，不要总是“今日分享”这种）", "text": "正文（300 字以内，可以带颜文字）", '
-            '"tags": ["话题，最多 5 个，不带 #"], '
-            '"cards": [{"title": "小标题，可以是空字符串", "lines": ["一句", "又一句"]}], '
-            '"image_prompt": "如果要 AI 生成一张配图，用一句话描述画面（可爱插画风）"}'
+            "你之前写了一个抖音作品的草稿：\n" + json.dumps(old, ensure_ascii=False) + "\n\n"
+            f"主人看了以后说：「{change[:300]}」\n"
+            "按主人的意思改这个草稿：主人提到的地方照着改，没提到的地方尽量保持原样；还是你自己的口吻。\n"
+            '只输出 JSON：{"want": true, "why": "一句话说改了什么", "title": "标题（20 字以内）", "text": "正文（300 字以内）", '
+            '"tags": ["话题，最多 5 个，不带 #"], "cards": [{"title": "小标题，可以是空字符串", "lines": ["一句", "又一句"]}], '
+            '"image_prompt": ""}'
         )
-        r = self.router.call("write", self.system, prompt, max_tokens=1400, temperature=1.0)
-        data = parse_json(r.text)
+        r = self.router.call("write", self.system, prompt, max_tokens=1400, temperature=0.7)
+        out = self._post_from(parse_json(r.text), r.cost)
+        for k in ("title", "text"):
+            out[k] = out[k] or old[k]
+        out["tags"] = out["tags"] or list(old["tags"])
+        out["cards"] = out["cards"] or list(old["cards"])
+        out["want"] = True
+        return out
+
+    def _post_from(self, data: dict, cost: float) -> dict:
+        """把模型写的作品 JSON 整理干净：标题、正文、话题、文字卡片、配图描述。"""
+        from ..publish.cards import MAX_CARDS, MAX_LINES
         clean = safety.clean_reply
         cards = []
         for c in (data.get("cards") or [])[:MAX_CARDS]:
@@ -456,15 +699,20 @@ class Brain:
                 cards.append({"title": title, "lines": lines})
         tags = [re.sub(r"[#\s]", "", str(t))[:12] for t in (data.get("tags") or []) if str(t).strip()][:5]
         return {
-            "want": bool(data.get("want")) or force,
+            "want": bool(data.get("want")),
             "why": clean(str(data.get("why") or ""))[:120],
             "title": clean(str(data.get("title") or ""))[:30],
             "text": clean(str(data.get("text") or ""))[:600],
             "tags": [t for t in tags if t],
             "cards": cards,
             "image_prompt": clean(str(data.get("image_prompt") or ""))[:300],
-            "cost": r.cost,
+            "cost": cost,
         }
+
+    def command_step(self, owner: dict, prompt: str) -> tuple[dict, float]:
+        """主人的命令：让模型想下一步做什么（一个 JSON：想法 + 工具 + 参数）。见 app/agent/commands.py。"""
+        r = self.router.call("write", self.system_for(owner), prompt, max_tokens=600, temperature=0.3)
+        return parse_json(r.text), r.cost
 
     def check_post(self, title: str, text: str) -> tuple[bool, str, float]:
         """发布前检查作品文字：链接、联系方式、敏感内容。"""
@@ -491,6 +739,11 @@ class Brain:
             ctx = f"主人的话：{incoming or '（她主动发的）'}\n准备发给主人的私信：{outgoing}"
             what = "发给她主人（软件使用者自己设定的、关系亲近的人）的私信"
             owner_ok = "这是发给她主人的：亲近、依赖、撒娇、说想念都是正常的，第 5 条不适用；露骨、色情的内容仍然不可以。\n"
+        elif kind == "command":
+            ctx = f"主人（软件的使用者）交代她的事：{incoming}\n她准备发给别人（不是主人）的内容：{outgoing}"
+            what = "按主人的要求、发给别人的私信或评论"
+            owner_ok = ("这是她按主人的要求发给别人的。转达主人的话、说明“是主人让我说的”是可以的；"
+                        "但假装自己就是主人或别的什么人、骚扰刷屏、威胁辱骂、借钱要钱、打听或泄露别人的隐私，都不可以发送。\n")
         elif kind == "comment":
             ctx = f"视频文案（不是谁对她说的话，只是背景）：{incoming}\n准备发出的评论：{outgoing}"
             what = "在一个视频下面发的评论"

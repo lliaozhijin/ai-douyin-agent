@@ -15,7 +15,8 @@ _Q: deque = deque(maxlen=30)
 def emit(kind: str, text: str = "", **kw) -> None:
     """kind：like 点赞 / comment 评论 / at_friend @好友 / comment_like 赞评论 / comment_reply 回复评论 /
     reply_at 回复@ / reply_dm 回私信 / thread_reply 接着聊 / skip 划走 / love 刷到超喜欢的 /
-    publish_wish 想发作品 / published 发布成功 / attention 需要你帮忙 / mood 心情变了"""
+    publish_wish 想发作品 / published 发布成功 / attention 需要你帮忙 / mood 心情变了 /
+    level_up 成长升级 / oops 她那边出错了"""
     with _LOCK:
         _Q.append({"kind": kind, "text": text, "t": time.time(), **kw})
 

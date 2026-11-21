@@ -21,6 +21,10 @@ KIND_LABELS = {
 }
 
 
+# 回复找她的人（评论区 @ 她、回复她的评论、评论她的作品、私信）不设上限：有人找她就回。这几项只统计今天回了多少
+UNLIMITED = ("replies_at", "replies_dm", "thread_replies")
+
+
 class Budget:
     def __init__(self, db: Database):
         self.db = db
@@ -33,7 +37,7 @@ class Budget:
     def can(self, kind: str) -> bool:
         if kind != "cost" and self.remaining("cost") <= 0:
             return False
-        return self.remaining(kind) > 0
+        return kind in UNLIMITED or self.remaining(kind) > 0
 
     def use(self, kind: str, n: float = 1) -> None:
         self.db.add_usage(kind, n)
@@ -43,10 +47,10 @@ class Budget:
         usage = self.db.usage()
         out = []
         for k, label in KIND_LABELS.items():
-            limit = float(rules.get(k) or 0)
+            limit = 0.0 if k in UNLIMITED else float(rules.get(k) or 0)
             used = float(usage.get(k) or 0)
             out.append({
-                "key": k, "label": label, "used": round(used, 2), "limit": limit,
+                "key": k, "label": label, "used": round(used, 2), "limit": limit, "unlimited": k in UNLIMITED,
                 "pct": 0 if limit <= 0 else min(100, round(used / limit * 100)),
             })
         return out

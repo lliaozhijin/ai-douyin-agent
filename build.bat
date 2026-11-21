@@ -3,6 +3,8 @@ chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 title AI也要刷抖音 一键打包
+rem 关掉这个窗口的“快速编辑”：不然用鼠标点一下窗口里面，标题就变成“选择 ……”，程序会一直暂停到按 Esc / 回车
+powershell -NoProfile -ExecutionPolicy Bypass -File "tools\no_quickedit.ps1" >nul 2>&1
 
 echo ==================================================
 echo   AI也要刷抖音 一键打包
@@ -32,6 +34,22 @@ if not defined PY (
   exit /b 1
 )
 echo [1/6] 使用 Python：%PY%
+
+rem ---------- 1.5 Microsoft VC++ 运行库 ----------
+rem 新版 onnxruntime、ctranslate2（听声音）是用 VS 2022 17.10 以后的编译器编的：电脑上的 msvcp140.dll
+rem 低于 14.40 时，它们一启动就“访问冲突”崩溃（连报错都没有）。太旧就自动更新（要管理员权限）。
+set "VCRT=UNKNOWN"
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -ExecutionPolicy Bypass -File "tools\vcredist.ps1" -Check`) do set "VCRT=%%V"
+if /i not "%VCRT:~0,2%"=="OK" (
+  echo.
+  echo 电脑上的 Microsoft VC++ 运行库太旧或者没装［%VCRT%］，需要 14.40 以上：
+  echo 不更新的话，抠图组件 onnxruntime 和听声音的组件一启动就会崩溃，打包也会失败。
+  echo 现在自动更新，会弹出管理员确认窗口，请点“是”……
+  powershell -NoProfile -ExecutionPolicy Bypass -File "tools\vcredist.ps1" -Install
+  if errorlevel 1 goto :vcrt_fail
+  for /f "usebackq delims=" %%V in (`powershell -NoProfile -ExecutionPolicy Bypass -File "tools\vcredist.ps1" -Check`) do set "VCRT=%%V"
+)
+echo VC++ 运行库：%VCRT%
 
 rem ---------- 2. 虚拟环境和依赖 ----------
 rem 之前用不合适的 Python 建的 .venv 要删掉重建
@@ -89,16 +107,27 @@ if not exist "assets\models\whisper\faster-whisper-base\model.bin" (
   echo [3/6] 语音模型已存在
 )
 
+rem ---------- 3.6 检查听声音的组件（每一步在单独的小进程里试；不管结果如何都继续） ----------
+echo [3/6] 检查听视频声音的组件（结果保存在 data\logs\listen_check.txt）...
+"%VPY%" tools\check_listen.py
+
 rem ---------- 4. 测试 ----------
+rem -X faulthandler：万一测试进程崩溃（不是测试没通过），会打印出崩在哪一行
 echo [4/6] 运行测试...
-"%VPY%" -m unittest discover -s tests || goto :fail
+"%VPY%" -X faulthandler -m unittest discover -s tests || goto :test_fail
 
 rem ---------- 5. 打包程序 ----------
-echo [5/6] 打包程序...
+echo [5/6] 打包程序（大约 5～15 分钟；开头收集组件时可能好几分钟不出新的字，是正常的）...
+echo       提示：标题如果变成“选择 ……”，说明窗口被鼠标点了、程序暂停了，按 Esc 就能继续。
 "%VPY%" -m PyInstaller --noconfirm --clean aiWannaTikTok.spec || goto :fail
 
 rem ---------- 6. 生成安装包 ----------
 echo [6/6] 生成安装包...
+rem 把微软官方的 VC++ 运行库安装程序一起打进安装包：别人电脑上的太旧时，安装时自动更新（下载失败就不带）
+if not exist "installer\redist\vc_redist.x64.exe" (
+  echo 下载 Microsoft VC++ 运行库安装程序（约 25MB，打进安装包）...
+  powershell -NoProfile -ExecutionPolicy Bypass -File "tools\vcredist.ps1" -Download "installer\redist\vc_redist.x64.exe"
+)
 call :find_iscc
 if not defined ISCC (
   echo 没找到 Inno Setup，尝试用 winget 自动安装...
@@ -133,6 +162,22 @@ if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86
 if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
 if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 exit /b 0
+
+:vcrt_fail
+echo.
+echo [失败] 没能自动更新 Microsoft VC++ 运行库。
+echo 请手动下载安装：https://aka.ms/vs/17/release/vc_redist.x64.exe
+echo 装完以后（提示要重启就先重启电脑）再运行一次本脚本。
+pause
+exit /b 1
+
+:test_fail
+echo.
+echo [失败] 测试没有通过（或者测试进程中途崩溃了）。
+echo 请把这个窗口往上翻，截图里要包含 FAIL / ERROR 或 Windows fatal exception 那几行；
+echo 再把 data\logs\listen_check.txt 一起发给开发者。
+pause
+exit /b 1
 
 :fail
 echo.

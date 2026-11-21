@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, date, timedelta
@@ -49,14 +50,14 @@ CREATE TABLE IF NOT EXISTS videos (
 CREATE INDEX IF NOT EXISTS idx_videos_vid ON videos(video_id);
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL,            -- at / dm / reply
+    kind        TEXT NOT NULL,            -- at 评论里 @ 她 / reply 回复她的评论 / work 评论她的作品 / dm 私信
     ext_id      TEXT UNIQUE,              -- 去重用
     user_name   TEXT,
     content     TEXT,
     video_title TEXT,
     video_url   TEXT,
     reply       TEXT,
-    status      TEXT NOT NULL,            -- replied / pending / skipped_sensitive / skipped_limit / skipped_link / skipped_gone / skipped_old / uncertain / failed / manual / blocked
+    status      TEXT NOT NULL,            -- replied / pending / merged 和同一个人的另一条一起回了 / skipped_sensitive / skipped_limit / skipped_link / skipped_gone / skipped_old / uncertain / failed / manual / blocked
     reason      TEXT,
     cost        REAL NOT NULL DEFAULT 0,
     tokens      INTEGER NOT NULL DEFAULT 0,
@@ -151,6 +152,17 @@ CREATE TABLE IF NOT EXISTS memories (     -- 她记得的一件件具体的事
 CREATE INDEX IF NOT EXISTS idx_mem_person ON memories(person);
 CREATE INDEX IF NOT EXISTS idx_mem_scope ON memories(scope);
 CREATE INDEX IF NOT EXISTS idx_mem_day ON memories(day);
+CREATE TABLE IF NOT EXISTS memory_archive ( -- 淡忘了的记忆：不再主动想起，压缩后留着；被人提起时还能想起来
+    id          INTEGER PRIMARY KEY,           -- 和原来在 memories 里的 id 一样
+    kind        TEXT NOT NULL DEFAULT '',
+    person      TEXT NOT NULL DEFAULT '',
+    day         TEXT NOT NULL DEFAULT '',
+    codec       TEXT NOT NULL,
+    dict_id     INTEGER NOT NULL DEFAULT 0,
+    data        BLOB NOT NULL,                 -- 压缩过的整条记忆（JSON）
+    archived_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_marc_person ON memory_archive(person);
 CREATE TABLE IF NOT EXISTS people (       -- 私信好友的人物印象卡（评论区的人不建卡）
     name       TEXT PRIMARY KEY,
     card       TEXT NOT NULL DEFAULT '',  -- 一段话的印象
@@ -178,6 +190,7 @@ CREATE TABLE IF NOT EXISTS owners (       -- 主人：她会主动找 TA 聊天�
     enabled    INTEGER NOT NULL DEFAULT 1,
     chat       INTEGER NOT NULL DEFAULT 1, -- 主动找 TA 聊天
     share      INTEGER NOT NULL DEFAULT 1, -- 主动分享视频
+    at         INTEGER NOT NULL DEFAULT 1, -- 刷到 TA 会喜欢的视频时，评论里 @ TA 来看
     closeness  REAL NOT NULL DEFAULT 0,   -- 亲密度 0～100，聊得越多越高
     last_proactive TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
@@ -222,9 +235,110 @@ CREATE TABLE IF NOT EXISTS drafts (
     card_bg      TEXT NOT NULL DEFAULT '',      -- 文字卡片背景：空 = 用默认设置；none = 内置粉色样式；其他 = 背景图文件名
     card_panel   INTEGER NOT NULL DEFAULT 1     -- 1 文字写在半透明白卡片上；0 直接写在背景图上
 );
+CREATE TABLE IF NOT EXISTS content_marks ( -- 她互动过的内容：同样的内容只互动一次，同一类视频每天只互动一次
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id   TEXT NOT NULL DEFAULT '',
+    text_hash  TEXT NOT NULL DEFAULT '',  -- 文案的 SimHash（十六进制）；文案太短为空
+    img_hash   TEXT NOT NULL DEFAULT '',  -- 第一眼画面的 dHash；画面太单调为空
+    txt        TEXT NOT NULL DEFAULT '',  -- 清理后的文案（比较短文案用）
+    topic      TEXT NOT NULL DEFAULT '',  -- 这个视频属于哪一类（她看的时候自己判断的）
+    title      TEXT NOT NULL DEFAULT '',
+    liked      INTEGER NOT NULL DEFAULT 0,
+    commented  INTEGER NOT NULL DEFAULT 0,
+    collected  INTEGER NOT NULL DEFAULT 0,
+    shared     INTEGER NOT NULL DEFAULT 0, -- 分享给主人 / 在评论里 @ 人来看
+    day        TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_marks_day ON content_marks(day, topic);
+CREATE TABLE IF NOT EXISTS owner_taste (  -- 她了解到的主人口味：每一类视频主人喜不喜欢（Beta 分布）
+    owner      TEXT NOT NULL,
+    topic      TEXT NOT NULL,
+    alpha      REAL NOT NULL DEFAULT 1,   -- 主人喜欢的证据（含先验）
+    beta       REAL NOT NULL DEFAULT 2,   -- 主人不喜欢 / 没兴趣的证据（含先验）
+    said       TEXT NOT NULL DEFAULT '',  -- 主人自己说过：喜欢 / 不喜欢
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(owner, topic)
+);
+CREATE TABLE IF NOT EXISTS owner_shares ( -- 她分享给主人 / @ 主人来看的视频，和主人的反应
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner       TEXT NOT NULL,
+    way         TEXT NOT NULL,             -- dm 私信里分享 / at 评论里 @
+    video_id    TEXT NOT NULL DEFAULT '',
+    video_url   TEXT NOT NULL DEFAULT '',
+    topic       TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    said        TEXT NOT NULL DEFAULT '',  -- 她分享时说的话
+    status      TEXT NOT NULL DEFAULT 'sent', -- sent 等反应 / liked / neutral / disliked / ignored
+    feedback    TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    resolved_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS knowledge (    -- 她自己学到的东西（刷到的视频、评论区、私信里）
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic      TEXT NOT NULL DEFAULT '',
+    fact       TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT '',  -- video / comment / dm
+    ref        TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.6,
+    uses       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    used_at    TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'stable', -- candidate 刚学到、还要再验证 / stable 确认过的
+    hits       INTEGER NOT NULL DEFAULT 1,      -- 又在别处见到同样的说法几次
+    days       TEXT NOT NULL DEFAULT ''         -- 在哪几天见到过（逗号分开，最多留 5 天）
+);
+CREATE TABLE IF NOT EXISTS learn_notes (  -- 还没整理的学习素材
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    source     TEXT NOT NULL,
+    ref        TEXT NOT NULL DEFAULT '',
+    text       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    done       INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tool_jobs (    -- “其他功能”的任务：下载视频、导出文案
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,             -- video 下载视频 / text 导出文案
+    url         TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT '',
+    files       TEXT NOT NULL DEFAULT '[]',
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    finished_at TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS blocked_users (
     user_name  TEXT PRIMARY KEY,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS person_ids (   -- 名字 → 主页 id：私信列表、评论区、通知里同一个人的名字写法可能不一样，靠主页 id 认成一个人
+    name       TEXT PRIMARY KEY,
+    uid        TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_person_ids_uid ON person_ids(uid);
+CREATE TABLE IF NOT EXISTS my_taste (     -- 她自己的口味：每一类视频她现在有多喜欢（跟着她每天的经历自己变，不用设置）
+    topic      TEXT PRIMARY KEY,
+    score      REAL NOT NULL DEFAULT 0,   -- 越大越喜欢；每天自然回落一点（会淡、会腻）
+    seen       INTEGER NOT NULL DEFAULT 0, -- 刷到过几个
+    loved      INTEGER NOT NULL DEFAULT 0, -- 其中 8 分以上的
+    acted      INTEGER NOT NULL DEFAULT 0, -- 点赞 / 收藏 / 评论过几个
+    talked     INTEGER NOT NULL DEFAULT 0, -- 私信、评论区里聊到过几次
+    first_at   TEXT NOT NULL DEFAULT '',
+    last_at    TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS my_works (     -- 她发出去的作品现在怎么样了（从自己主页读的）
+    aweme_id   TEXT PRIMARY KEY,
+    draft_id   INTEGER NOT NULL DEFAULT 0,  -- 对应哪个草稿（认不出是 0）
+    desc       TEXT NOT NULL DEFAULT '',
+    posted_at  TEXT NOT NULL DEFAULT '',
+    likes      INTEGER NOT NULL DEFAULT 0,
+    comments   INTEGER NOT NULL DEFAULT 0,
+    collects   INTEGER NOT NULL DEFAULT 0,
+    shares     INTEGER NOT NULL DEFAULT 0,
+    plays      INTEGER NOT NULL DEFAULT 0,
+    checked_at TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -266,7 +380,7 @@ def _comment_detail(r: dict) -> dict:
 
 
 def _message_detail(r: dict) -> dict:
-    where = {"at": "在评论区 @ 了她", "reply": "回复了她的评论"}.get(r.get("kind"), "发来的私信")
+    where = {"at": "在评论区 @ 了她", "reply": "回复了她的评论", "work": "评论了她的作品"}.get(r.get("kind"), "发来的私信")
     parts = [{"who": f"{r.get('user_name') or '对方'} {where}", "me": False, "text": r.get("content") or ""}]
     if r.get("reply"):
         parts.append({"who": "她的回复", "me": True, "text": r["reply"]})
@@ -312,9 +426,13 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        # WAL 日志用完截断到 4MB 以内（不然长期运行会一直变大）
+        self.conn.execute("PRAGMA journal_size_limit=4194304")
         self._migrate()
         self.conn.commit()
         self._seed()
+        from .storage import Keeper
+        self.keeper = Keeper(self)       # 旧记录的归档、压缩、回收空间（见 storage.py）
 
     _NEW_COLUMNS = {
         "daily_usage": {"comment_likes": "INTEGER NOT NULL DEFAULT 0", "comment_replies": "INTEGER NOT NULL DEFAULT 0",
@@ -326,6 +444,14 @@ class Database:
                    "form": "TEXT NOT NULL DEFAULT ''"},
         "events": {"ref": "TEXT NOT NULL DEFAULT ''"},
         "friends": {"manual": "INTEGER NOT NULL DEFAULT 0"},
+        # cmd：这位主人可以在私信里给她下命令（让她去私信别人、@、搜视频分享、发作品……）；默认不开，你在“主人”里勾上
+        "owners": {"at": "INTEGER NOT NULL DEFAULT 1", "cmd": "INTEGER NOT NULL DEFAULT 0"},
+        # 好感度（0～100）：TA 说话友善会慢慢升、说难听的话会降、很久不联系会慢慢回落到一般（参考 dsh_soul 的好感度）
+        "people": {"affection": "REAL NOT NULL DEFAULT 30"},
+        # 内容指纹按 16 位一段切成 4 段（SimHash 分段索引）：差 3 位以内的两个指纹至少有一段完全相同
+        "content_marks": {**{f"b{i}": "INTEGER" for i in range(4)}, **{f"i{i}": "INTEGER" for i in range(4)}},
+        "knowledge": {"status": "TEXT NOT NULL DEFAULT 'stable'", "hits": "INTEGER NOT NULL DEFAULT 1",
+                      "days": "TEXT NOT NULL DEFAULT ''"},
         "comment_actions": {"video_title": "TEXT NOT NULL DEFAULT ''", "video_author": "TEXT NOT NULL DEFAULT ''",
                             "video_url": "TEXT NOT NULL DEFAULT ''"},
     }
@@ -342,10 +468,40 @@ class Database:
         if not self.conn.execute("SELECT 1 FROM kv WHERE key='bad_at_cleanup_v1'").fetchone():
             self.conn.execute("DELETE FROM messages WHERE kind='at' AND content LIKE '%暂时没有更多了%'")
             self.conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('bad_at_cleanup_v1', 'true')")
+        for i in range(4):
+            self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_marks_b{i} ON content_marks(b{i})")
+            self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_marks_i{i} ON content_marks(i{i})")
+        if not self.conn.execute("SELECT 1 FROM kv WHERE key='content_marks_v1'").fetchone():
+            self._backfill_content_marks()
+            self.conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('content_marks_v1', 'true')")
+        if self.conn.execute("SELECT 1 FROM content_marks WHERE b0 IS NULL AND (text_hash != '' OR img_hash != '') "
+                             "LIMIT 1").fetchone():
+            from .fingerprint import bands, from_hex
+            rows = self.conn.execute("SELECT id, text_hash, img_hash FROM content_marks WHERE b0 IS NULL").fetchall()
+            self.conn.executemany(
+                "UPDATE content_marks SET b0=?, b1=?, b2=?, b3=?, i0=?, i1=?, i2=?, i3=? WHERE id=?",
+                [(*bands(from_hex(r["text_hash"])), *bands(from_hex(r["img_hash"])), r["id"]) for r in rows])
         done = self.conn.execute("SELECT 1 FROM kv WHERE key='dm_users_reset_v2'").fetchone()
         if not done:
             self.conn.execute("DELETE FROM dm_users")
             self.conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('dm_users_reset_v2', 'true')")
+
+    def _backfill_content_marks(self) -> None:
+        """升级时：以前点过赞、评论过、收藏过的视频也记进“互动过的内容”，同样的内容以后不再重复互动。"""
+        from .fingerprint import fingerprint, to_hex
+
+        rows = self.conn.execute(
+            "SELECT video_id, title, topic, liked, collected, comment, created_at FROM videos "
+            "WHERE liked=1 OR collected=1 OR (comment IS NOT NULL AND comment != '') ORDER BY id DESC LIMIT 3000"
+        ).fetchall()
+        for r in rows:
+            fp = fingerprint(r["title"] or "")
+            self.conn.execute(
+                "INSERT INTO content_marks(video_id, text_hash, txt, topic, title, liked, commented, collected, shared, "
+                "day, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (r["video_id"] or "", to_hex(fp["th"]), fp["txt"], r["topic"] or "", (r["title"] or "")[:60],
+                 int(r["liked"] or 0), int(bool(r["comment"])), int(r["collected"] or 0),
+                 int(str(r["comment"] or "").startswith("@")), (r["created_at"] or "")[:10], r["created_at"] or ""))
 
     # ---------- 基础 ----------
     def execute(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:
@@ -480,6 +636,19 @@ class Database:
             where.append(f"kind IN ({','.join('?' * len(kinds))})")
             args += list(kinds)
         w = ("WHERE " + " AND ".join(where)) if where else ""
+        if day and day in self.keeper.days("events"):
+            # 这一天的记录已经归档压缩了：解压出来，和表里剩下的合在一起分页
+            rows = self.keeper.read("events", day) + self.query(f"SELECT * FROM events {w}", tuple(args))
+            if kinds:
+                rows = [r for r in rows if r.get("kind") in kinds]
+            for r in rows:
+                r.pop("_rid", None)
+            rows.sort(key=lambda r: (r.get("ts") or "", int(r.get("id") or 0)), reverse=True)
+            total = shown = len(rows)
+            pages = max(1, -(-shown // size))
+            page = max(1, min(int(page or 1), pages))
+            return {"items": rows[(page - 1) * size: page * size], "page": page, "pages": pages, "size": size,
+                    "total": total, "shown": shown, "archived": True}
         total = int(self.query(f"SELECT COUNT(*) AS n FROM events {w}", tuple(args))[0]["n"])
         shown = min(total, max_pages * size) if max_pages else total
         pages = max(1, -(-shown // size))
@@ -490,12 +659,17 @@ class Database:
 
     def event_days(self, limit: int = 366) -> list[dict]:
         """有记录的日期和每天的条数（最新的在前）。"""
-        return self.query("SELECT substr(ts,1,10) AS day, COUNT(*) AS n FROM events GROUP BY day "
-                          "ORDER BY day DESC LIMIT ?", (limit,))
+        days = {r["day"]: int(r["n"]) for r in self.query(
+            "SELECT substr(ts,1,10) AS day, COUNT(*) AS n FROM events GROUP BY day")}
+        for d, n in self.keeper.days("events").items():      # 归档了的日子也列出来
+            days[d] = days.get(d, 0) + n
+        return [{"day": d, "n": days[d]} for d in sorted(days, reverse=True)[:limit]]
 
     # ---------- 视频 ----------
     def seen_video(self, video_id: str) -> bool:
-        return bool(video_id) and bool(self.query("SELECT 1 FROM videos WHERE video_id=? LIMIT 1", (video_id,)))
+        return bool(video_id) and bool(self.query("SELECT 1 FROM videos WHERE video_id=? UNION ALL "
+                                                  "SELECT 1 FROM seen_videos WHERE video_id=? LIMIT 1",
+                                                  (video_id, video_id)))
 
     def add_video(self, **kw) -> int:
         kw.setdefault("created_at", now_str())
@@ -508,6 +682,60 @@ class Database:
         """这条通知 / 私信处理过没有。评论区的记录过期删掉以后，回执（gone_messages）还在：不会再回一遍。"""
         return bool(self.query("SELECT 1 FROM messages WHERE ext_id=? UNION ALL "
                                "SELECT 1 FROM gone_messages WHERE ext_id=? LIMIT 1", (ext_id, ext_id)))
+
+    # 以前的版本会把这些消息丢下不回（启动前收到的、额度用完的、只回关注她的人……），或者回到一半被打断了。
+    # 现在只要有人找她，她都会回：再看到这些消息时，重新拿出来回复
+    REVIVE_STATUSES = ("skipped_old", "skipped_limit", "skipped_scope")
+    REVIVE_REASONS = ("处理中", "你让她休息了", "遇到验证", "今天对这个人的回复已到上限", "没能确认对方有没有关注她")
+
+    @classmethod
+    def revivable(cls, status: str, reason: str) -> bool:
+        return status in cls.REVIVE_STATUSES or (
+            status == "pending" and any((reason or "").startswith(r) for r in cls.REVIVE_REASONS))
+
+    def message_handled(self, ext_id: str) -> bool:
+        """这条通知 / 私信已经有了结果（回过了、放进待你处理了、跳过了……），不用再回。
+        以前被丢下、或者回到一半被打断的不算：还要回。"""
+        if self.query("SELECT 1 FROM gone_messages WHERE ext_id=? LIMIT 1", (ext_id,)):
+            return True
+        rows = self.query("SELECT status, reason FROM messages WHERE ext_id=?", (ext_id,))
+        return bool(rows) and not self.revivable(rows[0]["status"], rows[0]["reason"] or "")
+
+    def claim_message(self, **kw) -> int | None:
+        """开始处理一条消息：新的就记下来；以前丢下 / 被打断的就重新拿出来。已经有结果的返回 None。"""
+        ext = kw.get("ext_id")
+        with self._lock:
+            if ext and self.message_handled(ext):
+                return None
+            rows = self.query("SELECT id FROM messages WHERE ext_id=?", (ext,)) if ext else []
+            if rows:
+                mid = int(rows[0]["id"])
+                self.update_message(mid, status="pending", reason="处理中", handled_at=None,
+                                    content=kw.get("content", ""), video_url=kw.get("video_url", "") or "")
+                return mid
+            kw.setdefault("status", "pending")
+            kw.setdefault("reason", "处理中")
+            return self.add_message(**kw) or None
+
+    def settle_dm_leftovers(self, user: str, keep_mid: int) -> int:
+        """回完 user 的私信以后：TA 以前没回到的那几批（被打断的、以前丢下的）这次已经一起看过、一起回了，
+        不再挂在“待你处理”里。"""
+        rows = self.query("SELECT id, status, reason FROM messages WHERE kind='dm' AND user_name=? AND id != ?",
+                          (user, keep_mid))
+        ids = [r["id"] for r in rows if self.revivable(r["status"], r["reason"] or "")]
+        for i in ids:
+            self.update_message(i, status="merged", reason="后来和 TA 的新消息一起看、一起回了", handled_at=now_str())
+        return len(ids)
+
+    def comment_history(self, user: str, video_url: str = "", exclude: int = 0, limit: int = 6) -> list[dict]:
+        """评论区里，这个人以前找过她的几次（同一个视频下的排在前面），每条：对方说的、她回的、在哪个视频。"""
+        rows = self.query(
+            "SELECT id, kind, content, reply, video_title, video_url, created_at FROM messages "
+            "WHERE user_name=? AND kind IN ('at','reply','work') AND id != ? AND status IN ('replied','manual','merged') "
+            "ORDER BY id DESC LIMIT 30", (user, exclude))
+        same = [r for r in rows if video_url and r["video_url"] == video_url]
+        other = [r for r in rows if r not in same]
+        return list(reversed((same + other)[:limit]))
 
     COMMENT_KEEP_DAYS = 5      # 评论区的消息记录：和这个人没有新一轮对话以后，再留几天
     GONE_KEEP_DAYS = 180       # 回执留多久（抖音“互动消息”里的旧通知早就翻不到了）
@@ -522,10 +750,10 @@ class Database:
         with self._lock:
             users = [r["user_name"] for r in self.query(
                 "SELECT user_name, MAX(MAX(created_at), MAX(COALESCE(handled_at, ''))) AS last FROM messages "
-                "WHERE kind IN ('at','reply') GROUP BY user_name HAVING last < ?", (cutoff,))]
+                "WHERE kind IN ('at','reply','work') GROUP BY user_name HAVING last < ?", (cutoff,))]
             n = 0
             for u in users:
-                where = "kind IN ('at','reply') AND " + ("user_name IS NULL" if u is None else "user_name=?")
+                where = "kind IN ('at','reply','work') AND " + ("user_name IS NULL" if u is None else "user_name=?")
                 args = () if u is None else (u,)
                 self.execute(
                     "INSERT OR IGNORE INTO gone_messages(ext_id, kind, reply, gone_at) "
@@ -551,7 +779,7 @@ class Database:
     def messages(self, flt: str = "all", limit: int = 200) -> list[dict]:
         where = {
             "all": "1=1",
-            "at": "kind IN ('at','reply')",
+            "at": "kind IN ('at','reply','work')",
             "dm": "kind='dm'",
             "pending": "status='pending'",
             "skipped": "status LIKE 'skipped%'",
@@ -562,7 +790,7 @@ class Database:
         rows = self.query(
             """SELECT
                  COUNT(*) AS all_count,
-                 SUM(kind IN ('at','reply')) AS at_count,
+                 SUM(kind IN ('at','reply','work')) AS at_count,
                  SUM(kind='dm') AS dm_count,
                  SUM(status='pending') AS pending_count,
                  SUM(status LIKE 'skipped%') AS skipped_count
@@ -577,6 +805,13 @@ class Database:
         )
         return int(rows[0]["n"])
 
+    def thread_replies_today(self, user_name: str) -> int:
+        """今天她在评论区和这个人“接着聊”回了几次（回复她评论的那种；发出去了、或者可能发出去了都算）。"""
+        rows = self.query(
+            "SELECT COUNT(*) AS n FROM messages WHERE kind='reply' AND user_name=? AND status IN ('replied', 'uncertain') "
+            "AND substr(handled_at,1,10)=?", (user_name, today_str()))
+        return int(rows[0]["n"])
+
     # ---------- 私信上下文 ----------
     def add_dm(self, user_name: str, role: str, content: str) -> None:
         self.execute("INSERT INTO dm_history(user_name, role, content, ts) VALUES(?,?,?,?)",
@@ -587,10 +822,135 @@ class Database:
                           (user_name, limit))
         return list(reversed(rows))
 
+    def dm_lines(self, names: list[str], since: str = "", limit: int = 10) -> list[dict]:
+        """这几个名字（同一个人）最近的私信：[{user_name, role, content, ts}]，按时间顺序。"""
+        names = [n for n in names if n]
+        if not names:
+            return []
+        rows = self.query(f"SELECT user_name, role, content, ts FROM dm_history WHERE user_name IN "
+                          f"({','.join('?' * len(names))}) AND ts >= ? ORDER BY id DESC LIMIT ?",
+                          (*names, since or "", limit))
+        return list(reversed(rows))
+
+    def comment_lines(self, names: list[str], since: str = "", limit: int = 6) -> list[dict]:
+        """这几个名字（同一个人）最近在评论区和她的来回（找她的、回复她评论的、评论她作品的，
+        还有她刷视频时回复过 TA 的评论）：[{ts, where, them, me}]，按时间顺序。"""
+        names = [n for n in names if n]
+        if not names:
+            return []
+        marks = ",".join("?" * len(names))
+        out = [{"ts": r["created_at"], "where": r["video_title"] or "", "them": r["content"] or "", "me": r["reply"] or "",
+                "kind": r["kind"]}
+               for r in self.query(
+                   f"SELECT kind, content, reply, video_title, created_at FROM messages WHERE user_name IN ({marks}) "
+                   "AND kind IN ('at','reply','work') AND status IN ('replied','manual','merged','uncertain') "
+                   "AND created_at >= ? ORDER BY id DESC LIMIT ?", (*names, since or "", limit))]
+        out += [{"ts": r["created_at"], "where": r["video_title"] or "", "them": r["text"] or "", "me": r["reply"],
+                 "kind": "my_reply"}
+                for r in self.query(
+                    f"SELECT text, reply, video_title, created_at FROM comment_actions WHERE user_name IN ({marks}) "
+                    "AND reply != '' AND created_at >= ? ORDER BY created_at DESC LIMIT ?", (*names, since or "", limit))]
+        out.sort(key=lambda x: x["ts"])
+        return out[-limit:]
+
+    # ---------- 她发过的作品 ----------
+    def save_my_works(self, works: list[dict]) -> int:
+        """存从自己主页读到的作品数据，顺便认出是哪个草稿发的（文案对得上，或者发布时间差不多）。返回认出了几个。"""
+        from datetime import datetime as _dt
+        sq = lambda t: re.sub(r"\s+|#\S+", "", t or "")  # noqa: E731
+        posted = self.query("SELECT id, title, text, published_at FROM drafts WHERE status='published' AND published_at != '' "
+                            "ORDER BY published_at DESC LIMIT 60")
+        matched = 0
+        for w in works:
+            when = _dt.fromtimestamp(w["create_time"]).strftime("%Y-%m-%d %H:%M:%S") if w.get("create_time") else ""
+            desc = sq(w.get("desc"))
+            did = 0
+            for d in posted:
+                t, x = sq(d["title"])[:8], sq(d["text"])[:10]
+                if (x and x in desc) or (t and len(t) >= 4 and t in desc):
+                    did = d["id"]
+                    break
+            if not did and when:
+                near = [d for d in posted if abs((_dt.strptime(d["published_at"][:19], "%Y-%m-%d %H:%M:%S")
+                                                  - _dt.strptime(when, "%Y-%m-%d %H:%M:%S")).total_seconds()) <= 2 * 3600]
+                did = near[0]["id"] if len(near) == 1 else 0
+            matched += bool(did)
+            self.execute(
+                "INSERT INTO my_works(aweme_id, draft_id, desc, posted_at, likes, comments, collects, shares, plays, checked_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(aweme_id) DO UPDATE SET draft_id=CASE WHEN excluded.draft_id>0 "
+                "THEN excluded.draft_id ELSE my_works.draft_id END, desc=excluded.desc, likes=excluded.likes, "
+                "comments=excluded.comments, collects=excluded.collects, shares=excluded.shares, plays=excluded.plays, "
+                "checked_at=excluded.checked_at",
+                (w["aweme_id"], did, w.get("desc") or "", when, int(w.get("likes") or 0), int(w.get("comments") or 0),
+                 int(w.get("collects") or 0), int(w.get("shares") or 0), int(w.get("plays") or 0), now_str()))
+        return matched
+
+    def recent_posts(self, days: int = 30, limit: int = 6) -> list[dict]:
+        """她最近发出去的作品，新的在前：[{id, title, text, day, likes, comments, collects, shares, said: [{user, text, reply}]}]
+        （点赞这些从自己主页读的，没读到是 None；said 是别人在作品下的评论和她的回复）。"""
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        out = []
+        for d in self.query("SELECT id, title, text, published_at FROM drafts WHERE status='published' AND published_at >= ? "
+                            "ORDER BY published_at DESC LIMIT ?", (since, limit)):
+            w = self.query("SELECT * FROM my_works WHERE draft_id=? ORDER BY checked_at DESC LIMIT 1", (d["id"],))
+            w = w[0] if w else None
+            said = []
+            if w:
+                said = [{"user": r["user_name"] or "", "text": r["content"] or "", "reply": r["reply"] or ""}
+                        for r in self.query("SELECT user_name, content, reply FROM messages WHERE kind='work' AND video_url LIKE ? "
+                                            "ORDER BY id DESC LIMIT 4", (f"%{w['aweme_id']}%",))]
+            out.append({"id": d["id"], "title": d["title"], "text": d["text"], "day": d["published_at"][:10],
+                        "likes": w["likes"] if w else None, "comments": w["comments"] if w else None,
+                        "collects": w["collects"] if w else None, "shares": w["shares"] if w else None, "said": said})
+        return out
+
+    def unposted_drafts(self, days: int = 7, limit: int = 4) -> list[dict]:
+        """最近写了、但没发出去的草稿（你没让发的、发失败的）。"""
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        return self.query("SELECT id, title, text, status, created_at FROM drafts WHERE status IN ('discarded','failed','wish') "
+                          "AND created_at >= ? ORDER BY id DESC LIMIT ?", (since, limit))
+
+    # ---------- 同一个人的几个名字 ----------
+    def link_person(self, name: str, uid: str) -> None:
+        """记下“这个名字是这个主页 id 的人”（私信、评论区里读到主页 id 时）。"""
+        name, uid = (name or "").strip(), (uid or "").strip()
+        if not name or not uid or uid.startswith("name:"):
+            return
+        self.execute("INSERT INTO person_ids(name, uid, updated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                     "uid=excluded.uid, updated_at=excluded.updated_at", (name, uid, now_str()))
+
+    def person_aliases(self, name: str) -> list[str]:
+        """和 name 是同一个人的所有名字（name 自己排第一）：主页 id 一样的（私信列表、评论区、互关好友里的），
+        以及去掉 emoji、标点以后一字不差的（“吃白饭的鲸🐳”和“吃白饭的鲸”）。"""
+        from .names import name_key, uid_of
+        name = (name or "").strip()
+        if not name:
+            return []
+        out = [name]
+        uids = {r["uid"] for r in self.query("SELECT uid FROM person_ids WHERE name=?", (name,)) if r["uid"]}
+        uids |= {r["uid"] for r in self.query("SELECT uid FROM friends WHERE nickname=? AND uid NOT LIKE 'name:%'",
+                                               (name,)) if r["uid"]}
+        for r in self.query("SELECT url FROM dm_users WHERE name=? AND url != ''", (name,)):
+            if uid_of(r["url"]):
+                uids.add(uid_of(r["url"]))
+        for uid in uids:
+            out += [r["name"] for r in self.query("SELECT name FROM person_ids WHERE uid=?", (uid,))]
+            out += [r["nickname"] for r in self.query("SELECT nickname FROM friends WHERE uid=?", (uid,))]
+            out += [r["name"] for r in self.query("SELECT name FROM dm_users WHERE url LIKE ?", (f"%/user/{uid}%",))]
+        key = name_key(name)
+        if len(key) >= 2:
+            pool = {r["n"] for r in self.query("SELECT DISTINCT user_name AS n FROM dm_history")}
+            pool |= {r["n"] for r in self.query("SELECT name AS n FROM people")}
+            pool |= {r["n"] for r in self.query("SELECT DISTINCT user_name AS n FROM messages WHERE user_name != '' "
+                                                 "ORDER BY id DESC LIMIT 2000")}
+            out += [n for n in pool if n and name_key(n) == key]
+        return list(dict.fromkeys(n for n in out if n))
+
     # ---------- 不回复名单 ----------
     # ---------- 别人的评论 ----------
     def comment_done(self, cid: str) -> bool:
-        return bool(cid) and bool(self.query("SELECT 1 FROM comment_actions WHERE cid=?", (cid,)))
+        return bool(cid) and bool(self.query("SELECT 1 FROM comment_actions WHERE cid=? UNION ALL "
+                                             "SELECT 1 FROM seen_comments WHERE cid=? LIMIT 1", (cid, cid)))
 
     def add_comment_action(self, cid: str, video_id: str, user_name: str, text: str,
                            liked: bool = False, reply: str = "", video: dict | None = None) -> None:
@@ -608,9 +968,15 @@ class Database:
         kind, _, key = (ref or "").partition(":")
         if kind == "video":
             rows = self.query("SELECT * FROM videos WHERE id=?", (key,))
+            if not rows and key.isdigit():
+                old = self.keeper.find("videos", int(key))       # 归档了的旧视频
+                rows = [old] if old else []
             return _video_detail(rows[0]) if rows else None
         if kind == "cmt":
             rows = self.query("SELECT * FROM comment_actions WHERE cid=?", (key,))
+            if not rows:
+                old = self.keeper.find_by("comment_actions", "cid", key)
+                rows = [old] if old else []
             return _comment_detail(rows[0]) if rows else None
         if kind == "msg":
             rows = self.query("SELECT * FROM messages WHERE id=?", (key,))
@@ -618,8 +984,13 @@ class Database:
         return None
 
     def activity(self, kind: str, day: str | None = None, limit: int = 100) -> list[dict]:
-        """某一天某类互动的详情列表（仪表盘点用量格子时显示）。"""
+        """某一天某类互动的详情列表（仪表盘点用量格子时显示）。那一天的记录归档了的，解压出来看。"""
         like = (day or today_str()) + "%"
+        if day and kind in self._ARCHIVED_ACTIVITY:
+            tbl, keep, fmt = self._ARCHIVED_ACTIVITY[kind]
+            old = [r for r in self.keeper.read(tbl, day) if keep(r)]
+            if old:
+                return [fmt(r) for r in sorted(old, key=lambda r: r.get("_rid") or 0, reverse=True)[:limit]]
         if kind == "comments":
             rows = self.query("SELECT * FROM videos WHERE comment != '' AND comment IS NOT NULL AND created_at LIKE ? "
                               "ORDER BY id DESC LIMIT ?", (like, limit))
@@ -633,10 +1004,10 @@ class Database:
                               "ORDER BY rowid DESC LIMIT ?", (like, limit))
             return [_comment_detail(r) for r in rows]
         if kind in ("replies_at", "replies_dm", "thread_replies"):
-            mk = {"replies_at": "at", "replies_dm": "dm", "thread_replies": "reply"}[kind]
-            rows = self.query("SELECT * FROM messages WHERE kind=? AND status IN ('replied','manual') "
-                              "AND COALESCE(handled_at, created_at) LIKE ? ORDER BY id DESC LIMIT ?",
-                              (mk, like, limit))
+            mk = {"replies_at": ("at", "work"), "replies_dm": ("dm",), "thread_replies": ("reply",)}[kind]
+            rows = self.query("SELECT * FROM messages WHERE kind IN (%s) AND status IN ('replied','manual') "
+                              "AND COALESCE(handled_at, created_at) LIKE ? ORDER BY id DESC LIMIT ?"
+                              % ",".join("?" * len(mk)), (*mk, like, limit))
             return [_message_detail(r) for r in rows]
         if kind == "at_friends":
             rows = self.query("SELECT * FROM videos WHERE comment LIKE '@%' AND created_at LIKE ? "
@@ -655,6 +1026,15 @@ class Database:
                               (like, limit))
             return [_video_detail(r) for r in rows]
         return []
+
+    _ARCHIVED_ACTIVITY = {
+        "comments": ("videos", lambda r: bool(r.get("comment")), _video_detail),
+        "likes": ("videos", lambda r: bool(r.get("liked")), _video_detail),
+        "collects": ("videos", lambda r: bool(r.get("collected")), _video_detail),
+        "at_friends": ("videos", lambda r: str(r.get("comment") or "").startswith("@"), _video_detail),
+        "comment_replies": ("comment_actions", lambda r: bool(r.get("reply")), _comment_detail),
+        "comment_likes": ("comment_actions", lambda r: bool(r.get("liked")), _comment_detail),
+    }
 
     # ---------- 私信对象的资料 ----------
     def dm_user(self, name: str) -> dict | None:
@@ -717,8 +1097,9 @@ class Database:
         """这个视频她以前评论过没有（不管过了多久）。评论过就不再发新评论，但别人回复她的还可以接着聊。"""
         if not video_id:
             return False
-        return bool(self.query("SELECT 1 FROM videos WHERE video_id=? AND comment IS NOT NULL AND comment != '' LIMIT 1",
-                               (video_id,)))
+        return bool(self.query("SELECT 1 FROM videos WHERE video_id=? AND comment IS NOT NULL AND comment != '' "
+                               "UNION ALL SELECT 1 FROM seen_videos WHERE video_id=? AND commented=1 LIMIT 1",
+                               (video_id, video_id)))
 
     # ---------- 主人 ----------
     def owners(self, enabled_only: bool = False) -> list[dict]:
@@ -746,16 +1127,29 @@ class Database:
             names.append(name)
             old = keep.get(name) or {}
             self.execute(
-                "INSERT INTO owners(name, call, relation, enabled, chat, share, closeness, last_proactive, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET call=excluded.call, "
-                "relation=excluded.relation, enabled=excluded.enabled, chat=excluded.chat, share=excluded.share",
+                "INSERT INTO owners(name, call, relation, enabled, chat, share, at, cmd, closeness, last_proactive, "
+                "created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET call=excluded.call, "
+                "relation=excluded.relation, enabled=excluded.enabled, chat=excluded.chat, share=excluded.share, "
+                "at=excluded.at, cmd=excluded.cmd",
                 (name, str(it.get("call") or "")[:20], str(it.get("relation") or "")[:200],
                  int(bool(it.get("enabled", True))), int(bool(it.get("chat", True))), int(bool(it.get("share", True))),
+                 int(bool(it.get("at", True))), int(bool(it.get("cmd", old.get("cmd") or False))),
                  float(old.get("closeness") or 0), old.get("last_proactive") or "", old.get("created_at") or now_str()))
         for name in keep:
             if name not in names:
                 self.execute("DELETE FROM owners WHERE name=?", (name,))
         return refused
+
+    def owner_uid(self, name: str) -> str:
+        """主人在互关好友名单里的主页 id（sec_uid）：用来认准私信里的是不是主人本人（昵称可以重名，主页 id 不会）。
+        名单里没有、只有名字没有 id、或者有两个同名的互关好友，都返回空。"""
+        rows = self.query("SELECT uid FROM friends WHERE nickname=? AND mutual=1 AND uid NOT LIKE 'name:%'",
+                          ((name or "").strip(),))
+        return rows[0]["uid"] if len(rows) == 1 else ""
+
+    def friend_uid(self, name: str) -> str:
+        """互关好友的主页 id（同名的有两个以上时分不清，返回空）。"""
+        return self.owner_uid(name)
 
     def owner_unanswered(self, name: str) -> tuple[int, str]:
         """她最近连着给这位主人发了几句、对方还没回，以及最后一句是什么时候发的
@@ -789,7 +1183,7 @@ class Database:
         rows = self.query(
             "SELECT comment AS t FROM videos WHERE comment != '' AND comment IS NOT NULL "
             "UNION ALL SELECT reply AS t FROM comment_actions WHERE reply != '' "
-            "UNION ALL SELECT reply AS t FROM messages WHERE kind IN ('at','reply') AND status IN ('replied','manual') "
+            "UNION ALL SELECT reply AS t FROM messages WHERE kind IN ('at','reply','work') AND status IN ('replied','manual') "
             "AND reply IS NOT NULL AND reply != '' "
             "UNION ALL SELECT reply AS t FROM gone_messages WHERE reply != '' LIMIT ?", (limit,))
         return [r["t"] for r in rows if r["t"]]

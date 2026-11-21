@@ -1172,23 +1172,38 @@ class ReactDataTests(unittest.TestCase):
 
 
 class DmInterruptTests(unittest.TestCase):
-    def test_new_dm_cuts_video_short_in_instant_mode(self):
+    def test_new_dm_cuts_video_short(self):
+        """看视频途中来了新私信：这个视频不再多看，马上去回（不再有“每 5 分钟回一次”的模式）。"""
         from app.agent.runner import Agent
 
         agent = Agent(make_db())
         agent._want_run = True
-        agent._cur_rules = agent.db.rules()  # 默认：自动回私信 + 秒回
+        agent._cur_rules = agent.db.rules()
         agent.browser = mock.Mock()
         agent.browser.dm_signal.side_effect = [False, True]
+        agent.browser.notice_signal.return_value = False
         with mock.patch.object(agent, "_sleep", return_value=True):
             self.assertFalse(agent._watch_sleep(30))  # 第二秒来了新私信，提前结束
         self.assertTrue(agent._dm_flag)
-        agent._cur_rules = dict(agent._cur_rules, dm_reply_mode="5min")
-        agent._dm_flag = False
-        agent.browser.dm_signal.side_effect = None
-        agent.browser.dm_signal.return_value = True
+
+    def test_new_notice_is_noted_without_cutting_the_video(self):
+        """“通知”上来了新红点（有人 @ 她、回复她的评论）：记一笔，看完这个视频就去看。"""
+        from app.agent.runner import Agent
+
+        agent = Agent(make_db())
+        agent._want_run = True
+        agent.browser = mock.Mock()
+        agent.browser.dm_signal.return_value = False
+        agent.browser.notice_signal.side_effect = [True, False, False]
         with mock.patch.object(agent, "_sleep", return_value=True):
-            self.assertTrue(agent._watch_sleep(2))  # 每 5 分钟回一次的模式不打断看视频
+            self.assertTrue(agent._watch_sleep(2))
+        self.assertTrue(agent._notice_flag)
+        agent._next_at = agent._next_dm = time.time() + 600
+        b = mock.Mock()
+        b.notice_signal.return_value = False
+        b.dm_signal.return_value = False
+        self.assertEqual(agent._inbox_due(b, agent.db.rules()), (True, False))
+        self.assertFalse(agent._notice_flag)
 
 
 class MentionTests(unittest.TestCase):
@@ -1409,45 +1424,36 @@ class InboxScheduleTests(unittest.TestCase):
         agent.db.set_json("rules", r)
         return agent
 
-    def test_instant_mode_checks_badge_between_full_checks(self):
-        agent = self.make_agent(dm_reply_mode="instant")
+    def test_red_dots_trigger_a_check_between_full_checks(self):
+        agent = self.make_agent()
         agent._next_at = agent._next_dm = time.time() + 600
         b = mock.Mock()
         b.dm_signal.return_value = False
-        with mock.patch("app.agent.runner.Inbox") as InboxCls:
-            InboxCls.return_value.dm_badge.return_value = True
-            self.assertEqual(agent._inbox_due(b, agent.db.rules()), (False, True))
-            InboxCls.return_value.dm_badge.return_value = False
-            self.assertEqual(agent._inbox_due(b, agent.db.rules()), (False, False))
-            b.dm_signal.return_value = True  # 页面里的脚本发现未读数变多了
-            self.assertEqual(agent._inbox_due(b, agent.db.rules()), (False, True))
+        b.notice_signal.return_value = False
+        self.assertEqual(agent._inbox_due(b, agent.db.rules()), (False, False))
+        b.dm_signal.return_value = True  # 页面里的脚本发现“消息”的未读数变多了
+        self.assertEqual(agent._inbox_due(b, agent.db.rules()), (False, True))
+        b.dm_signal.return_value = False
+        b.notice_signal.return_value = True  # “通知”的未读数变多了
+        self.assertEqual(agent._inbox_due(b, agent.db.rules()), (True, False))
 
-    def test_five_minute_mode_ignores_badge(self):
-        from app.agent.runner import dm_gap_seconds
+    def test_old_settings_do_not_stop_replying(self):
+        """以前的“关掉自动回复”“每天最多回复几条”“每 5 分钟回一次”都不再起作用：有人找她就回。"""
+        from app.agent.runner import DM_GAP, dm_gap_seconds
 
-        agent = self.make_agent(dm_reply_mode="5min")
-        agent._next_at = agent._next_dm = time.time() + 600
-        with mock.patch("app.agent.runner.Inbox") as InboxCls:
-            InboxCls.return_value.dm_badge.return_value = True
-            self.assertEqual(agent._inbox_due(mock.Mock(), agent.db.rules()), (False, False))
-        self.assertEqual(dm_gap_seconds(agent.db.rules()), 300)
-        self.assertEqual(dm_gap_seconds({"dm_reply_mode": "instant"}), 60)
-
-    def test_daily_cap_stops_checking(self):
-        agent = self.make_agent()
+        agent = self.make_agent(auto_reply_at=False, auto_reply_dm=False, dm_reply_mode="5min")
         r = agent.db.rules()
-        r["limits"]["replies_at"] = 0
-        r["limits"]["replies_dm"] = 0
+        r["limits"].update(replies_at=0, replies_dm=0, thread_replies=0)
         agent.db.set_json("rules", r)
         agent._next_at = agent._next_dm = 0
-        with mock.patch("app.agent.runner.Inbox") as InboxCls:
-            InboxCls.return_value.dm_badge.return_value = True
-            # @ 的额度用完了，但“接着聊评论”还有额度：照样去看有没有人回复她
-            self.assertEqual(agent._inbox_due(mock.Mock(), agent.db.rules()), (True, False))
-            self.assertEqual(agent._notice_kinds(agent.db.rules()), ("reply",))
-            r["limits"]["thread_replies"] = 0
-            agent.db.set_json("rules", r)
-            self.assertEqual(agent._inbox_due(mock.Mock(), agent.db.rules()), (False, False))
+        b = mock.Mock()
+        b.dm_signal.return_value = False
+        b.notice_signal.return_value = False
+        self.assertEqual(agent._inbox_due(b, agent.db.rules()), (True, True))
+        for k in ("replies_at", "replies_dm", "thread_replies"):
+            self.assertTrue(agent.budget.can(k))
+        self.assertEqual(dm_gap_seconds(agent.db.rules()), DM_GAP)
+        self.assertNotIn("replies_at", agent.db.rules()["limits"] if "replies_at" not in r["limits"] else {})
 
 
 class CuteStyleTests(unittest.TestCase):
@@ -1560,10 +1566,11 @@ class DmScopeTests(unittest.TestCase):
         agent._handle_incoming(inbox, mid, {"user": "雨.", "text": "你好"}, "dm", agent.db.rules())
         return agent.db.query("SELECT status FROM messages WHERE id=?", (mid,))[0]["status"]
 
-    def test_only_followers_get_replies(self):
+    def test_everyone_gets_replies(self):
+        """“只回复关注她的人”这个设置去掉了：不管对方有没有关注她，私信都回（旧设置留在数据库里也不起作用）。"""
         self.assertEqual(self.run_dm(True), "replied")
-        self.assertEqual(self.run_dm(False), "skipped_scope")
-        self.assertEqual(self.run_dm(None), "pending")  # 确认不了就放进“待你处理”
+        self.assertEqual(self.run_dm(False), "replied")
+        self.assertEqual(self.run_dm(None), "replied")
 
     def test_messages_api_includes_profile(self):
         from app.api import Api
@@ -1741,11 +1748,19 @@ class RunnerIncomingTests(unittest.TestCase):
         mid = self.add("hi", user="坏人")
         self.agent._handle_incoming(self.inbox, mid, {"user": "坏人", "text": "hi"}, "dm", self.db.rules())
         self.assertEqual(self.status(mid)["status"], "blocked")
+        self.agent.brain.reply_dm.return_value = Draft(text="来啦", ok=True, reason="", cost=0.0, tokens=1)
         rules = self.db.rules()
-        rules["per_user_daily"] = 0
+        rules["per_user_daily"] = 0                       # 旧设置：不再起作用
         mid2 = self.add("再来", user="小鹿")
         self.agent._handle_incoming(self.inbox, mid2, {"user": "小鹿", "text": "再来"}, "dm", rules)
-        self.assertEqual(self.status(mid2)["status"], "pending")
+        self.assertNotEqual(self.status(mid2)["status"], "pending")
+        # 只有碰上没完没了的（像机器人一样一天来回几十次），安全阀才让她先停下
+        from app.agent import runner
+        with mock.patch.object(runner, "PER_USER_DAY_GUARD", 0):
+            mid3 = self.add("又来", user="小鹿")
+            self.agent._handle_incoming(self.inbox, mid3, {"user": "小鹿", "text": "又来"}, "dm", rules)
+        self.assertEqual(self.status(mid3)["status"], "pending")
+        self.assertEqual(self.status(mid3)["reason"], runner.GUARD_REASON)
 
 
 if __name__ == "__main__":

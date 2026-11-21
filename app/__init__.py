@@ -2,4 +2,4 @@
 
 APP_NAME = "AI也要刷抖音"
 APP_NAME_EN = "aiWannaTikTok"  # 英文名：程序文件名、安装包文件名
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.4.0"

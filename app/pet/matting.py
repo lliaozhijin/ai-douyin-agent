@@ -32,11 +32,13 @@ class MattingError(Exception):
 
 
 def onnx_available() -> bool:
+    """装没装抠图组件：只看找不找得到，不真的导入（电脑上的 VC++ 运行库太旧时，一导入整个软件就闪退）。"""
+    import importlib.util
+    import sys
     try:
-        import onnxruntime  # noqa: F401
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+        return importlib.util.find_spec("onnxruntime") is not None
+    except (ValueError, ImportError):
+        return sys.modules.get("onnxruntime") is not None
 
 
 def model_ready() -> bool:
@@ -91,12 +93,17 @@ def prepare(img: Image.Image, max_side: int = 1600) -> Image.Image:
 def cutout(img: Image.Image, use_model: bool = True) -> tuple[Image.Image, str]:
     """返回 (抠好的 RGBA 图，裁到人物边缘并留一点边；用的方法)。"""
     img = prepare(img)
+    broken = ""
+    if not has_alpha(img) and use_model and onnx_available() and model_ready():
+        broken = _onnx_broken()
     if has_alpha(img):
         out, how = img.convert("RGBA"), "原图就是透明背景"
-    elif use_model and onnx_available() and model_ready():
+    elif use_model and onnx_available() and model_ready() and not broken:
         out, how = _model_cut(img.convert("RGB")), "本机抠图模型"
     else:
         out, how = _flood_cut(img.convert("RGB")), "去掉纯色背景"
+        if broken:
+            how += f"（抠图模型用不了：{broken}）"
     a = out.getchannel("A")
     bbox = a.point(lambda v: 255 if v > 40 else 0).getbbox()
     if not bbox:
@@ -107,6 +114,12 @@ def cutout(img: Image.Image, use_model: bool = True) -> tuple[Image.Image, str]:
     m = 12
     box = (max(0, bbox[0] - m), max(0, bbox[1] - m), min(out.width, bbox[2] + m), min(out.height, bbox[3] + m))
     return out.crop(box), how
+
+
+def _onnx_broken() -> str:
+    """先在小进程里导入一下 onnxruntime（见 native_probe.py）：崩了就不在软件里导入，返回原因。"""
+    from ..native_probe import import_ok
+    return import_ok("onnxruntime")
 
 
 def _model_cut(img: Image.Image) -> Image.Image:

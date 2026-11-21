@@ -157,7 +157,8 @@ def system_prompt(persona: dict, mood: str = "", owner: dict | None = None, memo
     if douyin_emoji and (persona.get("emote") or "auto") != "none":
         lines.append(emoji_line())
     if persona.get("interests"):
-        lines.append("感兴趣的内容：" + "、".join(persona["interests"]) + "。")
+        lines.append("你一开始就感兴趣的内容：" + "、".join(persona["interests"])
+                     + "（之后爱看什么会跟着你每天刷到的、聊到的慢慢变）。")
     if persona.get("catchphrases"):
         freq = CATCH_FREQ.get(persona.get("catch_freq") or "sometimes", CATCH_FREQ["sometimes"])
         lines.append(f"{freq}：{persona['catchphrases']}。")

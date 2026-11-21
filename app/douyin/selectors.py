@@ -13,7 +13,7 @@ from ..paths import SELECTORS_FILE
 
 log = logging.getLogger(__name__)
 
-SELECTORS_VERSION = 23  # 改了默认定位就加 1，旧的 selectors.json 会自动备份并更新
+SELECTORS_VERSION = 25  # 改了默认定位就加 1，旧的 selectors.json 会自动备份并更新
 
 DEFAULT_SELECTORS: dict = {
     "_说明": "抖音网页改版后，如果某个动作失效，修改这里对应的定位即可。修改后重启软件生效。",
@@ -47,6 +47,9 @@ DEFAULT_SELECTORS: dict = {
     "detail_author": ["[data-e2e='user-info'] a[href*='/user/']"],
     # 用户主页（www.douyin.com/user/<id>）：名字、抖音号、头像、关注按钮（“回关”“互相关注”说明对方关注了她）
     "profile_info": ["[data-e2e='user-info']"],
+    # 别人主页上的“私信”按钮（主人让她私信一个私信列表里还没有的互关好友时用）
+    "profile_dm_button": ["[data-e2e='user-info'] button:has-text('私信')", "button:has-text('私信'):visible",
+                          "[data-e2e='user-info'] :text-is('私信')"],
     "profile_name": ["[data-e2e='user-info'] h1"],
     "profile_avatar": ["[data-e2e='live-avatar'] img", "[data-e2e='user-detail'] img"],
     "profile_follow_btn": ["[data-e2e='user-info-follow-btn']"],
@@ -102,6 +105,8 @@ DEFAULT_SELECTORS: dict = {
     "notice_content": ["pre"],
     "notice_at_keywords": ["@了你", "提到了你", "在评论中@了你"],
     "notice_reply_keywords": ["回复了你的评论", "回复了你"],
+    # 别人评论了她发的作品
+    "notice_work_keywords": ["评论了你的作品", "评论了你的视频", "评论了你的图文", "评论了你的日常"],
     # 评论下面折叠的回复（“展开 3 条回复”）
     # 2026-11 实测：“展开 N 条回复”是评论里的一个按钮（class 带 comment-reply-expand-btn）；
     # Playwright 的 :text-matches 在这里匹配不到，改用 has-text
@@ -132,9 +137,14 @@ DEFAULT_SELECTORS: dict = {
                            "text=内容由AI生成"],
     "creator_declare_ok": ["button:has-text('确定')", "button:has-text('确认')", "button:has-text('完成')"],
     "creator_advanced": ["text=高级设置", "text=更多设置"],
-    "creator_uploading": ["text=上传中", "text=正在上传", "text=处理中"],
+    # 下面三组是“页面上出现了这几个字”（不是选择器，不要写 text=）
+    "creator_uploading": ["上传中", "正在上传", "取消上传", "上传进度"],
+    "creator_upload_done": ["重新上传", "更换视频", "替换视频"],
+    "creator_upload_failed": ["上传失败", "上传出错", "网络异常，请重试"],
     "creator_publish": ["button:text-is('发布')", "button:has-text('发布'):not(:has-text('定时'))"],
-    "creator_done_words": ["发布成功", "作品管理", "content/manage"],
+    # 发布成功：跳到作品管理页（看网址），或者页面上出现“发布成功”。
+    # 以前这里还有“作品管理”四个字——创作者中心的菜单、提示里也会出现，点了发布就算成功，其实没发出去
+    "creator_done_words": ["发布成功"],
     "creator_login_words": ["扫码登录", "验证码登录", "密码登录"],
 
     # 私信（2026-11 实测：右侧面板，左边会话列表，点开某个会话后聊天窗口盖住列表）
@@ -158,6 +168,13 @@ DEFAULT_SELECTORS: dict = {
                         ".semi-portal a[href*='/user/']"],
     # 视频分享卡片（2026-11 实测：封面 + 作者头像 + 作者名 + 播放图标，网页上没有链接）
     "dm_share_card": ["[class*='MessageItemShareAweme']"],
+    # 视频右侧的“分享”按钮（鼠标移上去 / 点一下会弹出“分享给朋友”的面板）
+    "share_button": ["[data-e2e='feed-active-video'] [data-e2e='video-player-share']", "[data-e2e='video-player-share']"],
+    "share_search": ["input[placeholder*='搜索']:not([data-e2e='searchbar-input']):not([placeholder*='感兴趣']):visible"],
+    "share_send_texts": ["分享", "发送", "分享给TA", "分享给 TA", "确定", "确认分享"],
+    "comment_none_text": "暂无评论",
+    # 聊天里抖音自己发的提示（看起来像对方发的一条消息）：不当成对方说的话
+    "dm_system_texts": ["我们已互相关注，可以开始聊天了", "你们已互相关注对方", "打个招呼吧"],
     "dm_text_bubble": ["[class*='MessageItemText']"],
     "dm_share_link": ["a[href*='/video/']", "a[href*='modal_id=']", "a[href*='/note/']"],
     "dm_unsupported_text": "暂不支持该消息类型",

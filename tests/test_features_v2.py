@@ -198,14 +198,20 @@ class BrainV2Tests(unittest.TestCase):
 
     def test_draft_post_parses(self):
         brain = Brain(make_db())
-        brain.router = fake_router(json.dumps({
-            "want": True, "why": "今天好开心想分享", "title": "今天的小确幸", "text": "刷到好多小猫！",
-            "tags": ["#萌宠", "日常"], "cards": [{"title": "猫猫", "lines": ["圆滚滚", "好可爱"]}],
-            "image_prompt": "一只橘猫"}, ensure_ascii=False))
-        d = brain.draft_post(["猫猫视频"], "开心")
+        brain.router = mock.Mock()
+        brain.router.call.side_effect = [
+            mock.Mock(text=json.dumps({"want": True, "why": "今天好开心想分享",
+                                       "ideas": [{"idea": "刷到好多小猫", "p": 0.5}]}, ensure_ascii=False), cost=0.001),
+            mock.Mock(text=json.dumps({"title": "今天的小确幸", "text": "刷到好多小猫！", "tags": ["#萌宠", "日常"],
+                                       "cards": [{"title": "猫猫", "lines": ["圆滚滚", "好可爱"]}], "image_prompt": "一只橘猫"},
+                                      ensure_ascii=False), cost=0.002)]
+        d = brain.draft_post(["猫猫视频"], "开心", form="cards")
         self.assertTrue(d["want"])
+        self.assertEqual(d["idea"], "刷到好多小猫")
         self.assertEqual(d["tags"], ["萌宠", "日常"])
         self.assertEqual(d["cards"][0]["lines"], ["圆滚滚", "好可爱"])
+        self.assertEqual(d["image_prompt"], "")                       # 没法生图时不要配图描述
+        self.assertAlmostEqual(d["cost"], 0.003)
 
 
 class PublishTests(unittest.TestCase):
@@ -271,26 +277,30 @@ class RunnerV2Tests(unittest.TestCase):
         agent.mood.bias.return_value = {"threshold": 0, "dwell": 1.0, "publish": 1.0}
         return agent
 
-    def test_thread_stops_at_cap(self):
+    def test_thread_keeps_going_until_the_safety_valve(self):
+        """有人回复她的评论：不再设“最多回几次”，接着聊；只有来回多得像机器人刷屏时，安全阀才让她停下。"""
+        from app.agent import runner
         agent = self.make_agent()
         db = agent.db
         rules = db.rules()
-        rules["thread_max_replies"] = 2
+        rules["thread_max_replies"] = 1                       # 旧设置：不再起作用
         it = {"kind": "reply", "user": "小明", "text": "哈哈", "video_url": "https://www.douyin.com/video/1",
               "mine": "好可爱", "ext_id": "rp_1"}
         inbox = mock.Mock()
         inbox.open_mention_video.return_value = {"desc": "猫"}
         inbox.reply_mention.return_value = True
+        inbox.thread_context.return_value = []
         from app.agent.brain import Draft
         agent.brain.reply_thread.return_value = Draft(text="是呀", ok=True)
-        for i in range(3):
-            mid = db.add_message(kind="reply", ext_id=f"rp_{i}", user_name="小明", content="哈哈", status="pending")
-            agent._handle_thread(inbox, mid, dict(it, ext_id=f"rp_{i}"), rules)
-        self.assertEqual(inbox.reply_mention.call_count, 2)
-        last = agent.brain.reply_thread.call_args_list[-1]
-        self.assertTrue(last.args[4])  # 第 2 次是最后一次，要收尾
-        statuses = [m["status"] for m in db.messages("all")]
-        self.assertIn("skipped_limit", statuses)
+        with mock.patch.object(runner, "THREAD_USER_DAY_GUARD", 3):       # 和同一个人一天最多互聊几次
+            for i in range(4):
+                mid = db.add_message(kind="reply", ext_id=f"rp_{i}", user_name="小明", content="哈哈", status="pending")
+                agent._handle_thread(inbox, mid, dict(it, ext_id=f"rp_{i}"), rules)
+        self.assertEqual(inbox.reply_mention.call_count, 3)
+        self.assertFalse(agent.brain.reply_thread.call_args_list[-1].args[4])   # 不再被要求“收尾”
+        last = db.query("SELECT status, reason FROM messages WHERE ext_id='rp_3'")[0]
+        self.assertEqual(last["status"], "skipped_limit")                          # 到底线：跳过，不进“待你处理”
+        self.assertIn("一天最多 3 次", last["reason"])
 
     def test_publish_command_runs_after_ui_marks_publishing(self):
         agent = self.make_agent()
@@ -553,7 +563,7 @@ class PublishPageLoadTests(unittest.TestCase):
         b.page.reload.side_effect = lambda **k: state.update(reloaded=True)
         b.page.get_by_text.return_value.first.is_visible.return_value = True
         with mock.patch("app.douyin.browser.cancel.sleep"):
-            got = b.wait_any("creator_file_input", timeout=0.6, state="attached")
+            got = b.wait_any("creator_file_input", timeout=3, state="attached")   # 找到就返回；时间给宽一点，机器忙时不误报
         self.assertTrue(b.page.reload.called)
         self.assertIs(got, loc)
 
@@ -976,20 +986,23 @@ class NoticeThreadTests(unittest.TestCase):
         self.assertEqual(b.notice_comment("顶层评论")["reply_id"], "0")
 
 
-class InboxEpochTests(unittest.TestCase):
-    """只回这次启动、活跃时段开始之后收到的 @ 和私信；之前的全部跳过，不提醒。"""
+class InboxDrainTests(unittest.TestCase):
+    """点“开始刷视频”、每天活跃时段开始时：先把攒下的评论和私信全部回完，再去刷视频；之前收到的也回，不丢下。"""
 
     def _agent(self):
         from unittest import mock
         from app.agent.runner import Agent
 
         agent = Agent(make_db())
-        r = agent.db.rules()
-        r["auto_reply_at"] = True
-        r["auto_reply_dm"] = True
-        agent.db.set_json("rules", r)
         agent._ensure_browser = mock.Mock(return_value=mock.Mock())
         return agent
+
+    def _replies(self, agent):
+        from app.db import now_str
+
+        def handle(inbox, mid, it, kind, rules):
+            agent.db.update_message(mid, status="replied", reply="好呀", reason="", handled_at=now_str())
+        return handle
 
     def test_epoch_key_uses_last_active_start(self):
         from datetime import datetime
@@ -999,37 +1012,109 @@ class InboxEpochTests(unittest.TestCase):
         self.assertEqual(agent._epoch_key(rules, datetime(2026, 11, 7, 10, 0)), "2026-11-07 09:00")
         self.assertEqual(agent._epoch_key(rules, datetime(2026, 11, 7, 8, 0)), "2026-11-06 09:00")
 
-    def test_first_check_skips_everything_already_there(self):
+    def test_messages_from_before_the_start_are_answered_too(self):
         from unittest import mock
 
         agent = self._agent()
-        old_pending = agent.db.add_message(kind="at", ext_id="at_old", user_name="旧人", content="旧消息",
-                                           status="pending", reason="待你处理")
-        mention = {"kind": "at", "ext_id": "at_1", "user": "雨.", "text": "@Yu 给我买奶茶", "video_url": "u"}
-        dm = {"ext_id": "dm_1", "user": "小明", "text": "在吗"}
+        held = agent.db.add_message(kind="at", ext_id="at_held", user_name="旧人", content="旧消息",
+                                    status="pending", reason="认不出对方是在哪个视频下 @ 的她")
+        agent.db.add_message(kind="at", ext_id="at_old", user_name="雨.", content="以前的 @", status="skipped_old",
+                             reason="这次启动之前就收到的消息，按规则不再回复")
+        agent.db.add_message(kind="dm", ext_id="dm_cut", user_name="小明", content="在吗", status="pending",
+                             reason="你让她休息了，这条还没回（可以手动回复）")
+        mention = {"kind": "at", "ext_id": "at_1", "user": "雨.", "text": "@Yu 给我买奶茶", "video_url": "u1"}
+        old = {"kind": "at", "ext_id": "at_old", "user": "阿花", "text": "以前的 @", "video_url": "u2"}
+        dm = {"ext_id": "dm_cut", "user": "小明", "text": "在吗"}
         with mock.patch("app.agent.runner.Inbox") as InboxCls:
             ib = InboxCls.return_value
-            ib.fetch_mentions.return_value = [mention]
+            ib.fetch_mentions.return_value = [mention, old]
             ib.fetch_unread_dms.return_value = [dm]
-            agent._handle_incoming = mock.Mock()
-            agent._process_inbox(stop_on_pause=False)
-            agent._handle_incoming.assert_not_called()            # 之前的一条都不回
-            self.assertFalse(ib.fetch_mentions.call_args.kwargs["resolve_video"])
-            rows = {r["ext_id"]: r["status"] for r in agent.db.query("SELECT ext_id, status FROM messages")}
-            self.assertEqual(rows, {"at_old": "skipped_old", "at_1": "skipped_old", "dm_1": "skipped_old"})
-            # 之后新来的才回
-            ib.fetch_mentions.return_value = [mention, {**mention, "ext_id": "at_2", "text": "新的 @"}]
+            ib.dm_missed.return_value = []
+            agent._handle_incoming = mock.Mock(side_effect=self._replies(agent))
+            n = agent._process_inbox(stop_on_pause=False, deep=True)
+        self.assertEqual(n, 3)
+        self.assertEqual(sorted(c.args[2]["ext_id"] for c in agent._handle_incoming.call_args_list),
+                         ["at_1", "at_old", "dm_cut"])
+        self.assertTrue(ib.fetch_mentions.call_args.kwargs["deep"])
+        self.assertTrue(ib.fetch_unread_dms.call_args.kwargs["scan_all"])        # 没有红点、但还没回的也点开
+        rows = {r["ext_id"]: r["status"] for r in agent.db.query("SELECT ext_id, status FROM messages")}
+        self.assertEqual(rows, {"at_held": "pending", "at_old": "replied", "dm_cut": "replied", "at_1": "replied"})
+        self.assertTrue(agent.db.message_handled("at_held"))                     # 留给你处理的不会自己再回
+        _ = held
+
+    def test_drain_runs_rounds_until_nothing_new_then_watches(self):
+        from unittest import mock
+
+        agent = self._agent()
+        agent._want_run = True
+        with mock.patch.object(agent, "_process_inbox", side_effect=[3, 1, 0]) as pi:
+            self.assertTrue(agent._drain_inbox())
+        self.assertEqual(pi.call_count, 3)
+        self.assertTrue(all(c.kwargs.get("deep") for c in pi.call_args_list))
+        ev = agent.db.query("SELECT title, detail FROM events ORDER BY id DESC LIMIT 1")[0]
+        self.assertIn("开始刷视频", ev["title"])
+        self.assertIn("4 条", ev["detail"])
+
+    def test_tick_drains_before_watching_and_again_next_day(self):
+        from unittest import mock
+
+        agent = self._agent()
+        agent._want_run = True
+        agent.logged_in = True
+        agent._drain_pending = True
+        r = agent.db.rules()
+        r.update(active_start="00:00", active_end="23:59")
+        agent.db.set_json("rules", r)
+        with mock.patch.object(agent, "_drain_inbox", return_value=True) as drain, \
+                mock.patch.object(agent, "_watch_one") as watch, mock.patch("app.agent.runner.Feed"), \
+                mock.patch.object(agent, "_memory_upkeep"), mock.patch.object(agent, "_owner_due", return_value=None), \
+                mock.patch.object(agent, "_maybe_publish_wish"), \
+                mock.patch.object(agent, "_inbox_due", return_value=(False, False)):
+            agent._tick()
+            drain.assert_called_once()
+            watch.assert_not_called()                     # 这一轮只回消息
+            agent._tick()
+            watch.assert_called_once()                    # 回完了才刷视频
+            agent._active_epoch = "2000-01-01 09:00"      # 第二天活跃时段开始
+            agent._tick()
+            self.assertEqual(drain.call_count, 2)
+
+    def test_stopped_drain_resumes_next_time(self):
+        from unittest import mock
+
+        agent = self._agent()
+        agent._want_run = True
+
+        def stop(**kw):
+            agent._want_run = False
+            return 2
+        with mock.patch.object(agent, "_process_inbox", side_effect=stop):
+            self.assertFalse(agent._drain_inbox())
+
+    def test_same_person_same_video_is_answered_once_with_everything(self):
+        from unittest import mock
+
+        agent = self._agent()
+        newest = {"kind": "at", "ext_id": "at_3", "user": "雨.", "text": "第三句", "video_url": "u"}
+        mid_ = {"kind": "at", "ext_id": "at_2", "user": "雨.", "text": "第二句", "video_url": "u"}
+        first = {"kind": "at", "ext_id": "at_1", "user": "雨.", "text": "第一句", "video_url": "u"}
+        other = {"kind": "at", "ext_id": "at_9", "user": "阿花", "text": "我也来", "video_url": "u"}
+        with mock.patch("app.agent.runner.Inbox") as InboxCls:
+            ib = InboxCls.return_value
+            ib.fetch_mentions.return_value = [newest, other, mid_, first]
             ib.fetch_unread_dms.return_value = []
+            agent._handle_incoming = mock.Mock(side_effect=self._replies(agent))
             agent._process_inbox(stop_on_pause=False)
-            self.assertEqual(agent._handle_incoming.call_count, 1)
-            self.assertEqual(agent._handle_incoming.call_args.args[2]["ext_id"], "at_2")
-        _ = old_pending
+        self.assertEqual(agent._handle_incoming.call_count, 2)
+        it = agent._handle_incoming.call_args_list[0].args[2]
+        self.assertEqual((it["ext_id"], it["earlier"]), ("at_3", ["第一句", "第二句"]))
+        rows = {r["ext_id"]: r["status"] for r in agent.db.query("SELECT ext_id, status FROM messages")}
+        self.assertEqual(rows, {"at_3": "replied", "at_2": "merged", "at_1": "merged", "at_9": "replied"})
 
     def test_failed_handling_never_stays_processing(self):
         from unittest import mock
 
         agent = self._agent()
-        agent._inbox_epoch = agent._epoch_key(agent.db.rules())
         with mock.patch("app.agent.runner.Inbox") as InboxCls, mock.patch("app.agent.runner.Feed"):
             ib = InboxCls.return_value
             ib.fetch_mentions.return_value = [{"kind": "at", "ext_id": "at_9", "user": "雨.", "text": "@Yu 嗨",
@@ -1040,6 +1125,20 @@ class InboxEpochTests(unittest.TestCase):
         m = agent.db.query("SELECT status, reason FROM messages WHERE ext_id='at_9'")[0]
         self.assertEqual(m["status"], "failed")
         self.assertIn("读不到", m["reason"])
+
+    def test_dm_history_merges_the_chat_window(self):
+        agent = self._agent()
+        agent.db.add_dm("小明", "them", "周末去爬山吗")
+        agent.db.add_dm("小明", "me", "好呀去哪座")
+        it = {"before": [{"role": "me", "content": "好呀去哪座"}, {"role": "them", "content": "香山"},
+                         {"role": "me", "content": "（你在手机上替她回的）几点"}]}
+        hist = agent._dm_history("小明", it)
+        self.assertEqual([h["content"] for h in hist],
+                         ["周末去爬山吗", "好呀去哪座", "香山", "（你在手机上替她回的）几点"])
+        self.assertFalse(agent._dm_done("小明", "小明 香山 10:24"))           # 列表上最后一句是 TA 说的：要点开
+        agent.db.add_dm("小明", "me", "那就早上八点见")
+        self.assertTrue(agent._dm_done("小明", "小明 那就早上八点见 10:30"))
+        self.assertFalse(agent._dm_done("小明", "小明 好的好的 10:31"))
 
 
 class EmergencyStopTests(unittest.TestCase):
@@ -1915,28 +2014,32 @@ class CommentSendRetryAndMentionTests(unittest.TestCase):
 
 
 class ThreadCheckIndependentTests(unittest.TestCase):
-    """“接着聊评论”不再挂在“自动回复 @”下面。"""
+    """互动消息里的三种都看：@ 她、回复她的评论、评论她的作品；以前的开关关了也照样看。"""
 
-    def test_thread_only(self):
+    def test_all_kinds_even_with_old_switches_off(self):
         from app.agent.runner import Agent
         db = make_db()
         r = db.rules()
         r["auto_reply_at"] = False
-        r["auto_reply_thread"] = True
+        r["auto_reply_thread"] = False
         r["auto_reply_dm"] = False
         db.set_json("rules", r)
         agent = Agent(db)
         agent._next_at = 0
-        self.assertEqual(agent._inbox_due(mock.Mock(), db.rules()), (True, False))
-        agent._inbox_epoch = agent._epoch_key(db.rules())
+        agent._next_dm = time.time() + 600
+        b = mock.Mock()
+        b.dm_signal.return_value = False
+        b.notice_signal.return_value = False
+        self.assertEqual(agent._inbox_due(b, db.rules()), (True, False))
         with mock.patch("app.agent.runner.Inbox") as InboxCls:
             inbox = InboxCls.return_value
             inbox.fetch_mentions.return_value = []
-            inbox.last_notice = {"opened": True, "rows": 3, "at": 0, "reply": 0}
+            inbox.last_notice = {"opened": True, "rows": 3, "at": 0, "reply": 0, "work": 0}
             agent._ensure_browser = mock.Mock()
             agent._process_inbox(stop_on_pause=False, at=True, dm=False)
-        self.assertEqual(inbox.fetch_mentions.call_args.kwargs["kinds"], ("reply",))
+        self.assertEqual(inbox.fetch_mentions.call_args.kwargs["kinds"], ("at", "reply", "work"))
         self.assertEqual(agent.notice_checked["new_reply"], 0)
+        self.assertEqual(agent.notice_checked["new_work"], 0)
 
     def test_panel_fail_warns_once_an_hour(self):
         from app.agent.runner import Agent
@@ -2497,6 +2600,9 @@ class OwnerTests(unittest.TestCase):
         self.db = make_db()
         be_friends(self.db, '小廖')
         self.db.save_owners([{"name": "小廖", "call": "哥哥", "relation": "把我带到这个世界的人"}])
+        r = self.db.rules()                       # 不设勿扰时段：这些测试不该跟着跑测试时的钟点变（勿扰另有测试）
+        r["owner_quiet_start"] = r["owner_quiet_end"] = "00:00"
+        self.db.set_json("rules", r)
         self.agent = Agent(self.db)
         self.agent.brain = mock.Mock()
         self.agent.brain.reply_dm.return_value = mock.Mock(ok=True, text="在呀哥哥", cost=0.0, tokens=0, reason="")
@@ -2518,7 +2624,8 @@ class OwnerTests(unittest.TestCase):
         self.assertNotIn("不和任何人发展恋爱", sp)
         self.assertIn("不和任何人发展恋爱", system_prompt(self.db.persona()))       # 对别人还是保持距离
 
-    def test_no_reply_cap_for_owner(self):
+    def test_no_reply_cap_for_anyone(self):
+        """回复不设上限：主人随时聊，别人也一样每条都回（旧的“每天最多回复”设置不再起作用）。"""
         r = self.db.rules()
         r["per_user_daily"] = 1
         r["limits"]["replies_dm"] = 1
@@ -2526,9 +2633,8 @@ class OwnerTests(unittest.TestCase):
         for i in range(4):
             self.assertEqual(self._dm("小廖", f"第{i}句")["status"], "replied")
         self.assertEqual(self.agent.brain.reply_dm.call_args.kwargs["owner"]["name"], "小廖")
-        self.assertEqual(self.agent.budget.remaining("replies_dm"), 1)             # 和主人聊天不占别人的私信额度
         self.assertEqual(self._dm("路人", "你好")["status"], "replied")
-        self.assertNotEqual(self._dm("路人", "再问一句")["status"], "replied")      # 别人照常受上限限制
+        self.assertEqual(self._dm("路人", "再问一句")["status"], "replied")
         self.assertGreater(self.db.owner("小廖")["closeness"], 0)                   # 聊得越多越亲近
 
     def test_owner_skips_sensitive_guard(self):
@@ -2622,24 +2728,12 @@ class OwnerTests(unittest.TestCase):
         self.assertEqual(self.db.save_owners([{"name": "小廖", "call": "主人"}]), [])
         self.assertEqual(self.db.owner("小廖")["call"], "主人")
 
-    def test_owner_dm_is_watched_even_when_dm_budget_is_gone(self):
+    def test_everyone_in_daytime_only_owner_at_night(self):
         a = self.agent
         r = self.db.rules()
-        r["limits"]["replies_dm"] = 0
+        r["limits"]["replies_dm"] = 0                                                # 旧设置：不再起作用
+        r["auto_reply_dm"] = False
         self.db.set_json("rules", r)
-        self.assertFalse(a._dm_for_all(r))
-        self.assertTrue(a._dm_watch(r))                                              # 额度用完了：还是去看（只回主人）
-        self.assertTrue(a._dm_watch(dict(r, auto_reply_dm=False)))                   # 关了自动回复私信：主人的照样回
-        self.assertFalse(a._dm_watch(dict(r, owner_enabled=False)))
-        self.db.save_owners([])
-        self.assertFalse(a._dm_watch(r))
-
-    def test_only_owner_conversations_are_opened_when_budget_is_gone(self):
-        a = self.agent
-        r = self.db.rules()
-        r["limits"]["replies_dm"] = 0
-        self.db.set_json("rules", r)
-        a._inbox_epoch = a._epoch_key(r)
         a._ensure_browser = mock.Mock()
         a._want_run = True
         with mock.patch("app.agent.runner.Inbox") as InboxCls:
@@ -2647,12 +2741,8 @@ class OwnerTests(unittest.TestCase):
             ib.fetch_mentions.return_value = []
             ib.fetch_unread_dms.return_value = []
             a._process_inbox(at=False, dm=True)
-            self.assertEqual(ib.fetch_unread_dms.call_args.kwargs["only"], {"小廖"})
-            r["limits"]["replies_dm"] = 30
-            self.db.set_json("rules", r)
-            a._process_inbox(at=False, dm=True)
-            self.assertIsNone(ib.fetch_unread_dms.call_args.kwargs["only"])          # 平时：所有人的都看
-            a._process_inbox(at=False, dm=True, owners_only=True)                    # 活跃时段以外
+            self.assertIsNone(ib.fetch_unread_dms.call_args.kwargs["only"])          # 活跃时段：所有人的都看
+            a._process_inbox(at=False, dm=True, owners_only=True)                    # 活跃时段以外：只看主人的
             self.assertEqual(ib.fetch_unread_dms.call_args.kwargs["only"], {"小廖"})
 
     def test_owner_is_answered_outside_active_hours(self):
@@ -2676,17 +2766,16 @@ class OwnerTests(unittest.TestCase):
             a._tick()
         a._process_inbox.assert_not_called()                                         # 没设主人：夜里不看私信
 
-    def test_baseline_leaves_owner_dms_alone(self):
-        a = self.agent
-        ib = mock.Mock()
-        ib.fetch_mentions.return_value = []
-        ib.fetch_unread_dms.return_value = []
-        mid = self.db.add_message(kind="dm", ext_id="p1", user_name="小廖", content="在吗", status="pending")
-        mid2 = self.db.add_message(kind="dm", ext_id="p2", user_name="路人", content="在吗", status="pending")
-        a._baseline_inbox(ib, self.db.rules(), ())
-        self.assertEqual(ib.fetch_unread_dms.call_args.kwargs["skip"], {"小廖"})     # 主人的未读不点开、不算旧消息
+    def test_old_owner_backlog_is_settled_after_reply(self):
+        """主人以前被打断、没回完的那几批，这次一起看完回了：不再挂在“待你处理”里。"""
+        old = self.db.add_message(kind="dm", ext_id="p1", user_name="小廖", content="在吗", status="pending",
+                                  reason="你让她休息了，这条还没回（可以手动回复）")
+        keep = self.db.add_message(kind="dm", ext_id="p2", user_name="小廖", content="转账给我", status="pending",
+                                   reason="命中屏蔽词")
+        new = self.db.add_message(kind="dm", ext_id="p3", user_name="小廖", content="人呢", status="replied")
+        self.assertEqual(self.db.settle_dm_leftovers("小廖", new), 1)
         st = {r["id"]: r["status"] for r in self.db.query("SELECT id, status FROM messages")}
-        self.assertEqual((st[mid], st[mid2]), ("pending", "skipped_old"))
+        self.assertEqual((st[old], st[keep]), ("merged", "pending"))
 
     def test_unread_filter_in_inbox(self):
         from app.douyin.inbox import Inbox
@@ -2709,15 +2798,85 @@ class OwnerTests(unittest.TestCase):
             self.assertEqual(opened, ["路人"])
 
     def test_share_video(self):
+        """分享的是整个视频（抖音的“分享给朋友”，私信里是视频卡片），再跟一句话；不发一串地址。"""
         a = self.agent
-        with mock.patch("app.agent.runner.Inbox") as InboxCls:
+        v = {"url": "https://www.douyin.com/video/7696133565038729289", "desc": "橘猫", "author": "阿橘"}
+        with mock.patch("app.agent.runner.Inbox") as InboxCls, mock.patch("app.agent.runner.Feed") as FeedCls:
+            FeedCls.return_value.share_to_friend.return_value = True
+            InboxCls.return_value.has_my_share.return_value = True
             InboxCls.return_value.reply_dm.return_value = True
-            a._owner_share(mock.Mock(), self.db.owner("小廖"), "这只猫好像你",
-                           {"url": "https://www.douyin.com/video/1", "desc": "橘猫", "author": "阿橘"})
+            a._owner_share(mock.Mock(), self.db.owner("小廖"), "这只猫好像你", v)
+            FeedCls.return_value.share_to_friend.assert_called_once_with("小廖")
             sent = InboxCls.return_value.reply_dm.call_args.args[1]
-        self.assertIn("这只猫好像你", sent)
-        self.assertIn("douyin.com/video/1", sent)
+        self.assertEqual(sent, "这只猫好像你")
+        self.assertNotIn("douyin.com", sent)
+        self.assertIn("[分享了视频《橘猫》]", self.db.dm_history("小廖")[-1]["content"])
         self.assertEqual(len(a._owners_for_share(dict(self.db.rules(), owner_share_per_day=1))), 0)
+
+    def test_no_card_means_nothing_is_sent(self):
+        a = self.agent
+        v = {"url": "https://www.douyin.com/video/7696133565038729289", "desc": "橘猫", "author": "阿橘"}
+        for shared, in_chat in ((False, True), (True, False)):
+            with mock.patch("app.agent.runner.Inbox") as InboxCls, mock.patch("app.agent.runner.Feed") as FeedCls:
+                FeedCls.return_value.share_to_friend.return_value = shared
+                InboxCls.return_value.has_my_share.return_value = in_chat
+                a._owner_share(mock.Mock(), self.db.owner("小廖"), "这只猫好像你", v)
+                InboxCls.return_value.reply_dm.assert_not_called()                  # 卡片没发出去：一句话也不发，更不发地址
+        self.assertEqual(a._today_events("owner_share"), 0)
+        self.assertEqual(self.db.query("SELECT COUNT(*) n FROM events WHERE kind='error' AND title LIKE '没能把视频分享给主人%'")[0]["n"], 1)
+
+    def test_share_panel_steps(self):
+        from app.douyin.feed import Feed
+        f = Feed.__new__(Feed)
+        f.b = mock.Mock()
+        f.b.sel = {"share_send_texts": ["分享", "发送"]}
+        f._dump_comments_once = mock.Mock()
+        btn, who, send = mock.Mock(name="share"), mock.Mock(name="friend"), mock.Mock(name="send")
+        f.b.find.side_effect = lambda key, timeout=0, root=None: btn if key == "share_button" else None
+        f._floating = mock.Mock(side_effect=[None, who])                            # 移上去没出来 → 点一下出来了
+        who.evaluate_handle.return_value.as_element.return_value = send
+        f.b.safe_click.return_value = True
+        self.assertTrue(f.share_to_friend("小廖"))
+        btn.hover.assert_called_once()
+        btn.click.assert_called_once()
+        self.assertEqual([c.args[0] for c in f.b.safe_click.call_args_list], [who, send])
+        # 面板里没有这位好友：保存页面（面板还开着），不乱点
+        f._floating = mock.Mock(return_value=None)
+        f.b.safe_click.reset_mock()
+        self.assertFalse(f.share_to_friend("小廖"))
+        self.assertEqual(f._dump_comments_once.call_args.args[0], "share_panel_fail")
+        f.b.safe_click.assert_not_called()
+
+    def test_owner_can_be_mentioned_in_comments(self):
+        a = self.agent
+        self.db.execute("INSERT INTO people(name, topics, facts) VALUES('小廖', '猫、川菜', '养了一只橘猫')")
+        got = a._owners_for_at(self.db.rules())
+        self.assertEqual([(o["nickname"], o["owner"], o["call"]) for o in got], [("小廖", True, "哥哥")])
+        self.assertIn("猫、川菜", got[0]["tags"])
+        self.assertIn("养了一只橘猫", got[0]["tags"])
+        # 每天有上限；主人那一行可以单独关掉；主人功能关了就没有
+        for _ in range(2):
+            self.db.add_event("owner_at", "评论里 @ 了主人", "x")
+        self.assertEqual(a._owners_for_at(self.db.rules()), [])
+        self.assertEqual(len(a._owners_for_at(dict(self.db.rules(), owner_at_per_day=5))), 1)
+        self.assertEqual(a._owners_for_at(dict(self.db.rules(), owner_at_per_day=5, owner_enabled=False)), [])
+        self.db.save_owners([{"name": "小廖", "call": "哥哥", "at": False}])
+        self.assertEqual(a._owners_for_at(dict(self.db.rules(), owner_at_per_day=5)), [])
+
+    def test_decide_prompt_lists_owner_with_likes(self):
+        from app.agent.brain import Brain
+        b = Brain(self.db)
+        b.router = mock.Mock()
+        b.router.call.return_value = mock.Mock(text='{"like": true, "comment": "这只橘猫和你家那只一模一样", "at_friend": 1, "reason": "x"}',
+                                               cost=0.0, tokens=0)
+        friends = [{"nickname": "小廖", "tags": "常聊：猫、川菜", "owner": True, "call": "哥哥", "uid": ""},
+                   {"nickname": "阿宁", "tags": "旅行", "uid": "u2"}]
+        dec = b.decide({"desc": "橘猫", "author": "a", "comments": []}, [], True, True, False, False, friends=friends)
+        p = b.router.call.call_args_list[0].args[2]
+        self.assertIn("1. 小廖（你的主人「哥哥」，常聊：猫、川菜）", p)
+        self.assertIn("2. 阿宁（喜欢：旅行）", p)
+        self.assertIn("照你对 TA 的了解 TA 也会喜欢", p)
+        self.assertTrue(dec["at_friend"]["owner"])
 
     def test_save_owners_keeps_closeness(self):
         self.db.owner_touch("小廖", closer=7)
@@ -3034,7 +3193,7 @@ class MessageCenterKeepTests(unittest.TestCase):
     def setUp(self):
         from datetime import datetime, timedelta
         self.db = make_db()
-        self.now = datetime(2026, 11, 12, 12, 0, 0)
+        self.now = datetime.now().replace(microsecond=0)      # 不能写死日期：界面整理记录时按真实的“现在”算
         self.ago = lambda d, h=0: (self.now - timedelta(days=d, hours=h)).strftime("%Y-%m-%d %H:%M:%S")
 
     def _msg(self, kind, ext, user, days, status="replied", reply="好呀", handled=None):
@@ -3460,7 +3619,7 @@ class VoiceTests(unittest.TestCase):
     def test_speech_text_is_cleaned(self):
         from app.publish import voice
         t = voice.speech_text("周末的小确幸", "今天去了海边🌊，风好大呀～～(｡･ω･｡)ﾉ♡ 看到一只柯基[比心]！！ #海边 #柯基 https://x.com/a")
-        self.assertEqual(t, "周末的小确幸。\n今天去了海边，风好大呀～ 看到一只柯基！")
+        self.assertEqual(t, "今天去了海边，风好大呀～ 看到一只柯基！")                       # 只读正文，不读标题
         self.assertLessEqual(len(voice.speech_text("", "长" * 3000)), voice.MAX_CHARS)
 
     def test_key_is_encrypted_and_never_in_rules(self):
@@ -3564,7 +3723,7 @@ class VoiceTests(unittest.TestCase):
                 Image.new("RGB", (1080, 1440), (255, 220, 230)).save(tmp / str(did) / n)
             with mock.patch("app.publish.voice.synthesize", return_value=(mp3.read_bytes(), "mp3", 0.002)) as syn:
                 cost = narrate_draft(db, did)
-            self.assertEqual(syn.call_args.args[2], "周末。\n今天去了海边，风好大呀")
+            self.assertEqual(syn.call_args.args[2], "今天去了海边，风好大呀")          # 只读正文，不读标题“周末”
             self.assertEqual(cost, 0.002)
             d = db.draft(did)
             v = d["media"][-1]
@@ -3682,8 +3841,8 @@ class ReplyEveryMessageTests(unittest.TestCase):
         p = b.router.call.call_args_list[0].args[2]
         self.assertIn("对方连着发了 3 条消息", p)
         self.assertIn("3. 对了你喜欢猫吗", p)
-        self.assertIn("每一条都要回应到", p)
-        self.assertIn("120 字以内", p)
+        self.assertIn("每一条都要回应到，要一一回复", p)
+        self.assertIn("拆成几条短消息", p)
         b.router.call.reset_mock()
         b.reply_dm("小鹿", [], "你喜欢猫吗")
         p = b.router.call.call_args_list[0].args[2]
@@ -3763,6 +3922,189 @@ class ReplyEveryMessageTests(unittest.TestCase):
                 self.assertEqual((p.Tilt, p.LieE, p.ArmL), (raw.Tilt, raw.LieE, raw.ArmL))   # 身体、手的动作照旧
         raw = stickers._pose(rig, stickers.MOODS["跳舞"][0], stickers.MOODS["跳舞"][1]).pose()
         self.assertGreater(abs(raw.HeadDX), 15)                                      # 原来的动作确实把头甩开了
+
+
+class StickersFromOthersTests(unittest.TestCase):
+    """别人发来的表情包 / 图片：私信和评论区都要能看懂、会回；只发了一张表情包也要回。"""
+
+    def _inbox(self):
+        from app.douyin.inbox import Inbox
+        ib = Inbox.__new__(Inbox)
+        ib.b = mock.Mock()
+        ib.b.sel = {"dm_image_bubble": ["[class*='MessageItemImage']", "[class*='MessageItemEmoji']"],
+                    "dm_share_card": ["[class*='MessageItemShareAweme']"], "dm_text_bubble": ["[class*='MessageItemText']"]}
+        return ib
+
+    def test_sticker_message_is_an_image_not_a_share_card(self):
+        """2026-11-12 实测：聊天里的表情包（class 带 MessageItemEmoji）被当成“分享的视频卡片”去点，
+        报“点开后没认出是哪个视频”“分享卡片读不到视频地址”。"""
+        ib = self._inbox()
+        m = mock.Mock()
+        box = m.locator.return_value.first
+        box.count.return_value = 1
+        box.evaluate.return_value = "https://p26-sign.douyinpic.com/obj/x/abc?lk3s=1"
+        ib._share_link = mock.Mock(return_value="")
+        self.assertEqual(ib._classify(m, ""), ("image", "https://p26-sign.douyinpic.com/obj/x/abc?lk3s=1"))
+        ib._share_link.assert_not_called()
+        box.count.return_value = 0
+        ib._share_link = mock.Mock(return_value="https://www.douyin.com/video/7696133565038729289")
+        self.assertEqual(ib._classify(m, "")[0], "share")
+
+    def test_douyin_system_tip_is_not_their_message(self):
+        ib = self._inbox()
+        ib.b.sel = dict(ib.b.sel, dm_system_texts=["我们已互相关注，可以开始聊天了"], dm_from_me="[class*='isFromMe']")
+        a, b_ = mock.Mock(), mock.Mock()
+        ib.b.find_all.return_value = [b_, a]                                        # 页面上新的在前
+        ib.b.text_of.side_effect = lambda m, n: {a: "我们已互相关注，可以开始聊天了", b_: "你是谁"}[m]
+        ib._classify = mock.Mock(return_value=("text", ""))
+        a.evaluate.return_value = b_.evaluate.return_value = False
+        self.assertEqual([m["text"] for m in ib._read_chat(8)], ["你是谁"])
+
+    def test_real_page_selector(self):
+        from app.douyin.selectors import DEFAULT_SELECTORS, SELECTORS_VERSION
+        self.assertIn("[class*='MessageItemEmoji']", DEFAULT_SELECTORS["dm_image_bubble"])
+        self.assertGreaterEqual(SELECTORS_VERSION, 24)
+
+    def test_unread_dm_with_only_a_sticker(self):
+        ib = self._inbox()
+        ib.sec_uids = {}
+        ib.b.known_user.return_value = None
+        ib.open_dm_panel = mock.Mock(return_value=True)
+        ib._back_to_list = mock.Mock(return_value=True)
+        ib._has_unread = mock.Mock(return_value=True)
+        ib.b.find_all.return_value = ["c1"]
+        ib._conv_user = mock.Mock(return_value="小鹿")
+        ib._conv_avatar = mock.Mock(return_value="")
+        ib._open_conv = mock.Mock(return_value=True)
+        ib._share_link_by_click = mock.Mock()
+        ib._read_chat = mock.Mock(return_value=[
+            {"from_me": True, "kind": "text", "text": "早呀", "url": "", "el": None},
+            {"from_me": False, "kind": "image", "text": "", "url": "https://p.example/a.webp", "el": None}])
+        with mock.patch("app.douyin.inbox.react_values", return_value=[]):
+            it = ib.fetch_unread_dms()[0]
+        self.assertEqual(it["text"], "[发了一张表情包 / 图片]")
+        self.assertEqual(it["images"], ["https://p.example/a.webp"])
+        self.assertEqual(it["shares"], [])
+        ib._share_link_by_click.assert_not_called()                                 # 不再去点它
+
+    def test_fetch_image_makes_a_jpeg_the_model_can_read(self):
+        import io
+        from PIL import Image
+        ib = self._inbox()
+        buf = io.BytesIO()
+        frames = [Image.new("RGBA", (900, 600), (255, 0, 0, 0)), Image.new("RGBA", (900, 600), (0, 255, 0, 255))]
+        frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:])
+        r = ib.b.ctx.request.get.return_value
+        r.status, r.body.return_value = 200, buf.getvalue()
+        out = Image.open(io.BytesIO(ib.fetch_image("https://p.example/a.gif")))
+        self.assertEqual((out.format, max(out.size)), ("JPEG", 640))
+        r.body.return_value = b"not an image"
+        self.assertIsNone(ib.fetch_image("https://p.example/a.gif"))
+        r.status = 403
+        self.assertIsNone(ib.fetch_image("https://p.example/a.gif"))
+        self.assertIsNone(ib.fetch_image("about:blank"))
+
+    def test_dm_reply_sees_the_sticker(self):
+        from app.agent.brain import Brain
+        b = Brain(make_db())
+        b.router = mock.Mock()
+        b.router.call.return_value = mock.Mock(text="早上好呀～", cost=0.0, tokens=0)
+        b.reply_dm("小鹿", [], "[发了一张表情包 / 图片]", images=[b"jpg"])
+        call = b.router.call.call_args_list[0]
+        self.assertEqual((call.args[0], call.kwargs["images"]), ("vision", [b"jpg"]))
+        self.assertIn("先看懂它", call.args[2])
+        self.assertIn("对方这次只发了这张图、没有打字", call.args[2])
+        b.router.call.reset_mock()
+        b.reply_dm("小鹿", [], "你看这个\n[发了一张表情包 / 图片]", images=[b"jpg"])
+        self.assertIn("回复的时候把图里的意思也接上", b.router.call.call_args_list[0].args[2])
+        b.router.call.reset_mock()
+        b.reply_dm("小鹿", [], "[发了一张表情包 / 图片]", images=[])                 # 图片没下载下来
+        call = b.router.call.call_args_list[0]
+        self.assertEqual(call.args[0], "write")
+        self.assertIn("不要编造图上是什么", call.args[2])
+
+    def test_runner_downloads_dm_stickers(self):
+        from app.agent.runner import Agent
+        db = make_db()
+        a = Agent(db)
+        a.brain = mock.Mock()
+        a.brain.reply_dm.return_value = mock.Mock(ok=True, text="早上好呀～", cost=0, tokens=0, sticker=None, reason="")
+        a.brain.safety_check.return_value = (True, "", 0.0)
+        ib = mock.Mock()
+        ib.fetch_image.side_effect = lambda u: b"jpg-" + u[-1].encode()
+        ib.reply_dm.return_value = True
+        mid = db.add_message(kind="dm", ext_id="s1", user_name="小鹿", content="[发了一张表情包 / 图片]", status="pending")
+        a._handle_incoming(ib, mid, {"user": "小鹿", "text": "[发了一张表情包 / 图片]", "shares": [],
+                                     "images": ["https://p.example/1", "https://p.example/2"], "profile": {}}, "dm", db.rules())
+        self.assertEqual(a.brain.reply_dm.call_args.kwargs["images"], [b"jpg-1", b"jpg-2"])
+        self.assertEqual(db.query("SELECT status FROM messages WHERE id=?", (mid,))[0]["status"], "replied")
+
+    def test_comment_with_a_picture(self):
+        from app.agent.brain import Brain
+        from app.agent.runner import Agent
+        from app.douyin import inbox as inbox_mod
+        self.assertIn("imgOf(row)", inbox_mod.THREAD_ROWS_JS)
+        self.assertIn("!x.getAttribute('alt')", inbox_mod.THREAD_ROWS_JS)            # 文字里的小表情（带 alt）不算
+        a = Agent(make_db())
+        ib = mock.Mock()
+        ib.thread_context.return_value = [{"user": "楼主", "text": "这只柯基的屁股像面包", "img": "", "target": False},
+                                          {"user": "小鹿", "text": "[图片]", "img": "https://p.example/s.png", "target": True}]
+        ib.fetch_image.return_value = b"jpg"
+        it = {"user": "小鹿", "text": "[图片]"}
+        ctx = a._thread_context(ib, it)
+        self.assertEqual([c["user"] for c in ctx], ["楼主"])
+        self.assertEqual(it["image"], b"jpg")
+        b = Brain(make_db())
+        b.router = mock.Mock()
+        b.router.call.return_value = mock.Mock(text="哈哈", cost=0.0, tokens=0)
+        b.reply_thread({"desc": "柯基", "author": "a"}, "小鹿", "[图片]", [], False, context=ctx, image=b"jpg")
+        call = b.router.call.call_args_list[0]
+        self.assertEqual((call.args[0], call.kwargs["images"]), ("vision", [b"jpg"]))
+        self.assertIn("对方在评论里发了一张表情包 / 图片", call.args[2])
+        b.router.call.reset_mock()
+        b.reply_at({"desc": "柯基", "author": "a"}, "小鹿", "@雨雨", [b"f1"], context=ctx, image=b"jpg")
+        call = b.router.call.call_args_list[0]
+        self.assertEqual(call.kwargs["images"], [b"f1", b"jpg"])
+        self.assertIn("最后一张附图", call.args[2])
+
+    def test_missed_messages_include_stickers(self):
+        ib = self._inbox()
+        ib._chat_title = mock.Mock(return_value="小鹿")
+        ib._read_chat = mock.Mock(return_value=[
+            {"from_me": True, "kind": "text", "text": "早呀", "url": ""},
+            {"from_me": False, "kind": "text", "text": "在吗", "url": ""},
+            {"from_me": True, "kind": "text", "text": "在的在的", "url": ""},
+            {"from_me": False, "kind": "image", "text": "", "url": "https://p.example/a.webp"}])
+        self.assertEqual(ib.dm_missed("小鹿", ["在吗"], "在的在的"), ["[发了一张表情包 / 图片]"])
+        self.assertEqual(ib.missed_images, ["https://p.example/a.webp"])
+
+    def test_multiline_reply_is_not_reported_as_unsent(self):
+        """2026-11-12 日志：“私信好像没发出去（最新一条：项目地址：https://…）”——回复里有换行，
+        抖音把它分成两条发了，最新一条是后半段。"""
+        from app.douyin.inbox import dm_sent_ok
+        self.assertTrue(dm_sent_ok("谢谢关注～\n项目地址：https://github.com/x", "项目地址：https://github.com/x"))
+        self.assertTrue(dm_sent_ok("在的在的，怎么啦", "在的在的，怎么啦"))
+        self.assertFalse(dm_sent_ok("在的在的，怎么啦", "你是谁"))
+        self.assertFalse(dm_sent_ok("在的", ""))
+
+    def test_no_comments_at_all_is_not_a_problem(self):
+        """2026-11-12 实测：视频下写着“暂无评论”，却报“评论区打开了，但没读到评论”并保存了页面。"""
+        from app.douyin.feed import Feed
+        f = Feed.__new__(Feed)
+        f.b = mock.Mock()
+        f.b.sel = {"comment_none_text": "暂无评论"}
+        f.b.page.get_by_text.return_value.first.is_visible.return_value = True
+        self.assertTrue(f._no_comments_yet())
+        f.b.page.get_by_text.assert_called_with("暂无评论", exact=True)
+        f.b.page.get_by_text.return_value.first.is_visible.return_value = False
+        self.assertFalse(f._no_comments_yet())
+        src = (ROOT / "app" / "douyin" / "feed.py").read_text(encoding="utf-8")
+        self.assertIn("if not out and not self._no_comments_yet():", src)
+
+    def test_ui_owner_at(self):
+        js = (ROOT / "web" / "js" / "app.js").read_text(encoding="utf-8")
+        for want in ('class="own-at"', 'at: row.querySelector(".own-at").checked', 'id="r-ownat"', "owner_at_per_day"):
+            self.assertIn(want, js)
 
 
 class PostFormTests(unittest.TestCase):
@@ -3992,14 +4334,17 @@ class FreeFormPostTests(unittest.TestCase):
         b = Brain(make_db())
         cards = [{"title": "", "lines": ["今天的风有点像小时候"]}] + \
                 [{"title": f"第{i}件", "lines": [f"句{j}" for j in range(i + 1)]} for i in range(1, 7)] + ["只有一句的卡片"]
-        fake = mock.Mock(text=json.dumps({"want": True, "why": "想说话", "title": "碎碎念", "text": "正文", "tags": ["日常"],
-                                          "cards": cards}, ensure_ascii=False), cost=0.0)
-        with mock.patch.object(b.router, "call", return_value=fake) as call:
-            d = b.draft_post(["猫猫视频"], "有点想家", memory="以前的事：\n- 2026-10-01 和小廖聊过海边")
+        think = mock.Mock(text=json.dumps({"want": True, "why": "想说话", "ideas": [{"idea": "想海边了", "p": 0.4}]},
+                                          ensure_ascii=False), cost=0.0)
+        fake = mock.Mock(text=json.dumps({"title": "碎碎念", "text": "正文", "tags": ["日常"], "cards": cards},
+                                         ensure_ascii=False), cost=0.0)
+        with mock.patch.object(b.router, "call", side_effect=[think, fake]) as call:
+            d = b.draft_post(["猫猫视频"], "有点想家", memory="以前的事：\n- 2026-10-01 和小廖聊过海边", form="cards")
         prompt = call.call_args.args[2]
-        for word in ("没有固定的格式", "回忆", "憧憬", "吐槽", "和小廖聊过海边", "张数你自己定"):
+        for word in ("和小廖聊过海边", "你想发的是：想海边了", "想写多长写多长", "不想分就空着"):
             self.assertIn(word, prompt)
-        self.assertNotIn("1～4 张", prompt)
+        for rule in ("没有固定的格式", "张数你自己定", "1～4 张", "不涉及政治"):     # 不再给她定规矩
+            self.assertNotIn(rule, prompt)
         self.assertEqual(len(d["cards"]), 8)                                   # 不再砍成 4 张
         self.assertEqual(d["cards"][0], {"title": "", "lines": ["今天的风有点像小时候"]})
         self.assertEqual(len(d["cards"][6]["lines"]), 7)                       # 一张可以超过 4 句

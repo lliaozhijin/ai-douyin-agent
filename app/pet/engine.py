@@ -504,7 +504,7 @@ class Pet:
             self.wish = False
         if self.is_held or self.act in (CLIMB,):
             return
-        if self.is_hiding and kind in ("publish_wish", "attention", "love", "published"):
+        if self.is_hiding and kind in ("publish_wish", "attention", "love", "published", "level_up"):
             self.start_climb()
             return
         if self.is_hiding:
@@ -562,6 +562,18 @@ class Pet:
             self.add(BANG, 70 * self.fx, -320 * self.fy, 6, -30, 1.0, 26)
         elif kind == "at_friend":
             self.say(f"快来看～{short}" if text else "分享给好朋友～")
+        elif kind == "level_up":
+            # 成长升级（见 pet/growth.py）：欢呼 + 满天星星
+            self.face.flash_happy()
+            self.set_act(CHEER, 2.4)
+            self.say(f"升级啦！{text}" if text else "升级啦！", 4.0)
+            for _ in range(10):
+                self.add(STAR, self.R(-120, 120) * self.fx, self.R(-300, -120) * self.fy, self.R(-70, 70),
+                         self.R(-120, -60), 1.3, self.R(6, 10))
+        elif kind == "oops":
+            # 她那边出错了（镜像她的状态）：冒个烟、嘟囔一句
+            self.say(text or "呜……出了点小问题，等我一下", 3.0)
+            self.puff_burst(4)
 
     def start_sign(self):
         self.set_act(SIGN, 9.0)

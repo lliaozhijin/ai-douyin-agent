@@ -35,7 +35,11 @@ def output_problem(text: str) -> str | None:
         return "包含手机号"
     if CONTACT_RE.search(text):
         return "包含联系方式相关的词"
-    if len(text) > 300:
+    # 私信拆成几条发时（一行一条，行首可能带“[1]”这样回第几条的标记）：标记和换行不算字数，
+    # 讲专业知识时允许长一点
+    body = re.sub(r"(?m)^\s*[\[［【]\s*[\d\s\-~～、,，]+[\]］】]\s*", "", text)
+    lines = [x for x in body.split("\n") if x.strip()]
+    if len("".join(lines)) > (450 if len(lines) > 1 else 300):
         return "内容太长"
     return None
 

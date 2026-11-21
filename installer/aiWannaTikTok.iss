@@ -1,8 +1,8 @@
 ﻿; AI也要刷抖音 安装包脚本（Inno Setup 6）
-; 由 build.bat 自动调用，生成 installer\Output\aiWannaTikTok_Setup_v0.2.0.exe
+; 由 build.bat 自动调用，生成 installer\Output\aiWannaTikTok_Setup_v0.4.0.exe
 
 #define AppName "AI也要刷抖音"
-#define AppVersion "0.2.0"
+#define AppVersion "0.4.0"
 #define AppNameEn "aiWannaTikTok"
 #define AppExe "aiWannaTikTok.exe"
 
@@ -41,6 +41,11 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 [Files]
 Source: "..\dist\aiWannaTikTok\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; DestName: "使用说明.md"; Flags: ignoreversion
+#if FileExists(SourcePath + "redist\vc_redist.x64.exe")
+; 微软官方的 VC++ 运行库安装程序（build.bat 下载）：电脑上的太旧（低于 14.40）才解压、才运行。
+; 太旧的话，抠图组件和听声音的组件一启动就会崩溃。
+Source: "redist\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: VCRedistNeeded
+#endif
 
 [InstallDelete]
 ; 更早的版本程序文件名是 YuyuGirl.exe，升级时删掉，免得安装目录里留两个程序
@@ -63,9 +68,24 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
+#if FileExists(SourcePath + "redist\vc_redist.x64.exe")
+; 要管理员权限：用 shellexec 运行，Windows 会弹出确认窗口
+Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /passive /norestart"; StatusMsg: "正在更新 Microsoft VC++ 运行库……"; Flags: shellexec waituntilterminated; Check: VCRedistNeeded
+#endif
 Filename: "{app}\{#AppExe}"; Description: "立即启动{#AppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function VCRedistNeeded: Boolean;
+var
+  MS, LS: Cardinal;
+begin
+  { msvcp140.dll 低于 14.40（VS 2022 17.10）时，新版 onnxruntime、ctranslate2 一启动就访问冲突崩溃 }
+  if GetVersionNumbers(ExpandConstant('{sys}\msvcp140.dll'), MS, LS) then
+    Result := MS < ((14 shl 16) or 40)
+  else
+    Result := True;
+end;
+
 function GetDriveType(lpRootPathName: String): Cardinal;
   external 'GetDriveTypeW@kernel32.dll stdcall';
 

@@ -76,8 +76,10 @@ def _auth(db, rules: dict, need_voice: bool = True) -> tuple[dict, str, dict | N
 
 
 def speech_text(title: str, text: str) -> str:
-    """把作品的标题和正文整理成适合朗读的话：去掉话题标签、[抖音表情]、颜文字、网址和读不出来的符号。"""
-    t = f"{(title or '').strip()}。\n{(text or '').strip()}" if title else (text or "")
+    """把作品的正文整理成适合朗读的话：去掉话题标签、[抖音表情]、颜文字、网址和读不出来的符号。
+    只读正文，不读标题（标题已经写在画面上 / 作品标题里，配音再念一遍就重复了）；title 参数留着只是为了兼容。"""
+    _ = title
+    t = (text or "").strip()
     t = re.sub(r"https?://\S+", " ", t)
     t = re.sub(r"#\S+", " ", t)                       # 话题
     t = re.sub(r"\[[^\[\]\s]{1,8}\]", "", t)          # [比心] 这样的抖音表情

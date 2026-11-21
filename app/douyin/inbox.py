@@ -9,11 +9,12 @@ import hashlib
 import logging
 import re
 import time
+from datetime import date
 
 from .. import cancel
 
 from ..db import today_str
-from .browser import DouyinBrowser
+from .browser import DouyinBrowser, media_only, name_key, same_person
 from .selectors import as_list
 from .feed import Feed, FeedReadError
 
@@ -64,9 +65,15 @@ THREAD_ROWS_JS = r"""
     const a = [...row.querySelectorAll('a[href*="/user/"]')].find((x) => x.closest(itemSel) === row && (x.textContent || '').trim());
     return a ? (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 30) : '';
   };
+  // 评论里配的图 / 表情包：属于这一条评论、不是头像、不是文字里的小表情（小表情带 alt）
+  const imgOf = (row) => {
+    const i = [...row.querySelectorAll('img')].find((x) => x.closest(itemSel) === row && !x.getAttribute('alt')
+      && !x.closest('[class*="avatar"], a[href*="/user/"]') && /^https?:/.test(x.currentSrc || x.src || ''));
+    return i ? (i.currentSrc || i.src) : '';
+  };
   const out = [];
   for (const row of rows) {
-    out.push({ user: userOf(row), text: textOf(row) });
+    out.push({ user: userOf(row), text: textOf(row), img: imgOf(row), target: row === el });
     if (row === el && row !== top) break;      // 到对方这条为止（后面的是更晚的回复）
   }
   return out;
@@ -79,7 +86,9 @@ THREADS_JS = r"""
 ([itemSel, expandSels]) => {
   const out = [];
   window.__aiwThread = window.__aiwThread || 0;
-  for (const row of document.querySelectorAll(itemSel)) {
+  const all = [...document.querySelectorAll(itemSel)];
+  const shown = all.filter((r) => r.getClientRects().length > 0);   // 评论区藏着的那一份不看
+  for (const row of (shown.length ? shown : all)) {
     if (row.hasAttribute('data-aiw-seen')) continue;
     row.setAttribute('data-aiw-seen', '1');
     let btn = null;
@@ -119,6 +128,23 @@ SCROLL_MORE_JS = r"""
 }
 """
 
+# 通知面板往下翻：只翻面板自己的滚动区域（不翻整个页面，免得把推荐页的视频划走）；翻不动返回 false
+NOTICE_SCROLL_JS = r"""
+(el) => {
+  let n = el.parentElement;
+  while (n && n !== document.body) {
+    const s = getComputedStyle(n);
+    if ((s.overflowY === "auto" || s.overflowY === "scroll") && n.scrollHeight > n.clientHeight + 10) {
+      const before = n.scrollTop;
+      n.scrollTop = before + Math.max(400, n.clientHeight * 0.9);
+      return n.scrollTop > before;
+    }
+    n = n.parentElement;
+  }
+  return false;
+}
+"""
+
 
 def _squash(t: str) -> str:
     return re.sub(r"\s+", "", t or "")
@@ -133,6 +159,14 @@ def match_mine(text: str, mine: list[str]) -> str:
         if len(k) >= 4 and k in t and len(m) > len(best):
             best = m
     return best
+
+
+def _name_in(name: str, text: str) -> bool:
+    """名字出现在这段文字里（忽略 emoji、标点：网页上名字里的 emoji 是图片，文字里没有）。"""
+    if _squash(name) and _squash(name) in _squash(text):
+        return True
+    k = name_key(name)
+    return len(k) >= 2 and k in name_key(text)
 
 
 def _same_name(a: str, b: str) -> bool:
@@ -213,16 +247,135 @@ def pick_unique(found: list[dict], prefer: str = "") -> str:
     return values.pop() if len(values) == 1 else ""
 
 
+IMAGE_LINE = "[发了一张表情包 / 图片]"
+
+# 私信里的“引用回复”：对方长按某一条消息点“引用”再说话，气泡旁边会带一小块被引用的那句话。
+# 网页版的写法没法在这里实测，所以按 class 名里带 quote / refer / reply 的元素找（找到的第一次把页面存下来，方便校准），
+# 找不到时再看文字是不是“引用 xx：……”开头。
+QUOTE_FIND_JS = r"""
+(el) => {
+  const cls = (n) => { const c = n.className; return (c && c.baseVal !== undefined) ? c.baseVal : String(c || ""); };
+  const isQ = (n) => { const c = cls(n); return /(quote|refer)/i.test(c) || (/reply/i.test(c) && !/(btn|button|icon|input|count)/i.test(c)); };
+  let root = el;
+  for (let i = 0; i < 2 && root.parentElement; i++) {
+    const p = root.parentElement;
+    if (p.querySelectorAll("[data-e2e='msg-item-content'], [data-e2e='msg-item']").length > 2) break;
+    root = p;
+  }
+  const hits = [];
+  if (isQ(root)) return [];
+  root.querySelectorAll("*").forEach((n) => { if (isQ(n)) hits.push(n); });
+  const outer = hits.filter((n) => !hits.some((o) => o !== n && o.contains(n)));
+  return outer.map((n) => (n.innerText || "").trim()).filter(Boolean).slice(0, 2);
+}
+"""
+QUOTE_TEXT = re.compile(r"^\s*(?:引用|回复)\s*(?:@?([^:：\s]{1,24})\s*[:：])?\s*(.{1,200})$")
+
+
+# 私信会话列表里每一行的名字：[会话行的选择器们, 名字的选择器们]
+CONV_NAMES_JS = r"""([items, titles]) => {
+  for (const s of items) {
+    let rows = [];
+    try { rows = [...document.querySelectorAll(s)]; } catch (e) { continue; }
+    if (!rows.length) continue;
+    return rows.slice(0, 40).map((r) => {
+      for (const t of titles) {
+        let e = null;
+        try { e = r.querySelector(t); } catch (err) { e = null; }
+        if (e) return (e.innerText || '').trim().slice(0, 30);
+      }
+      return ((r.innerText || '').trim().split(/\s+/)[0] || '').slice(0, 30);
+    });
+  }
+  return [];
+}"""
+
+
+def split_quote(quote: str) -> tuple[str, str]:
+    """被引用的那块文字 → （被引用的人，被引用的话）。“小明：今天去哪了” → （小明，今天去哪了）。"""
+    q = " ".join((quote or "").split())
+    q = re.sub(r"^(?:引用|回复)\s*", "", q)
+    m = re.match(r"^@?([^:：\s]{1,24})\s*[:：]\s*(.+)$", q)
+    return (m.group(1), m.group(2).strip()) if m else ("", q.strip())
+
+
+def quote_target(quote: str, earlier: list[dict], me_names: tuple = ()) -> str:
+    """被引用的那句是谁说的：me（她自己）/ them（对方自己之前说的）/ 空（认不出）。earlier：这条之前的消息。"""
+    who, said = split_quote(quote)
+    key = _squash(said)
+    if key:
+        for m in reversed(earlier):
+            t = _squash(m.get("text") or "")
+            if t and (key[:12] in t or (len(t) >= 4 and t in key)):
+                return "me" if m.get("from_me") else "them"
+    if who and who in me_names:
+        return "me"
+    return ""
+
+
+def quote_line(m: dict) -> str:
+    """一条对方的消息写给模型看：带引用的，标明 TA 是在针对哪句话说的。"""
+    text = m.get("text") or ""
+    q = m.get("quote") or ""
+    if not q:
+        return text
+    _who, said = split_quote(q)
+    target = {"me": "你之前说的", "them": "TA 自己之前说的"}.get(m.get("quote_of") or "", "之前的")
+    return f"[引用了{target}「{said[:60]}」，针对这句回复] {text}"
+
+
+def dm_sent_ok(text: str, latest: str) -> bool:
+    """她刚发的私信发出去了没有：最新一条是不是她这句话。
+    一条回复里有换行时，抖音会把它分成几条发出去——最新一条只是最后那一段，也算发出去了
+    （以前只拿开头几个字比，带换行的自动回复每次都被误报“没发出去”）。"""
+    a, b = _squash(text), _squash(latest)
+    if not a or not b:
+        return False
+    return a[:8] in b or b in a
+
+
+def conv_age_days(preview: str, today: date | None = None) -> int:
+    """私信会话列表里一行显示的时间（“刚刚”“10:24”“昨天”“星期二”“11-02”“2025-12-30”）离今天几天。认不出算 0。"""
+    today = today or date.today()
+    t = preview or ""
+    m = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})", t)
+    if m:
+        try:
+            return max(0, (today - date(int(m[1]), int(m[2]), int(m[3]))).days)
+        except ValueError:
+            return 0
+    m = re.search(r"(?<![\d:])(\d{1,2})[-/月](\d{1,2})日?(?![\d:])", t)
+    if m:
+        try:
+            d = date(today.year, int(m[1]), int(m[2]))
+        except ValueError:
+            return 0
+        if d > today:
+            d = date(today.year - 1, d.month, d.day)
+        return (today - d).days
+    if "前天" in t:
+        return 2
+    if "昨天" in t:
+        return 1
+    if re.search(r"星期[一二三四五六日天]|周[一二三四五六日天]", t):
+        return 6
+    return 0
+
+
 def _hid(*parts: str) -> str:
     return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()[:20]
 
 
 class Inbox:
+    my_names: tuple = ()
+    dup_names: set = set()          # 私信列表里同名的会话（分不清是谁）
+
     def __init__(self, b: DouyinBrowser):
         self.b = b
         self.sec_uids: dict[str, str] = {}  # 私信列表里的名字 -> 主页 id
         self.feed = Feed(b)
         self.last_notice: dict = {}  # 上次看“互动消息”的情况（给日志用）
+        self.last_dm_check: dict = {}  # 上次看私信的情况：看了几个会话、点开了谁、谁没回为什么（给日志用）
         self.last_reply_note = ""    # 上次回复 @ / 评论的补充说明（没找到那条评论、改成 @ 回去了……）
         self._notice_blank = False   # 面板里明确写着“没有消息”
 
@@ -294,17 +447,21 @@ class Inbox:
                 self.b.pause(0.5, 1.0)
 
     def _parse_notice(self, row, mine: list[str] | None = None) -> dict | None:
-        """读一条通知。只要两种：“提到了你 / @了你”（kind=at）和“回复了你的评论”（kind=reply）。
+        """读一条通知。只要三种：“提到了你 / @了你”（kind=at）、“回复了你的评论”（kind=reply）、
+        “评论了你的作品”（kind=work）。
 
         读出名字、评论内容、对方主页、视频 id（网页自己的数据里有就直接用）；
         回复她的评论时，再认一认回复的是她哪条评论（mine：她发过的评论）。"""
         text = self.b.text_of(row, 400)
         reply_kw = self.b.sel.get("notice_reply_keywords") or ["回复了你的评论", "回复了你"]
         at_kw = self.b.sel.get("notice_at_keywords") or ["@了你", "提到了你"]
+        work_kw = self.b.sel.get("notice_work_keywords") or ["评论了你的作品"]
         if any(k in text for k in reply_kw):
             kind = "reply"
         elif any(k in text for k in at_kw):
             kind = "at"
+        elif any(k in text for k in work_kw):
+            kind = "work"
         else:
             return None
         user = self.b.text_of(self.b.find("notice_user", timeout=500, root=row), 40).strip()
@@ -319,7 +476,7 @@ class Inbox:
         vid = pick_unique(react_values(row, ["aweme_id", "awemeId", "itemId", "item_id", "group_id"],
                                        r"^\d{15,20}$", up=1, depth=6), prefer="aweme")
         cid = pick_unique(react_values(row, ["cid", "comment_id", "commentId"], r"^\d{10,20}$", up=1, depth=6))
-        it = {"kind": kind, "ext_id": ("rp_" if kind == "reply" else "at_") + _hid(user, content), "user": user,
+        it = {"kind": kind, "ext_id": {"reply": "rp_", "work": "wk_"}.get(kind, "at_") + _hid(user, content), "user": user,
               "text": content, "user_url": user_url(href),
               "video_url": f"https://www.douyin.com/video/{vid}" if vid else "", "cid": cid, "mine": "",
               "video_gone": False}
@@ -353,10 +510,12 @@ class Inbox:
         return imgs <= 1 and svgs >= 2
 
     def fetch_mentions(self, limit: int = 10, is_known=None, kinds: tuple = ("at",), mine=None,
-                       resolve_video: bool = True) -> list[dict]:
-        """读“互动消息”里 @ 她的评论（kind=at）、回复她评论的（kind=reply）。
+                       resolve_video: bool = True, deep: bool = False, max_rows: int = 160) -> list[dict]:
+        """读“互动消息”里 @ 她的评论（kind=at）、回复她评论的（kind=reply）、评论她作品的（kind=work）。
 
-        is_known(ext_id) 为 True 的（已经处理过的）跳过；mine 是她发过的评论（认出别人回复的是哪条）。"""
+        is_known(ext_id) 为 True 的（已经处理过的）跳过；mine 是她发过的评论（认出别人回复的是哪条）。
+        deep：一边往下翻一边读（刚启动、活跃时段刚开始时，把之前攒下的都读出来）；连着翻到一批全是处理过的、
+        翻不出新的了、或者读够 max_rows 条就停。返回的按时间从新到旧。"""
         self.last_notice = {"opened": False}
         if not self.open_notice_panel():
             return []
@@ -365,16 +524,33 @@ class Inbox:
         rows = self._notice_rows()
         if not rows and not self._notice_blank:
             self._dump_once("notice_rows_empty", "通知面板打开了，但等了几秒也没读到一条通知")
-        counts = {"at": 0, "reply": 0}
-        for row in rows:
-            it = self._parse_notice(row, mine)
-            if it:
+        counts = {"at": 0, "reply": 0, "work": 0}
+        read_rows, row_keys = 0, set()
+        known_run = 0                       # 连着几条都是处理过的
+        while rows:
+            fresh = 0
+            for row in rows:
+                key = _squash(self.b.text_of(row, 200))
+                if not key or key in row_keys:
+                    continue
+                row_keys.add(key)
+                fresh += 1
+                read_rows += 1
+                it = self._parse_notice(row, mine)
+                if not it:
+                    continue
                 counts[it["kind"]] = counts.get(it["kind"], 0) + 1
-            if it and it["kind"] in kinds and it["ext_id"] not in seen:
-                seen.add(it["ext_id"])
-                items.append(it)
-        # 给日志用：面板打开了没有、读到几条通知、其中几条是 @ / 回复她的
-        self.last_notice = {"opened": True, "rows": len(rows), **counts}
+                if it["kind"] in kinds and it["ext_id"] not in seen:
+                    seen.add(it["ext_id"])
+                    items.append(it)
+                    known_run = known_run + 1 if (is_known and is_known(it["ext_id"])) else 0
+            if not deep or not fresh or read_rows >= max_rows or known_run >= self.KNOWN_RUN_STOP:
+                break
+            if not self._scroll_notice(rows[-1]):
+                break
+            rows = self.b.find_all("notice_item")
+        # 给日志用：面板打开了没有、读到几条通知、其中几条是 @ / 回复她的 / 评论她作品的
+        self.last_notice = {"opened": True, "rows": read_rows, **counts}
         out = []
         for it in items:
             if len(out) >= limit:
@@ -388,6 +564,19 @@ class Inbox:
             out.append(it)
         self.close_notice_panel()
         return out
+
+    KNOWN_RUN_STOP = 8   # 往下翻通知：连着这么多条都处理过了，再往下就是更早以前的，不用翻了
+
+    def _scroll_notice(self, last_row) -> bool:
+        """把通知面板往下翻一屏，等新的通知加载出来。翻不动了（到底了）返回 False。"""
+        try:
+            moved = last_row.evaluate(NOTICE_SCROLL_JS)
+        except Exception:  # noqa: BLE001
+            return False
+        if not moved:
+            return False
+        cancel.sleep(1.0)
+        return True
 
     def _notice_video_by_click(self, it: dict) -> str:
         """通知里没有视频链接：点一下这条通知的视频缩略图，看打开的是哪个视频。"""
@@ -415,7 +604,7 @@ class Inbox:
             return self.feed.read_detail(with_comments=with_comments)
         raise FeedReadError("不知道对方是在哪个视频下找她的（没有视频链接），这次没法回复")
 
-    def reply_mention(self, item: dict, text: str) -> bool:
+    def reply_mention(self, item: dict, text: str, mentions=None) -> bool:
         """在视频评论区找到对方那条评论（优先按评论 id，其次按内容 + 名字），点“回复”后发送。
 
         找的顺序（每一步都记日志）：① 已经加载出来的评论里直接找；② 知道楼主是哪条评论（互动消息里带的，
@@ -425,14 +614,30 @@ class Inbox:
         ⑥ 一边往下翻、一边把折叠着的回复一串串展开找（回复她的至少在 2 条回复以上的串里）。
 
         都找不到：是 @ 她的，就在评论区发一条 @ 对方的评论把话带到（对方一样会收到提醒）；
-        是回复她评论的，不发，原因记在 last_reply_note。"""
+        是回复她评论的，不发，原因记在 last_reply_note。
+        mentions：回复里还要 @ 的人（主人在评论区让她“@ 一下谁”）。
+
+        评论区打不开（2026-11-20 实测：直接打开视频页，等了一分多钟评论区也没出来）：先重新打开这个视频再试一次，
+        还不行就从“互动消息”里点这条通知进去（抖音自己打开视频、把这条评论放在最前面），都不行才算失败。"""
         self.last_reply_note = ""
         if not item.get("video_url"):
             return False  # 不知道是哪个视频，不能乱发
-        if not self.feed.open_comments():
-            self.last_reply_note = "那个视频的评论区没打开"
-            return False
         who = item.get("user") or "对方"
+        extra = [m for m in (mentions or []) if m] if isinstance(mentions, list) else []
+        if not self.feed.open_comments():
+            log.info("回复 %s：评论区没打开，重新打开这个视频再试一次", who)
+            try:
+                self.b.goto(item["video_url"])
+                self.b.wait_any("detail_container", timeout=30)
+            except Exception:  # noqa: BLE001
+                log.warning("重新打开视频失败", exc_info=True)
+            if not self.feed.open_comments():
+                log.info("回复 %s：评论区还是没打开，改从“互动消息”里点这条通知进去", who)
+                res = self._reply_via_notice(item, text, extra)
+                if res is not None:
+                    return res
+                self.last_reply_note = "那个视频的评论区没打开（重新打开视频、从通知点进去都试过了）"
+                return False
         is_reply = item.get("kind") == "reply"
         mine = item.get("mine") or ""
         target = self._find_comment(item, deep=False)
@@ -442,7 +647,7 @@ class Inbox:
             target = self._find_in_thread(item, item.get("root_cid") or "", item.get("root_text") or "",
                                           item.get("root_user") or "")
         if target is None:
-            res = self._reply_via_notice(item, text)
+            res = self._reply_via_notice(item, text, extra)
             if res is not None:
                 return res                      # 从通知点进去找到了，已经回复过（发出去了 / 没发出去 / 不确定）
             if not self.feed.open_comments():   # 点通知的时候评论区可能被收起来了
@@ -473,20 +678,21 @@ class Inbox:
                             f"在视频评论区里没找到 {who} 那条评论")
             self.feed.close_comments()
             if not is_reply and item.get("user"):
-                return self._at_back(item, text)
+                return self._at_back(item, text, extra)
             self.last_reply_note = "在评论区里没找到对方那条回复（可能排得太靠后、被折叠了，或者已经删除）"
             return False
         log.info("找 %s 的评论：在%s找到了", who, step)
-        ok = self.feed.reply_on_item(target, text, (item.get("text") or "")[:12], item.get("user") or "")
+        ok = self.feed.reply_on_item(target, text, (item.get("text") or "")[:12], item.get("user") or "",
+                                     **({"mentions": extra} if extra else {}))
         self.feed.close_comments()
         return ok
 
-    def _at_back(self, item: dict, text: str):
+    def _at_back(self, item: dict, text: str, mentions=None):
         """对方 @ 了她，但在评论区里找不到那条评论（评论太多）：发一条 @ 对方的评论把话带到。
         @ 不上（候选里没有这个人）就不发——不带 @ 的话对方收不到提醒，等于自说自话。"""
         who = item["user"]
         log.info("找不到 %s @ 她的那条评论，改成在评论区发一条 @%s 的评论回复", who, who)
-        res = self.feed.comment(text, mention=who, require_mention=True)
+        res = self.feed.comment(text, mention=[who] + list(mentions) if mentions else who, require_mention=True)
         if res:
             self.last_reply_note = f"没找到对方那条评论，改成在评论区 @{who} 回复的"
         elif not getattr(res, "uncertain", False):
@@ -505,7 +711,7 @@ class Inbox:
                 return row
         return None
 
-    def _reply_via_notice(self, item: dict, text: str):
+    def _reply_via_notice(self, item: dict, text: str, mentions=None):
         """像人一样回复：点“互动消息”里的这条通知，抖音自己打开那个视频，并把这条评论放在评论区最前面，
         在那儿点“回复”。
 
@@ -557,12 +763,18 @@ class Inbox:
             if self.feed.open_comments():
                 self.b.pause(0.8, 1.5)
                 target = self._find_comment(item, deep=False)
+                if target is None:
+                    # 抖音把这条回复所在的那一串放在最前面，有时回复是折叠着的：展开最前面那串再找
+                    top = self.b.find("comment_item", timeout=1500)
+                    if top is not None:
+                        target = self._expand_until(top, item, max_clicks=4)
             log.info("从通知点进去找 %s 的评论：%s（%s），%s", who, how, str(self.b.page.url)[:90],
                      "找到了" if target is not None else "评论区最前面没有这条评论")
             if target is None:
                 self._dump_once("notice_open_no_comment", f"从通知点进去以后没看到 {who} 那条评论")
                 return None
-            res = self.feed.reply_on_item(target, text, (item.get("text") or "")[:12], item.get("user") or "")
+            res = self.feed.reply_on_item(target, text, (item.get("text") or "")[:12], item.get("user") or "",
+                                          **({"mentions": list(mentions)} if mentions else {}))
             self.feed.close_comments()
             return res
         finally:
@@ -788,26 +1000,48 @@ class Inbox:
         return False
 
     def _match_comment(self, items: list, item: dict):
+        """在 items 里认出对方那条评论：正文对得上、作者对得上。
+
+        名字比较忽略 emoji 和标点（网页上名字里的 emoji 是图片，读不出来）；
+        对方只发了一张图 / 表情包的（通知里写“[图片]”）：找这个人只有图、没有字的那条，
+        有好几条时挑回复她的那条（“对方 ▸ 她”）。"""
         text = item.get("text") or ""
         core = _squash(re.sub(r"@\S+", " ", text))[:10] or _squash(text)[:10]
-        user = _squash(item.get("user") or "")
+        user = item.get("user") or ""
         if not core:
             return None
+        media = media_only(text)
+        me = getattr(self.b, "me_uid", "") or ""
+        first = None
         for c in items:
             # 只看这条评论自己的正文和作者（表情换成文字；不把展开的楼中楼里别人的话算进来）
             own = self.feed.comment_text(c) if hasattr(self.feed, "comment_text") else ""
             if not isinstance(own, str) or not own:
-                t = _squash(self.b.text_of(c, 400))
-                if core in t and (not user or user in t):
+                if media:
+                    continue                    # 只有图的那条：读不出正文就认不了
+                t = self.b.text_of(c, 400)
+                if core in _squash(t) and (not user or _name_in(user, t)):
                     return c
                 continue
-            if core not in _squash(re.sub(r"@\S+", " ", own)) and core not in _squash(own):
+            if media:
+                if not media_only(own):
+                    continue
+            elif core not in _squash(re.sub(r"@\S+", " ", own)) and core not in _squash(own):
                 continue
-            author = self.feed.comment_author(c) if hasattr(self.feed, "comment_author") else ""
-            if user and isinstance(author, str) and author and user not in _squash(author):
+            people = self.feed.comment_people(c) if hasattr(self.feed, "comment_people") else None
+            if isinstance(people, list):
+                author = str(people[0].get("name") or "") if people else ""
+            else:
+                author = self.feed.comment_author(c) if hasattr(self.feed, "comment_author") else ""
+            if user and isinstance(author, str) and author and not same_person(user, author):
                 continue
-            return c
-        return None
+            if not media:
+                return c
+            # 只有图的：同一个人可能发过好几张，回复她的那张最可能是
+            if me and isinstance(people, list) and any(me in str(p.get("href") or "") for p in people[1:]):
+                return c
+            first = first if first is not None else c
+        return first
 
     def _load_more_comments(self, items: list) -> None:
         """往下滚评论区，让网页加载下一批评论；有“加载更多 / 展开更多”按钮也点一下。"""
@@ -969,16 +1203,101 @@ class Inbox:
             except Exception:  # noqa: BLE001
                 from_me = False
             kind, url = self._classify(m, text)
+            quote = ""
+            if kind == "text":
+                text, quote = self._quote_of(m, text)
             if kind == "text" and not text:
                 continue
-            out.append({"from_me": from_me, "kind": kind, "text": text if kind != "unsupported" else "",
-                        "url": url, "el": m})
+            if kind == "text" and any(t and t in text for t in as_list(self.b.sel.get("dm_system_texts"))):
+                continue          # 抖音自己发的提示（“我们已互相关注，可以开始聊天了”），不是对方说的话
+            item = {"from_me": from_me, "kind": kind, "text": text if kind != "unsupported" else "",
+                    "url": url, "el": m}
+            if quote:
+                # 引用的是哪一句：在这条之前的消息里找（她说的 / 对方自己说的）
+                item["quote"] = quote
+                item["quote_of"] = quote_target(quote, out, self._my_names())
+            out.append(item)
         return out
+
+    def _quote_of(self, m, text: str) -> tuple[str, str]:
+        """这条消息里有没有“引用”：返回（去掉引用部分的正文，被引用的那块文字）。"""
+        found = []
+        try:
+            found = [q for q in (m.evaluate(QUOTE_FIND_JS) or []) if isinstance(q, str) and q.strip()]
+        except Exception:  # noqa: BLE001
+            found = []
+        if found:
+            q = " ".join(found[0].split())
+            body = text.replace(q, " ").strip() if q in text else text
+            if body == text and len(found) > 1:
+                body = text.replace(" ".join(found[1].split()), " ").strip()
+            self._dump_once("dm_quote", "私信里第一次遇到“引用回复”")
+            return " ".join(body.split()), q[:200]
+        # 没找到引用块：看原始文字是不是分了行、有一行是“引用 xx：……”（网页版有的写法）
+        if text.startswith(("引用", "回复")) or " 引用" in text:
+            try:
+                raw = [x.strip() for x in (m.inner_text(timeout=1500) or "").splitlines() if x.strip()]
+            except Exception:  # noqa: BLE001
+                raw = []
+            if len(raw) >= 2:
+                qi = next((i for i, x in enumerate(raw) if QUOTE_TEXT.match(x) and x.startswith(("引用", "回复"))), -1)
+                if qi >= 0:
+                    body = " ".join(raw[:qi] + raw[qi + 1:])
+                    self._dump_once("dm_quote", "私信里第一次遇到“引用回复”")
+                    return body, raw[qi][:200]
+            # 看着像引用、却没认出引用的是哪句：存一份页面，方便校准
+            self._dump_once("dm_quote_miss", "私信里有一条像“引用回复”的消息，但没认出引用的是哪句")
+        return text, ""
+
+    def _my_names(self) -> tuple:
+        names = getattr(self, "my_names", ())        # runner 会把她的名字（人设名、抖音昵称）告诉这里
+        return tuple(x for x in names if x)
+
+    def _image_of(self, m) -> str:
+        """这条消息是表情包 / 图片的话，返回图片地址；不是返回空。"""
+        for s in as_list(self.b.sel.get("dm_image_bubble")):
+            try:
+                box = m.locator(s).first
+                if box.count() == 0:
+                    continue
+                src = box.evaluate("el => { const i = el.tagName === 'IMG' ? el : el.querySelector('img');"
+                                   " return i ? (i.currentSrc || i.src || '') : ''; }")
+                return str(src or "") or "about:blank"
+            except Exception:  # noqa: BLE001
+                continue
+        return ""
+
+    def fetch_image(self, url: str, size: int = 640) -> bytes | None:
+        """把一张图片（表情包、评论里的图）下载下来，转成模型能看的 JPG。下载不了 / 认不出格式返回 None。
+        动图只取第一帧。"""
+        import io
+        if not url or not url.startswith("http"):
+            return None
+        try:
+            from PIL import Image
+            r = self.b.ctx.request.get(url, timeout=15000)
+            if r.status != 200:
+                return None
+            im = Image.open(io.BytesIO(r.body()))
+            im.seek(0)
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[3])
+            bg.thumbnail((size, size))
+            out = io.BytesIO()
+            bg.save(out, "JPEG", quality=88)
+            return out.getvalue()
+        except Exception as e:  # noqa: BLE001
+            log.info("图片没下载下来 / 打不开：%s", str(e).splitlines()[0][:100])
+            return None
 
     def _classify(self, m, text: str) -> tuple[str, str]:
         """判断一条消息是文字、分享的视频，还是网页版显示不了的内容。"""
         if self.b.sel.get("dm_unsupported_text", "暂不支持该消息类型") in text:
             return "unsupported", ""
+        img = self._image_of(m)
+        if img:
+            return "image", img            # 对方发的表情包 / 图片（以前被当成分享卡片去点，点不出视频）
         url = self._share_link(m)
         if url:
             return "share", url
@@ -1219,29 +1538,57 @@ class Inbox:
                 continue
         return False
 
-    def fetch_unread_dms(self, limit: int = 10, need_profile=None, only=None, skip=None) -> list[dict]:
+    def fetch_unread_dms(self, limit: int = 10, need_profile=None, only=None, skip=None, scan_all: bool = False,
+                         is_done=None, max_age_days: int = 30, watch=None) -> list[dict]:
         """need_profile(user) 返回 True 时，顺便去对方主页读资料（昵称、抖音号、头像、有没有关注她）。
 
-        only：只看这些人的未读（主人；别人的会话不点开，未读留着）。skip：这些人的未读不点开。"""
+        only：只看这些人的未读（主人；别人的会话不点开，未读留着）。skip：这些人的未读不点开。
+        scan_all：不光看有未读红点的会话——刚启动 / 活跃时段刚开始时，把会话列表里“对方说了话、她还没回”的
+        都找出来（消息在手机上看过、或者她上次回到一半被打断了，红点就没了，但还没回）。
+        is_done(user, 会话预览文字) 为 True 的会话不用点开（记录里她已经回过最后一句了）；
+        max_age_days 天以前的旧会话不翻。
+        watch：这些人的会话就算没有未读红点也看一眼（主人、刚聊过的人）——聊天窗口开着的时候 TA 发来的消息，
+        抖音网页直接算“已读”、不出红点；你在手机上看过她的私信，红点也没了。以前只认红点，这种消息要等到
+        下次刚启动 / 活跃时段开始时才发现，对方那边显示“已读”却一直没回音。
+        这一轮看了哪些会话、为什么没回，记在 self.last_dm_check 里（软件会写进日志）。"""
+        self.last_dm_check = {"opened": False, "convs": 0, "unread": [], "watched": [], "skipped": []}
         if not self.open_dm_panel() or not self._back_to_list():
             return []
-        users, avatars = [], {}
-        for conv in self.b.find_all("dm_conversation_item")[:20]:
-            if self._has_unread(conv):
-                u = self._conv_user(conv)
-                if (only is not None and u not in only) or (skip and u in skip):
+        stats = self.last_dm_check
+        stats["opened"] = True
+        users, avatars, had_unread = [], {}, set()
+        names = self.conv_names()           # 同名的两个会话分不清是谁（主人的命令要认准人）
+        self.dup_names = {n for n in names if n and names.count(n) > 1}
+        convs = self.b.find_all("dm_conversation_item")[:40 if scan_all else 20]
+        stats["convs"] = len(convs)
+        for conv in convs:
+            unread = self._has_unread(conv)
+            u = self._conv_user(conv) if (unread or scan_all or watch) else ""
+            if not unread and not scan_all and not (watch and u in watch):
+                continue
+            if not u or u in users or (only is not None and u not in only) or (skip and u in skip):
+                continue
+            if not unread:
+                preview = self.b.text_of(conv, 200)
+                if conv_age_days(preview) > max_age_days or (is_done and is_done(u, preview)):
                     continue
-                if u and u not in users:
-                    users.append(u)
-                    avatars[u] = self._conv_avatar(conv)
-                    # 会话这一行背后的数据里有对方的主页 id；同一行里出现两个不同的 id（比如群聊）就不认
-                    sec = pick_unique(react_values(conv, ["secUid", "sec_uid"], SEC_UID_RE, up=2))
-                    if sec:
-                        self.sec_uids[u] = sec
+                if not scan_all:
+                    stats["watched"].append(u)       # 没有红点，但列表上最后一句不是她回的那句：点开看看
+            else:
+                had_unread.add(u)
+                stats["unread"].append(u)
+            users.append(u)
+            avatars[u] = self._conv_avatar(conv)
+            # 会话这一行背后的数据里有对方的主页 id；同一行里出现两个不同的 id（比如群聊）就不认
+            sec = pick_unique(react_values(conv, ["secUid", "sec_uid"], SEC_UID_RE, up=2))
+            if sec:
+                self.sec_uids[u] = sec
         out = []
         for user in users[:limit]:
             if not self._open_conv(user):
+                stats["skipped"].append((user, "点不开这个会话"))
                 continue
+            peer = self.peer_uid(user)            # 聊天对方的主页 id：认主人时用（同名的人冒充不了）
             profile = {"avatar": avatars.get(user, "")}  # 私信列表里的头像，一定是这个人的
             known = self.b.known_user(user)
             if known:
@@ -1259,15 +1606,26 @@ class Inbox:
                         log.warning("读 %s 的主页失败：%s", user, str(e).splitlines()[0][:120])
                 else:
                     self._dump_once("dm_profile_unknown", f"找不到 {user} 的主页入口")
-            msgs = self._read_chat(15)
-            if not msgs or msgs[-1]["from_me"]:
-                continue  # 最后一条是她自己发的，不用再回
+            msgs = self._read_chat(24)          # 多读几条：回复要接得上前面聊的
+            if not msgs:
+                stats["skipped"].append((user, "点开了，但一条消息都没读出来"))
+                if user in had_unread:
+                    self._dump_once("dm_unread_unreadable", f"{user} 的会话有未读红点，点开后一条消息都没读出来")
+                continue
+            if msgs[-1]["from_me"]:
+                # 最后一条是她自己发的，不用再回。可这个会话明明有未读红点：多半是对方最后那条没认对
+                # （引用回复、撤回、新样式的消息……），存一次页面方便校准，免得对方那边显示已读、一直等不到回音
+                stats["skipped"].append((user, f"最后一条是她自己发的（“{(msgs[-1]['text'] or msgs[-1]['kind'])[:20]}”）"))
+                if user in had_unread:
+                    self._dump_once("dm_unread_but_mine",
+                                    f"{user} 的会话有未读红点，但读出来最后一条是她自己发的——对方最后那条可能没认出来")
+                continue
             theirs = []  # 对方在她上次说话之后连着发的几条
             for m in reversed(msgs):
                 if m["from_me"]:
                     break
                 theirs.insert(0, m)
-            shares, lines = [], []
+            shares, lines, images = [], [], []
             asked = " ".join(m["text"] for m in theirs if m["kind"] == "text")
             # 只看对方这次新发来的消息里的视频卡片，多张时只用最新的一张；以前发过的卡片不再翻出来
             newest = next((m for m in reversed(theirs) if m["kind"] == "share"), None)
@@ -1277,7 +1635,10 @@ class Inbox:
                     lines.append("[还分享了另一个视频，这次只看最新的那个]")
                     continue
                 if m["kind"] == "text":
-                    lines.append(m["text"])
+                    lines.append(quote_line(m))
+                elif m["kind"] == "image":
+                    images.append(m["url"])
+                    lines.append(IMAGE_LINE)
                 elif m["kind"] == "share":
                     url = m["url"] or self._share_link_by_click(m["el"])
                     label = "分享了一个视频"
@@ -1291,17 +1652,111 @@ class Inbox:
                     self._dump_unknown_once("对方发了一条网页版显示不了的消息")
                     lines.append("[发了一条网页版显示不了的内容，可能是表情包、图片或直播分享]")
             if not lines:
+                stats["skipped"].append((user, "TA 发的内容一条都没读出来"))
                 continue
             text = "\n".join(lines)[-400:]
             # 这批消息的“身份证”里带上她上一句说的话：对方隔一会儿又说了一遍同样的话（“在吗”“哈哈”），
             # 中间她回过话了，就是新的一批——以前只按“谁 + 说了什么 + 哪天”认，同一天说第二遍会被当成处理过、不回
             prev = next((m["text"] for m in reversed(msgs) if m["from_me"]), "")
+            label = {"image": IMAGE_LINE, "share": "[分享了一个视频]"}
+            before = [{"role": "me" if m["from_me"] else "them",
+                       "content": (quote_line(m) if m.get("quote") else m["text"]) or label.get(m["kind"], "")}
+                      for m in msgs[:len(msgs) - len(theirs)]]
             out.append({"ext_id": "dm_" + _hid(user, prev[:60], text, today_str()), "user": user, "text": text,
-                        "lines": lines[-12:],
-                        "shares": shares[:1], "need_share": need_share, "profile": profile,
+                        "lines": lines[-12:], "images": [u for u in images if u.startswith("http")][-2:],
+                        "shares": shares[:1], "need_share": need_share, "profile": profile, "before": before,
+                        "peer_uid": peer, "name_dup": user in self.dup_names,
                         "recent": [("我：" if m["from_me"] else "对方：") + (m["text"] or f"[{m['kind']}]") for m in msgs]})
         self._back_to_list()
         return out
+
+    def peer_uid(self, user: str = "") -> str:
+        """当前打开的聊天对方的主页 id（sec_uid）：聊天顶部背后的数据 → 会话列表那一行背后的数据 →
+        抖音私信接口里加载过的资料。都读不到返回空。"""
+        sec = ""
+        try:
+            sec = self._sec_uid_from_header()
+        except Exception:  # noqa: BLE001
+            sec = ""
+        if not sec and user:
+            sec = self.sec_uids.get(user, "")
+        if not sec and user:
+            info = self.b.known_user(user)
+            if info and info.get("from_im"):
+                sec = info.get("sec_uid") or ""
+        return sec if isinstance(sec, str) else ""
+
+    def conv_names(self) -> list[str]:
+        """私信会话列表里每一行的名字（按顺序，一次读完，不一行行去找）。"""
+        try:
+            items = [x.replace(":visible", "") for x in as_list(self.b.sel.get("dm_conversation_item"))]
+            titles = [x.replace(":visible", "") for x in as_list(self.b.sel.get("dm_conv_title"))]
+            got = self.b.page.evaluate(CONV_NAMES_JS, [items, titles])
+        except Exception:  # noqa: BLE001
+            return []
+        return [str(x) for x in got if isinstance(x, str)] if isinstance(got, list) else []
+
+    def _conv_matches(self, user: str) -> list:
+        try:
+            return [c for c in self.b.find_all("dm_conversation_item")[:40] if self._conv_user(c) == user]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def open_chat_with(self, user: str, sec_uid: str = "") -> str:
+        """打开和 user 的聊天，准备发消息（主人让她私信别人时用）。返回空字符串表示打开了，否则是原因。
+
+        和 douyin-dm-mcp 一样先认准人：私信列表里有这个名字、而且只有一个，就点开它，再核对聊天顶上的名字
+        （知道主页 id 时也核对 id）；列表里没有、知道 TA 的主页 id（互关好友），就去 TA 的主页点“私信”。"""
+        if not self.open_dm_panel():
+            return "私信面板打不开"
+        if self._chat_title() == user and (not sec_uid or self.peer_uid(user) in ("", sec_uid)):
+            return ""
+        if self._back_to_list():
+            rows = self._conv_matches(user)
+            if len(rows) > 1:
+                return f"私信列表里有 {len(rows)} 个叫“{user}”的人，分不清是哪一个"
+            if rows and self.b.safe_click(rows[0], f"和 {user} 的会话"):
+                self.b.pause(1.0, 1.8)
+                if self.b.find("dm_input", timeout=4000) is not None and self._chat_title() == user:
+                    got = self.peer_uid(user)
+                    if sec_uid and got and got != sec_uid:
+                        return f"私信列表里的“{user}”和互关好友里的不是同一个人"
+                    return ""
+        if not sec_uid:
+            return f"私信列表里没有“{user}”，也不知道 TA 的主页（不是互关好友）"
+        return self._chat_from_profile(user, sec_uid)
+
+    def _chat_from_profile(self, user: str, sec_uid: str) -> str:
+        """去 TA 的主页点“私信”，在弹出的聊天里发消息。"""
+        self.close_dm_panel()
+        self.b.goto(f"https://www.douyin.com/user/{sec_uid}")
+        btn = self.b.find("profile_dm_button", timeout=8000)
+        if btn is None or not self.b.safe_click(btn, f"{user} 主页上的“私信”"):
+            self._dump_once("profile_dm_missing", f"{user} 的主页上没找到“私信”按钮")
+            return f"{user} 的主页上没找到“私信”按钮"
+        self.b.pause(1.5, 2.5)
+        self.b.check_captcha()
+        if self.b.find("dm_input", timeout=8000) is None:
+            self._dump_once("profile_dm_no_chat", f"点了 {user} 主页上的“私信”，没看到聊天窗口")
+            return "点了 TA 主页上的“私信”，没看到聊天窗口"
+        title = self._chat_title()
+        if title and title != user:
+            return f"打开的聊天是“{title}”，不是“{user}”"
+        return ""
+
+    def send_text(self, user: str, text: str) -> bool:
+        """在已经打开的和 user 的聊天里发一句话（open_chat_with 之后用），发完核对。"""
+        box = self.b.find("dm_input", timeout=4000)
+        if box is None or not self.b.safe_click(box, "私信输入框"):
+            return False
+        self.b.pause(0.4, 0.9)
+        self.b.type_slowly(text)
+        self.b.pause(0.5, 1.0)
+        self.b.page.keyboard.press("Enter")
+        self.b.pause(1.2, 2.0)
+        self.b.check_captcha()
+        msgs = self._read_chat(3)
+        return not msgs or (msgs[-1]["from_me"] and dm_sent_ok(text, msgs[-1]["text"]))
 
     def reply_dm(self, item: dict, text: str) -> bool:
         self.last_reply_note = ""
@@ -1320,10 +1775,19 @@ class Inbox:
         self.b.check_captcha()
         # 确认真的发出去了：最新一条应该是她自己发的这句
         msgs = self._read_chat(3)
-        if msgs and not (msgs[-1]["from_me"] and text[:8] in msgs[-1]["text"]):
+        if msgs and not (msgs[-1]["from_me"] and dm_sent_ok(text, msgs[-1]["text"])):
             log.warning("私信好像没发出去（最新一条：%s）", msgs[-1]["text"][:30])
             return False
         return True
+
+    def has_my_share(self, user: str, n: int = 2) -> bool:
+        """和 user 的聊天里，最近几条有没有她发的视频卡片（分享视频以后核对用）。"""
+        try:
+            if self._chat_title() != user and not self._open_conv(user):
+                return False
+            return any(m["from_me"] and m["kind"] == "share" for m in self._read_chat(n))
+        except Exception:  # noqa: BLE001
+            return False
 
     def dm_missed(self, user: str, answered: list, reply: str) -> list[str]:
         """她刚回完 user 的私信：看看有没有哪几句对方的话她还没回应到。返回这些话（按时间顺序）。
@@ -1341,14 +1805,20 @@ class Inbox:
         mine = [i for i, m in enumerate(msgs) if m["from_me"]]
         if not mine:
             return []
-        key = _squash(reply)[:10]
+        # 她的回复可能拆成了好几条分开发：用最后一条认（最新的那条一定是她刚发的）
+        parts = [x for x in str(reply or "").split("\n") if _squash(x)]
+        key = _squash(parts[-1] if parts else reply)[:10]
         sent = next((i for i in reversed(mine) if key and key in _squash(msgs[i]["text"])), None)
         if sent is None:
             return []                          # 没认出她刚发的那句：不乱猜
-        start = sent
+        first = sent
+        while first > 0 and msgs[first - 1]["from_me"]:
+            first -= 1                         # 她连着发的那几条的第一条
+        start = first
         while start > 0 and not msgs[start - 1]["from_me"]:
             start -= 1                         # 她的回复前面、连着的对方的话
-        before = [m["text"] for m in msgs[start:sent] if m["kind"] == "text" and m["text"]]
+        said = lambda m: IMAGE_LINE if m["kind"] == "image" else (m["text"] if m["kind"] == "text" else "")  # noqa: E731
+        before = [said(m) for m in msgs[start:first] if said(m)]
         left = [_squash(a) for a in (answered or [])]
         missed = []
         for t in before:
@@ -1356,7 +1826,9 @@ class Inbox:
                 left.remove(_squash(t))            # 这句这次回应过了
             else:
                 missed.append(t)
-        after = [m["text"] for m in msgs[sent + 1:] if not m["from_me"] and m["kind"] == "text" and m["text"]]
+        after = [said(m) for m in msgs[sent + 1:] if not m["from_me"] and said(m)]
+        self.missed_images = [m["url"] for m in msgs[start:] if not m["from_me"] and m["kind"] == "image"
+                              and str(m["url"]).startswith("http")][-2:]
         return (missed + after)[-8:]
 
     def thread_context(self, item: dict, limit: int = 10) -> list[dict]:
@@ -1374,8 +1846,9 @@ class Inbox:
             rows = target.evaluate(THREAD_ROWS_JS, as_list(self.b.sel.get("comment_item"))[0])
         except Exception:  # noqa: BLE001
             return []
-        out = [{"user": str(r.get("user") or "")[:30], "text": str(r.get("text") or "")[:160]}
-               for r in (rows or []) if isinstance(r, dict) and r.get("text")]
+        out = [{"user": str(r.get("user") or "")[:30], "text": str(r.get("text") or "")[:160] or ("[图片]" if r.get("img") else ""),
+                "img": str(r.get("img") or ""), "target": bool(r.get("target"))}
+               for r in (rows or []) if isinstance(r, dict) and (r.get("text") or r.get("img"))]
         return out[:1] + out[1:][-(limit - 1):] if len(out) > limit else out
 
     def send_dm_file(self, user: str, path) -> bool:

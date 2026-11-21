@@ -9,3 +9,5 @@ onnxruntime>=1.17
 faster-whisper>=1.0
 # 给作品配音时把“声音 + 文字卡片”合成视频（自带 ffmpeg 程序，不用另外安装）
 imageio-ffmpeg>=0.5
+# “其他功能”：下载无水印视频、导出视频文案（YouTube、B 站、TikTok 等上千个网站）；[default] 带上解 YouTube 签名要用的 yt-dlp-ejs
+yt-dlp[default]>=2025.11.12

@@ -17,6 +17,7 @@ from datetime import datetime
 
 from .. import APP_NAME, cancel, crypto, winfocus
 from ..cancel import OperationCancelled  # noqa: F401 —— 方便别处 from browser import
+from ..names import name_key, same_person  # noqa: F401 —— 别处 from browser import
 from ..paths import DEBUG_DIR, PROFILE_DIR, SESSION_FILE
 from .selectors import as_list, load_selectors
 
@@ -46,6 +47,21 @@ class CaptchaDetected(BaseException):
     故意不继承 Exception：代码里各处“某一步失败就跳过”的 except Exception 不会把它吞掉，
     它会一路传到后台调度那里，暂停并提醒你手动完成验证（软件不会尝试自动过验证码）。
     """
+
+
+# 抖音风控时整页换成的“验证码中间页”（2026-11-20 实测：替主人搜视频时搜索页变成了它，
+# 标题就是这几个字，验证框是后加载出来的 iframe，刚打开时还看不到）
+MIDDLE_PAGE_TITLE = "验证码中间页"
+
+# 只有图片 / 表情包、没有字的评论，在通知和接口里写成这些
+MEDIA_WORDS = ("图片", "表情", "动画表情", "表情包", "动图", "贴纸", "图片评论", "GIF", "gif")
+_MEDIA_TOKEN = re.compile(r"\[(?:%s)\]" % "|".join(MEDIA_WORDS))
+
+
+def media_only(text: str) -> bool:
+    """这条评论是不是只有图片 / 表情包（“[图片]”“[表情]”这种），一个字都没有。"""
+    t = re.sub(r"\s+", "", re.sub(r"@\S+", " ", text or ""))
+    return bool(t) and bool(_MEDIA_TOKEN.search(t)) and not _MEDIA_TOKEN.sub("", t)
 
 
 # 平时把浏览器窗口放在所有显示器外面：照常播放、截图，但你看不到它，也不会挡住你用电脑。
@@ -120,6 +136,13 @@ class DouyinBrowser:
         self.following: dict[str, dict] = {}   # 打开自己的“关注”列表时读到的人：主页 id -> 资料（含是否互关）
         self.me_uid = ""                         # 她自己账号的主页 id（读互关好友时排除自己）
         self.media: dict[str, list] = {}         # 视频 id -> 抖音网页自己加载的播放地址（听视频声音时用）
+        self.aweme_details: dict[str, dict] = {}  # 视频 id -> 打开作品页时网页自己加载的完整作品数据（下载视频用）
+        self.search_items: list[dict] = []       # 打开搜索页时网页自己加载的搜索结果（主人让她搜视频时用）
+        self.my_works: list[dict] = []           # 打开自己主页时网页自己加载的“我的作品”和点赞、评论数
+        self.my_works_on = False                 # 只在看自己主页的时候收（看别人主页时那是别人的作品）
+        # 新标签页里弹了验证时调用（软件设好）：就在那个标签页里等你验证完，返回验证完没有。
+        # 不设的话标签页一关，验证框跟着没了，软件会以为你已经验证完
+        self.on_tab_verify = None
         self._emu: dict = {}                     # 被系统缩小窗口时，给页面固定大小用的调试会话（标签页 -> 会话）
         self._hide_checked = 0.0
 
@@ -159,6 +182,12 @@ class DouyinBrowser:
         from playwright.sync_api import sync_playwright  # 延迟导入，方便没装 Playwright 时也能跑测试
 
         prev_focus = winfocus.foreground()
+        try:
+            # 浏览器没在运行的时候清一下太大的缓存（只删缓存，登录状态不受影响；见 storage.py）
+            from ..storage import Keeper
+            Keeper.clean_browser_cache(PROFILE_DIR)
+        except Exception:  # noqa: BLE001
+            log.warning("清理浏览器缓存失败", exc_info=True)
         self._pw = sync_playwright().start()
         last_err = None
         off = offscreen_bounds()
@@ -394,6 +423,17 @@ class DouyinBrowser:
             return True
         return False
 
+    def notice_signal(self) -> bool:
+        """自上次查看以来，“通知”的未读数有没有增加：有人 @ 她、回复她的评论、评论她的作品了。"""
+        try:
+            seq = int(self.page.evaluate("() => (window.__aiwDm && window.__aiwDm.nseq) || 0") or 0)
+        except Exception:  # noqa: BLE001
+            return False
+        if seq > getattr(self, "_notice_seen_seq", 0):
+            self._notice_seen_seq = seq
+            return True
+        return False
+
     # ---------- 记下抖音网页自己加载的用户资料 ----------
     def _on_response(self, resp) -> None:
         """抖音网页在打开私信、主页时会加载用户资料（JSON）。这里只是顺手读一下这些返回内容，
@@ -418,6 +458,15 @@ class DouyinBrowser:
             self._collect_notices(data)
         if "/aweme/" in url:
             self._collect_media(data)
+        if "/search/" in url:
+            self._collect_search(data)
+        if "/aweme/post" in url and self.my_works_on:
+            self._collect_my_works(data)
+        if "/aweme/detail" in url and isinstance(data, dict) and isinstance(data.get("aweme_detail"), dict):
+            d = data["aweme_detail"]
+            self.aweme_details[str(d.get("aweme_id") or "")] = d
+            while len(self.aweme_details) > 20:
+                self.aweme_details.pop(next(iter(self.aweme_details)))
         for u in _iter_users(data):
             name = (u.get("nickname") or "").strip()
             if not name or not u.get("sec_uid"):
@@ -433,6 +482,27 @@ class DouyinBrowser:
             if old and old.get("from_im") and not info["from_im"]:
                 continue  # 私信接口里来的更可信，不被同名的其他人覆盖
             self.users_seen[name] = info
+
+    def _collect_my_works(self, data) -> None:
+        """自己主页的作品列表（网页自己加载的）：每个作品的 id、文案、发布时间、点赞 / 评论 / 收藏 / 转发数。"""
+        if not isinstance(data, dict):
+            return
+        have = {w["aweme_id"] for w in self.my_works}
+        for a in data.get("aweme_list") or []:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("aweme_id") or "")
+            st = a.get("statistics") or {}
+            if not aid.isdigit() or aid in have:
+                continue
+            have.add(aid)
+            self.my_works.append({
+                "aweme_id": aid, "desc": str(a.get("desc") or "")[:300],
+                "create_time": int(a.get("create_time") or 0),
+                "likes": _num(st.get("digg_count")), "comments": _num(st.get("comment_count")),
+                "collects": _num(st.get("collect_count")), "shares": _num(st.get("share_count")),
+                "plays": _num(st.get("play_count")),
+            })
 
     def _collect_notices(self, data) -> None:
         """互动消息的返回内容里，每条通知带着那条评论：评论 id、内容、作者、所在视频 id，
@@ -458,6 +528,8 @@ class DouyinBrowser:
                 if "cid" in o and "text" in o and str(o.get("cid") or "").isdigit():
                     u = o.get("user") or {}
                     found.append({"cid": str(o["cid"]), "text": str(o.get("text") or ""),
+                                  # 发的是图片 / 表情包（这种评论 text 是空的）
+                                  "media": bool(o.get("sticker") or o.get("image_list") or o.get("image_info")),
                                   "reply_id": str(o.get("reply_id") or "0"),
                                   "reply_to_reply_id": str(o.get("reply_to_reply_id") or "0"),
                                   "aweme_id": str(o.get("aweme_id") or aw or ""),
@@ -502,6 +574,15 @@ class DouyinBrowser:
         except Exception:  # noqa: BLE001
             pass
 
+    def _collect_search(self, data) -> None:
+        """搜索页的返回内容（/aweme/v1/web/search/item/、general/search/…）：网页自己发的、自己签名的请求，
+        这里只是顺手读结果——视频 id、文案、作者、点赞数、时长（和 Apify 上的抖音搜索工具一样拦截 response，不另外发请求）。"""
+        found = search_items_in(data)
+        if found:
+            have = {x["aweme_id"] for x in self.search_items}
+            self.search_items.extend(x for x in found if x["aweme_id"] not in have)
+            del self.search_items[80:]
+
     def media_urls(self, video_id: str) -> list:
         return list(self.media.get(str(video_id or ""), []))
 
@@ -513,12 +594,22 @@ class DouyinBrowser:
         t = sq(text)
         if not t:
             return None
+        if media_only(text):
+            # 只发了图片 / 表情包：通知里写“[图片]”，接口里的 text 是空的，没法按内容认——
+            # 按作者找最近一条只有图的（接口返回的是从新到旧）
+            if not user:
+                return None
+            for c in self.notice_comments:
+                if c.get("user") and same_person(c["user"], user) and (
+                        c.get("media") or not sq(c["text"]) or media_only(c["text"])):
+                    return c
+            return None
         best = None
         for c in self.notice_comments:
             ct = sq(c["text"])
             if not ct or not (ct == t or (len(t) >= 6 and (t in ct or ct in t))):
                 continue
-            if user and c.get("user") and sq(c["user"]) != sq(user):
+            if user and c.get("user") and not same_person(c["user"], user):
                 continue
             if best is None or (ct == t and sq(best["text"]) != t):
                 best = c
@@ -646,6 +737,17 @@ class DouyinBrowser:
                     pass
                 self.goto(url)
             yield tab
+        except CaptchaDetected as e:
+            # 在这个标签页里弹了验证：关标签页之前先请你验证（标签页一关验证框就没了，没法验证，
+            # 软件还会以为你已经验证完——2026-11-20 替主人搜视频时就是这样，主人那边一直没回音）
+            hook = self.on_tab_verify
+            if callable(hook) and getattr(e, "solved", None) is None:
+                try:
+                    e.solved = bool(hook())
+                except Exception:  # noqa: BLE001
+                    log.warning("等你在新标签页里验证时出错", exc_info=True)
+                    e.solved = False
+            raise
         finally:
             self.page = old
             cdp = self._emu.pop(tab, None)
@@ -709,10 +811,17 @@ class DouyinBrowser:
             cancel.checkpoint()
             for s in cands:
                 try:
-                    loc = self.page.locator(s).first
-                    ok = loc.count() > 0 if state == "attached" else loc.is_visible()
-                    if ok:
-                        return loc
+                    if state == "attached":
+                        loc = self.page.locator(s).first
+                        if loc.count() > 0:
+                            return loc
+                        continue
+                    hit = self.first_visible(self.page.locator(s))     # 有好几份时挑看得见的那份
+                    if hit is False:
+                        loc = self.page.locator(s).first
+                        hit = loc if loc.is_visible() else None
+                    if hit is not None:
+                        return hit
                 except Exception:  # noqa: BLE001
                     continue
             if reload_at and time.time() >= reload_at:
@@ -731,17 +840,52 @@ class DouyinBrowser:
         return None
 
     def find(self, key: str, timeout: int = 4000, root=None):
-        """按 selectors.json 里的候选依次查找，返回第一个可见的元素；找不到返回 None。"""
+        """按 selectors.json 里的候选依次查找，返回第一个可见的元素；找不到返回 None。
+
+        同一个选择器在页面上可能有好几份：2026-11-20 实测，图文作品的详情页上评论区有两份一模一样的，
+        排在前面的那份藏着，右边“评论(1007)”下面看得见的是第二份。以前只看第一份、等它变可见，
+        评论区明明开着也认成“没打开”。现在在所有匹配的元素里挑第一个看得见的。"""
         base = root or self.page
         for s in as_list(self.sel.get(key)):
             cancel.checkpoint()
             try:
-                loc = base.locator(s).first
-                loc.wait_for(state="visible", timeout=timeout)
-                return loc
+                hit = self._wait_visible(base.locator(s), timeout)
             except Exception:  # noqa: BLE001
-                continue
+                hit = None
+            if hit is not None:
+                return hit
         return None
+
+    @staticmethod
+    def first_visible(loc):
+        """loc 匹配到的元素里第一个看得见的（一次脚本调用判断全部）。都看不见返回 None；
+        判断不了（不是真正的页面元素）返回 False。"""
+        try:
+            flags = loc.evaluate_all(VISIBLE_FLAGS_JS)
+        except Exception:  # noqa: BLE001
+            return False
+        if not isinstance(flags, list):
+            return False
+        for i, ok in enumerate(flags[:300]):
+            if ok:
+                return loc.nth(i)
+        return None
+
+    def _wait_visible(self, loc, timeout: int):
+        """等 loc 匹配到的元素里有一个看得见（最多 timeout 毫秒）。"""
+        end = time.monotonic() + max(0, timeout) / 1000
+        while True:
+            hit = self.first_visible(loc)
+            if hit is False:                       # 判断不了：照老办法等第一个
+                first = loc.first
+                first.wait_for(state="visible", timeout=max(1, int((end - time.monotonic()) * 1000)))
+                return first
+            if hit is not None:
+                return hit
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            cancel.sleep(min(0.25, left))
 
     def dismiss_tips(self) -> bool:
         """关掉抖音盖在页面上的新手引导 / 提示层（例如“我知道了”）。关掉了返回 True。
@@ -815,19 +959,25 @@ class DouyinBrowser:
         """直接按一个 CSS 选择器找可见元素（不经过 selectors.json）。"""
         cancel.checkpoint()
         try:
-            loc = (root or self.page).locator(css).first
-            loc.wait_for(state="visible", timeout=timeout)
-            return loc
+            return self._wait_visible((root or self.page).locator(css), timeout)
         except Exception:  # noqa: BLE001
             return None
 
     def find_all(self, key: str, root=None) -> list:
+        """所有匹配的元素。页面上有藏着的重复一份时（见 find），只要看得见的那些；都看不见就照旧全给。"""
         cancel.checkpoint()
         base = root or self.page
         for s in as_list(self.sel.get(key)):
             try:
-                items = base.locator(s).all()
+                loc = base.locator(s)
+                items = loc.all()
                 if items:
+                    try:
+                        flags = loc.evaluate_all(VISIBLE_FLAGS_JS)
+                    except Exception:  # noqa: BLE001
+                        flags = None
+                    if isinstance(flags, list) and len(flags) == len(items) and any(flags) and not all(flags):
+                        items = [it for it, ok in zip(items, flags) if ok]
                     return items
             except Exception:  # noqa: BLE001
                 continue
@@ -848,10 +998,20 @@ class DouyinBrowser:
             self.page.keyboard.type(ch)
             cancel.sleep(random.uniform(0.05, 0.18))
 
+    @staticmethod
+    def _middle_page(pg) -> bool:
+        """整页都换成了抖音的“验证码中间页”（验证框还没加载出来时也认得出）。"""
+        try:
+            return MIDDLE_PAGE_TITLE in (pg.title() or "")
+        except Exception:  # noqa: BLE001
+            return False
+
     def check_captcha(self) -> None:
         cancel.checkpoint()
         if not self.page:
             return
+        if self._middle_page(self.page):
+            raise CaptchaDetected("middle_page")
         # 滑块 / 图形验证，以及刷视频中途弹的“二次验证”（短信验证码）：后者开着时遮罩盖住整页，什么都点不了
         for s in as_list(self.sel.get("captcha")) + as_list(self.sel.get("second_verify")):
             try:
@@ -867,7 +1027,10 @@ class DouyinBrowser:
             return False
         for sel in as_list(self.sel.get(key)):
             try:
-                if self.page.locator(sel).first.is_visible(timeout=300):
+                hit = self.first_visible(self.page.locator(sel))
+                if hit is False:
+                    hit = self.page.locator(sel).first.is_visible(timeout=300) or None
+                if hit:
                     return True
             except Exception:  # noqa: BLE001
                 continue
@@ -907,6 +1070,8 @@ class DouyinBrowser:
         except Exception:  # noqa: BLE001
             pages = [self.page] if self.page else []
         for pg in pages:
+            if self._middle_page(pg):
+                return True
             for sel in strong:
                 try:
                     if pg.locator(sel).first.is_visible(timeout=300):
@@ -949,26 +1114,32 @@ DM_WATCH_JS = r"""
   try {
     if (window.top !== window || !/douyin\.com$/.test(location.hostname)) return;
     if (window.__aiwDm) return;
-    const state = window.__aiwDm = { seq: 0, last: 0 };
-    const count = () => {
-      const e = document.querySelector("[data-e2e='im-entry']");
+    // 右上角“消息”（私信）和“通知”（@ 她、回复她的评论、评论她的作品）的未读数：变多了就记一次
+    const state = window.__aiwDm = { seq: 0, last: 0, nseq: 0, nlast: 0 };
+    const count = (sel) => {
+      const e = document.querySelector(sel);
       if (!e) return 0;
       const m = (e.innerText || "").match(/\d+/);
       if (m) return parseInt(m[0], 10);
       return e.querySelector("[class*='unread'],[class*='Unread'],[data-e2e='unread-count'],[class*='badge'],[class*='Badge']") ? 1 : 0;
     };
     const check = () => {
-      const n = count();
+      const n = count("[data-e2e='im-entry']");
       if (n > state.last && n > 0) state.seq += 1;
       state.last = n;
+      const k = count("[data-e2e='notice-entry']");
+      if (k > state.nlast && k > 0) state.nseq += 1;
+      state.nlast = k;
     };
-    let observed = null;
+    const observed = {};
     const hook = () => {
-      const e = document.querySelector("[data-e2e='im-entry']");
-      if (e && e !== observed) {
-        observed = e;
-        new MutationObserver(() => { clearTimeout(state.t); state.t = setTimeout(check, 200); })
-          .observe(e, { subtree: true, childList: true, characterData: true, attributes: true });
+      for (const sel of ["[data-e2e='im-entry']", "[data-e2e='notice-entry']"]) {
+        const e = document.querySelector(sel);
+        if (e && e !== observed[sel]) {
+          observed[sel] = e;
+          new MutationObserver(() => { clearTimeout(state.t); state.t = setTimeout(check, 200); })
+            .observe(e, { subtree: true, childList: true, characterData: true, attributes: true });
+        }
       }
       check();
     };
@@ -991,6 +1162,65 @@ def _iter_users(obj, depth: int = 0):
     elif isinstance(obj, list):
         for v in obj[:200]:
             yield from _iter_users(v, depth + 1)
+
+
+# 每个元素是不是看得见（和 Playwright 的“visible”一样：有大小、不是 visibility:hidden）
+VISIBLE_FLAGS_JS = """(els) => els.map((e) => {
+  const r = e.getBoundingClientRect();
+  if (!(r.width > 0 && r.height > 0)) return false;
+  const st = window.getComputedStyle(e);
+  return st.visibility !== 'hidden' && st.display !== 'none';
+})"""
+
+
+def _num(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def search_items_in(data) -> list[dict]:
+    """从搜索接口返回的 JSON 里找出每个视频：{aweme_id, url, desc, author, author_uid, likes, comments, duration_s}。
+    视频对象一般在 data[].aweme_info 里，这里不认死结构：有 aweme_id、desc 和 author 的对象都算。"""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def walk(o, depth: int = 0) -> None:
+        if depth > 8 or len(out) >= 60:
+            return
+        if isinstance(o, dict):
+            vid = str(o.get("aweme_id") or "")
+            author = o.get("author")
+            if vid.isdigit() and "desc" in o and isinstance(author, dict) and vid not in seen:
+                seen.add(vid)
+                st = o.get("statistics") if isinstance(o.get("statistics"), dict) else {}
+                video = o.get("video") if isinstance(o.get("video"), dict) else {}
+                dur = _num(video.get("duration") or o.get("duration"))
+                note = _num(o.get("aweme_type")) in (2, 68, 150) or bool(o.get("images"))
+                out.append({
+                    "aweme_id": vid,
+                    "url": f"https://www.douyin.com/{'note' if note else 'video'}/{vid}",
+                    "desc": " ".join(str(o.get("desc") or "").split())[:120],
+                    "author": str(author.get("nickname") or "").strip()[:40],
+                    "author_uid": str(author.get("sec_uid") or ""),
+                    "likes": _num(st.get("digg_count")),
+                    "comments": _num(st.get("comment_count")),
+                    "duration_s": round(dur / 1000) if dur > 1000 else dur,
+                })
+                return
+            for v in o.values():
+                if isinstance(v, (dict, list)):
+                    walk(v, depth + 1)
+        elif isinstance(o, list):
+            for v in o[:80]:
+                walk(v, depth + 1)
+
+    try:
+        walk(data)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _first_url(img) -> str:
